@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Zom31C
+Copyright (c) 2026 1c-conf-db-extractor contributors
+Copyright (c) 2015 infactum (v8unpack, portions in src/confdb/v8)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

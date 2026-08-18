@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confdb"
+version = "0.1.0"
+description = "Экстрактор конфигурации 1С:Предприятие 8 (.cf/.cfe/.epf) в SQLite — только распаковка и разбор, на базе алгоритма v8unpack (MIT)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+confdb = "confdb.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
