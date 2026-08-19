@@ -994,6 +994,11 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                             ord_no += 1
                         stats['modules'] += 1
                         stats['methods'] += len(methods)
+                        # файл модуля тоже отражаем в file (без data — тело в module):
+                        # это полная карта «объект → файл дампа» для внешних инструментов
+                        file_params.append((source_id, object_id, rel_file, 'bsl',
+                                            os.path.getsize(full), None))
+                        stats['files'] += 1
                         if len(method_params) >= 50000:
                             flush(module_params,
                                   'INSERT INTO module (object_id, code_name, context, body)'
