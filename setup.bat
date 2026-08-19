@@ -34,4 +34,10 @@ echo.
 echo Готово. Запуск:
 echo   confdb.bat extract файл.cf --db out.sqlite [--dump каталог]
 echo   confdb-ui.bat              текстовый консольный интерфейс
+echo.
+echo Для инструментов bsl_* - BSL Language Server в MCP-режиме - нужен JDK 21:
+echo   build-lsp-jar.bat          соберёт jar в bin\
+echo   1confdb-knw.bat out.db --lsp-workspace каталог-дампа
+where java >nul 2>nul
+if errorlevel 1 if not defined JAVA_HOME echo Внимание: java не найдена - установите JDK 21 для инструментов bsl_*.
 endlocal

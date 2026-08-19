@@ -115,48 +115,48 @@ ssh -L 8765:127.0.0.1:8765 user@host
 `--host 0.0.0.0` открывает порт наружу — используйте только в доверенной сети.
 В консольном интерфейсе — пункт 4 → «Сеть (HTTP-порт)».
 
-## Интеграция с BSL Language Server (форк bsl-language-server-confdb)
+## Интеграция с BSL Language Server — единая MCP-точка входа
 
-Дистрибутив дополнен мостом в [BSL Language Server](https://1c-syntax.github.io/bsl-language-server/):
-LS получает метаданные конфигурации из базы confdb **без EDT и платформы 1С**,
-а диагностика `ConfdbQueryValidation` подсвечивает ошибки запросов в модулях.
+`1confdb-knw` сам поднимает BSL Language Server (форк
+bsl-language-server-confdb) как дочерний процесс и отдаёт его инструменты
+в том же MCP-соединении с префиксом `bsl_`. LLM-клиенту нужен один сервер:
 
-Полный рабочий процесс:
+- 12 инструментов confdb по метаданным конфигурации (объекты, реквизиты,
+  модули, методы, запросы СКД, проверка запросов);
+- 10 инструментов `bsl_*` по коду: `bsl_analyze_file` (диагностики и метрики,
+  включая ConfdbQueryValidation — ошибки запросов из `check-queries`),
+  `bsl_document_symbols`, `bsl_find_references`, `bsl_call_hierarchy`,
+  `bsl_hover`, `bsl_definition`, `bsl_type_info`, `bsl_type_at_position`,
+  `bsl_global_member_info`, `bsl_global_member_search`.
+
+Подготовка (однократно):
 
 ```bat
-:: 1. Извлечь конфигурацию: база метаданных + workspace с модулями .bsl
+:: 1. Извлечь конфигурацию и подготовить дамп
 confdb.bat extract config.cf --db out.db --dump workspace
-
-:: 2. Подготовить дамп для LS (UTF-8 без BOM, переводы строк LF)
 confdb.bat prep-lsp workspace
-
-:: 3. Проверить запросы в модулях (пишет таблицу query_violation)
 confdb.bat check-queries out.db
 
-:: 4. В корне workspace создать .bsl-language-server.json
-::    (шаблон: lsp-config\bsl-language-server.json.example)
-::    { "confdbDatabase": "путь/к/out.db" }
-
-:: 5. Анализ (CLI), LSP для редактора или MCP — на выбор:
-bsl-lsp.bat analyze -s workspace -r json -o report
-bsl-lsp.bat lsp
-bsl-lsp.bat mcp
+:: 2. Собрать jar (нужен JDK 21, JAVA_HOME)
+build-lsp-jar.bat
 ```
 
-Что это даёт:
+Запуск — как обычно, плюс каталог дампа:
 
-- модули workspace привязываются к метаданным (`mdoRef` вида
-  `Catalog.Товары`, `CommonModule.X`, формы и команды объектов) —
-  типизация, completion, hover, definition работают по конфигурации;
-- метаданные: объекты 20 типов, формы, команды, роли, подсистемы
-  (с составом), реквизиты с типами, табличные части, значения перечислений;
-- `ConfdbQueryValidation` — ошибки запросов во встроенном языке
-  (синтаксис языка запросов 1С + несуществующие таблицы/поля);
-- без `confdbDatabase` в конфиге сервер ведёт себя как обычный
-  bsl-language-server (метаданные из EDT/файлов конфигуратора, если они есть).
+```bat
+1confdb-knw.bat out.db --lsp-workspace workspace
+```
 
-`bin\bsl-language-server.jar` в git не входит (>100 МБ): собирается из форка
-командой `build-lsp-jar.bat [путь-к-форку]` (нужен JDK 21, `JAVA_HOME`).
+Workspace запоминается в `~/.confdb/config.json` (ключ `lsp_workspace`) —
+при следующих запусках достаточно `1confdb-knw.bat out.db`, инструменты
+`bsl_*` поднимутся автоматически. Если jar или java не найдены, сервер
+продолжает работать без `bsl_*`.
+
+Тонкости: файлы для `bsl_*` задаются путями относительно корня дампа
+(`Catalog/Товары/Товары.obj.bsl`); метаданные для анализа берутся из той же
+базы confdb (`confdbDatabase` в `.bsl-language-server.json` создаётся в
+workspace автоматически). Первый вызов `bsl_*` сразу после запуска может
+попасть на индексацию дампа (~10–30 с) — повторить.
 
 Опции `extract`:
 

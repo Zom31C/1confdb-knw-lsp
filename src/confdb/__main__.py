@@ -60,6 +60,12 @@ def build_parser():
     m.add_argument('db', nargs='?', default=None,
                    help='путь к базе SQLite; без пути — last_db из конфига '
                         'или автопоиск *.db/*.sqlite')
+    m.add_argument('--lsp-workspace', metavar='DIR', default=None,
+                   help='каталог дампа для инструментов bsl_* (BSL Language Server)')
+    m.add_argument('--bsl-jar', metavar='JAR', default=None,
+                   help='путь к jar BSL Language Server')
+    m.add_argument('--java', metavar='EXE', default=None,
+                   help='путь к java (по умолчанию JAVA_HOME или PATH)')
     m.add_argument('--host', default='127.0.0.1',
                    help='адрес для HTTP-режима (по умолчанию 127.0.0.1)')
     m.add_argument('--port', type=int, default=0,
@@ -117,6 +123,12 @@ def main(argv=None):
         argv = [args.db] if args.db else []
         if args.port:
             argv += ['--host', args.host, '--port', str(args.port)]
+        if args.lsp_workspace:
+            argv += ['--lsp-workspace', args.lsp_workspace]
+        if args.bsl_jar:
+            argv += ['--bsl-jar', args.bsl_jar]
+        if args.java:
+            argv += ['--java', args.java]
         return mcp_main(argv)
 
     if args.cmd == 'bench':

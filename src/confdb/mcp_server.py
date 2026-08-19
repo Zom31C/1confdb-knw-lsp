@@ -34,7 +34,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .config import load_config
+from .config import load_config, save_config
 from .db.writer import TYPE_RU
 
 PROTOCOL_VERSION = '2024-11-05'
@@ -102,10 +102,15 @@ All tools are read-only. Prefer the dedicated tools over raw sql; use sql only f
 
 
 class McpServer:
-    """Обработчик JSON-RPC сообщений MCP поверх базы SQLite (read-only)."""
+    """Обработчик JSON-RPC сообщений MCP поверх базы SQLite (read-only).
 
-    def __init__(self, db_path):
+    :param bsl: запущенный :class:`BslMcpProxy` (необязательно) — добавляет
+        к инструментам базы инструменты ``bsl_*`` (BSL Language Server).
+    """
+
+    def __init__(self, db_path, bsl=None):
         self.db_path = db_path
+        self.bsl = bsl
         self._conn = None
         self._ctx = None
 
@@ -155,22 +160,50 @@ class McpServer:
         method = msg.get('method')
         msg_id = msg.get('id')
         if method == 'initialize':
+            instructions = PRIMER
+            if self.bsl is not None:
+                instructions += (
+                    '\n\nBSL CODE ANALYSIS (bsl_* tools): AST-level analysis of '
+                    'configuration modules in the dump workspace — '
+                    'bsl_analyze_file (diagnostics/metrics), bsl_document_symbols, '
+                    'bsl_find_references, bsl_call_hierarchy, bsl_hover, bsl_definition, '
+                    'bsl_type_info, bsl_type_at_position, bsl_global_member_info, '
+                    'bsl_global_member_search. File paths — relative to the dump root '
+                    '(e.g. Catalog/Товары/Товары.obj.bsl). Metadata (types, fields, '
+                    'references) comes from the same confdb database.')
             return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
                 'protocolVersion': PROTOCOL_VERSION,
                 'capabilities': {'tools': {}},
                 'serverInfo': {'name': '1confdb-knw', 'version': '1.0'},
-                'instructions': PRIMER}}
+                'instructions': instructions}}
         if msg_id is None or (method or '').startswith('notifications/'):
             return None  # уведомления
         if method == 'ping':
             return {'jsonrpc': '2.0', 'id': msg_id, 'result': {}}
         if method == 'tools/list':
+            tools = [t.spec() for t in TOOLS]
+            if self.bsl is not None:
+                tools.extend(self.bsl.prefixed_tools())
             return {'jsonrpc': '2.0', 'id': msg_id,
-                    'result': {'tools': [t.spec() for t in TOOLS]}}
+                    'result': {'tools': tools}}
         if method == 'tools/call':
             params = msg.get('params', {})
             name = params.get('name')
             args = params.get('arguments', {}) or {}
+            if isinstance(name, str) and name.startswith('bsl_'):
+                if self.bsl is None:
+                    return {'jsonrpc': '2.0', 'id': msg_id, 'error': {
+                        'code': -32602,
+                        'message': 'инструменты bsl_* недоступны: запустите '
+                                   'с --lsp-workspace <каталог дампа>'}}
+                try:
+                    text = self.bsl.call(name[len('bsl_'):], args)
+                    return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
+                        'content': [{'type': 'text', 'text': text}]}}
+                except Exception as err:  # noqa: BLE001 — ошибка инструмента
+                    return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
+                        'content': [{'type': 'text', 'text': f'ошибка: {err}'}],
+                        'isError': True}}
             tool = next((t for t in TOOLS if t.name == name), None)
             if tool is None:
                 return {'jsonrpc': '2.0', 'id': msg_id, 'error': {
@@ -700,11 +733,52 @@ def resolve_db(db):
     raise SystemExit(2)
 
 
-def serve_http(db_path, host='127.0.0.1', port=8765):
+def create_bsl_proxy(args, db):
+    """Создаёт и запускает шлюз BSL Language Server.
+
+    Возвращает запущенный :class:`BslMcpProxy` или None (нет workspace/jar,
+    ошибка запуска) — сервер при этом продолжает работать без инструментов
+    ``bsl_*``. Удачный workspace запоминается в ~/.confdb/config.json
+    (ключ lsp_workspace) для следующих запусков без опции.
+    """
+    workspace = getattr(args, 'lsp_workspace', None) or load_config().get('lsp_workspace')
+    if not workspace:
+        return None
+    if not os.path.isdir(workspace):
+        print(f'1confdb-knw: каталог LSP-workspace не найден: {workspace} — '
+              'инструменты bsl_* недоступны', file=sys.stderr)
+        return None
+    from .mcp_bsl_proxy import BslMcpProxy, find_jar
+    jar = find_jar(getattr(args, 'bsl_jar', None))
+    if not jar:
+        print('1confdb-knw: jar BSL Language Server не найден — соберите его '
+              '(build-lsp-jar.bat) или задайте CONFDB_BSL_JAR; '
+              'инструменты bsl_* недоступны', file=sys.stderr)
+        return None
+    proxy = BslMcpProxy(jar, workspace, db, java=getattr(args, 'java', None))
+    print(f'1confdb-knw: запускаю BSL Language Server '
+          f'(workspace: {os.path.abspath(workspace)})...', file=sys.stderr)
+    try:
+        proxy.start()
+    except Exception as err:  # noqa: BLE001 — шлюз не обязателен для работы
+        print(f'1confdb-knw: BSL LS не запустился: {err} — '
+              'инструменты bsl_* недоступны', file=sys.stderr)
+        proxy.stop()
+        return None
+    print(f'1confdb-knw: BSL LS готов, инструментов: {len(proxy.tools)}',
+          file=sys.stderr)
+    config = load_config()
+    if config.get('lsp_workspace') != os.path.abspath(workspace):
+        config['lsp_workspace'] = os.path.abspath(workspace)
+        save_config(config)
+    return proxy
+
+
+def serve_http(db_path, host='127.0.0.1', port=8765, bsl=None):
     if not os.path.isfile(db_path):
         print(f'Файл базы не найден: {db_path}', file=sys.stderr)
         return 2
-    server = McpServer(db_path)
+    server = McpServer(db_path, bsl=bsl)
     httpd, real_port = start_http_server(server, host, port)
     print(f'1confdb-knw: слушаю http://{host}:{real_port}/mcp '
           f'(legacy SSE: /sse); остановка — Ctrl+C.')
@@ -746,23 +820,41 @@ def main(argv=None):
                         help='адрес для HTTP-режима (по умолчанию 127.0.0.1)')
     parser.add_argument('--port', type=int, default=0,
                         help='порт HTTP-режима (без него — stdio)')
+    parser.add_argument('--lsp-workspace', metavar='DIR', default=None,
+                        help='каталог дампа для инструментов BSL Language Server '
+                             '(bsl_*); запоминается в конфиге, при следующих '
+                             'запусках можно не указывать')
+    parser.add_argument('--bsl-jar', metavar='JAR', default=None,
+                        help='путь к jar BSL Language Server '
+                             '(по умолчанию ищется в bin/ дистрибутива)')
+    parser.add_argument('--java', metavar='EXE', default=None,
+                        help='путь к java (по умолчанию JAVA_HOME или PATH)')
     args = parser.parse_args(argv)
     db = resolve_db(args.db)
+    bsl = create_bsl_proxy(args, db)
     if args.port:
-        return serve_http(db, args.host, args.port)
-    server = McpServer(db)
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
         try:
-            msg = json.loads(line)
-        except ValueError:
-            continue
-        resp = server.handle(msg)
-        if resp is not None:
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + '\n')
-            sys.stdout.flush()
+            return serve_http(db, args.host, args.port, bsl=bsl)
+        finally:
+            if bsl is not None:
+                bsl.stop()
+    server = McpServer(db, bsl=bsl)
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            resp = server.handle(msg)
+            if resp is not None:
+                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + '\n')
+                sys.stdout.flush()
+    finally:
+        if bsl is not None:
+            bsl.stop()
     return 0
 
 
