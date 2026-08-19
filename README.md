@@ -115,6 +115,49 @@ ssh -L 8765:127.0.0.1:8765 user@host
 `--host 0.0.0.0` открывает порт наружу — используйте только в доверенной сети.
 В консольном интерфейсе — пункт 4 → «Сеть (HTTP-порт)».
 
+## Интеграция с BSL Language Server (форк bsl-language-server-confdb)
+
+Дистрибутив дополнен мостом в [BSL Language Server](https://1c-syntax.github.io/bsl-language-server/):
+LS получает метаданные конфигурации из базы confdb **без EDT и платформы 1С**,
+а диагностика `ConfdbQueryValidation` подсвечивает ошибки запросов в модулях.
+
+Полный рабочий процесс:
+
+```bat
+:: 1. Извлечь конфигурацию: база метаданных + workspace с модулями .bsl
+confdb.bat extract config.cf --db out.db --dump workspace
+
+:: 2. Подготовить дамп для LS (UTF-8 без BOM, переводы строк LF)
+confdb.bat prep-lsp workspace
+
+:: 3. Проверить запросы в модулях (пишет таблицу query_violation)
+confdb.bat check-queries out.db
+
+:: 4. В корне workspace создать .bsl-language-server.json
+::    (шаблон: lsp-config\bsl-language-server.json.example)
+::    { "confdbDatabase": "путь/к/out.db" }
+
+:: 5. Анализ (CLI), LSP для редактора или MCP — на выбор:
+bsl-lsp.bat analyze -s workspace -r json -o report
+bsl-lsp.bat lsp
+bsl-lsp.bat mcp
+```
+
+Что это даёт:
+
+- модули workspace привязываются к метаданным (`mdoRef` вида
+  `Catalog.Товары`, `CommonModule.X`, формы и команды объектов) —
+  типизация, completion, hover, definition работают по конфигурации;
+- метаданные: объекты 20 типов, формы, команды, роли, подсистемы
+  (с составом), реквизиты с типами, табличные части, значения перечислений;
+- `ConfdbQueryValidation` — ошибки запросов во встроенном языке
+  (синтаксис языка запросов 1С + несуществующие таблицы/поля);
+- без `confdbDatabase` в конфиге сервер ведёт себя как обычный
+  bsl-language-server (метаданные из EDT/файлов конфигуратора, если они есть).
+
+`bin\bsl-language-server.jar` в git не входит (>100 МБ): собирается из форка
+командой `build-lsp-jar.bat [путь-к-форку]` (нужен JDK 21, `JAVA_HOME`).
+
 Опции `extract`:
 
 - `--db FILE` — записать результат в SQLite;

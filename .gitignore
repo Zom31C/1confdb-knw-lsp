@@ -5,3 +5,5 @@ _out/
 _tmp/
 *.db
 *.sqlite
+# jar собирается build-lsp-jar.bat из форка (файл > 100 МБ в git не кладём)
+bin/*.jar
