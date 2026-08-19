@@ -39,6 +39,14 @@ def build_parser():
     b.add_argument('--sample', metavar='N', type=int, default=1000,
                    help='размер сэмпла объектов верхнего уровня (по умолчанию 1000)')
 
+    l = subparsers.add_parser(
+        'prep-lsp',
+        help='подготовить дамп для BSL Language Server (*.bsl → UTF-8 без BOM, LF)')
+    l.add_argument('dump', help='каталог дампа (результат extract --dump)')
+    l.add_argument('--into', metavar='DIR',
+                   help='скопировать дамп в отдельный каталог с конвертацией '
+                        '(по умолчанию — править на месте)')
+
     m = subparsers.add_parser(
         '1confdb-knw',
         help='MCP-сервер знаний по конфигурации 1С и BSL для внешних LLM '
@@ -98,6 +106,18 @@ def main(argv=None):
     if args.cmd == 'bench':
         from .bench import bench as run_bench
         run_bench(args.src, sample=args.sample)
+        return 0
+
+    if args.cmd == 'prep-lsp':
+        from .lsp_prep import prep_dump
+        try:
+            stats = prep_dump(args.dump, dst_dir=args.into)
+        except (FileNotFoundError, ValueError) as err:
+            print(f'Ошибка: {err}', file=sys.stderr)
+            return 2
+        print(f'Файлов .bsl: {stats["files"]}, '
+              f'переписано: {stats["converted"]}, '
+              f'уже в нужном формате/пропущено: {stats["skipped"]}')
         return 0
 
     if args.workers is None:
