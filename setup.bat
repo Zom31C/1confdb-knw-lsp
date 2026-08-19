@@ -34,10 +34,33 @@ echo.
 echo Готово. Запуск:
 echo   confdb.bat extract файл.cf --db out.sqlite [--dump каталог]
 echo   confdb-ui.bat              текстовый консольный интерфейс
+endlocal
+
+:jdk
+where java >nul 2>nul
+if not errorlevel 1 goto jdk_ok
+if defined JAVA_HOME if exist "%JAVA_HOME%\bin\java.exe" goto jdk_ok
+where winget >nul 2>nul
+if errorlevel 1 (
+    echo Внимание: java не найдена, winget недоступен.
+    echo Для инструментов bsl_* установите JDK 21 вручную и выполните build-lsp-jar.bat
+    goto :eof
+)
+set /p INSTALL_JDK=Java не найдена. Установить JDK 21 Temurin через winget - может потребоваться подтверждение администратора? [Y/n]: 
+if /i "%INSTALL_JDK%"=="n" goto :eof
+if /i "%INSTALL_JDK%"=="Н" goto :eof
+if /i "%INSTALL_JDK%"=="нет" goto :eof
+echo Устанавливаю JDK 21 Temurin ...
+winget install --id EclipseAdoptium.Temurin.21.JDK -e --accept-source-agreements --accept-package-agreements
+if errorlevel 1 (
+    echo Ошибка установки JDK. Установите вручную: winget install EclipseAdoptium.Temurin.21.JDK
+    goto :eof
+)
+for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-21*") do set "JAVA_HOME=%%d"
+if defined JAVA_HOME echo JAVA_HOME для этой консоли: %JAVA_HOME% - можно сразу запускать build-lsp-jar.bat
+
+:jdk_ok
 echo.
-echo Для инструментов bsl_* - BSL Language Server в MCP-режиме - нужен JDK 21:
+echo Для инструментов bsl_* - BSL Language Server в MCP-режиме:
 echo   build-lsp-jar.bat          соберёт jar в bin\
 echo   1confdb-knw.bat out.db --lsp-workspace каталог-дампа
-where java >nul 2>nul
-if errorlevel 1 if not defined JAVA_HOME echo Внимание: java не найдена - установите JDK 21 для инструментов bsl_*.
-endlocal
