@@ -139,7 +139,8 @@ def test_write_db(tmp_path):
     db_path = str(tmp_path / 'out.sqlite')
 
     stats = write_db(dump, db_path, source_file='test.cf')
-    assert stats == {'objects': 7, 'modules': 3, 'methods': 1, 'files': 4, 'files_content': 3,
+    # files: 4 прочих файла дампа + 3 файла модулей .bsl (карта объект→файл)
+    assert stats == {'objects': 7, 'modules': 3, 'methods': 1, 'files': 7, 'files_content': 3,
                      'skd': 0, 'attributes': 6, 'refs': 6, 'enum_values': 2,
                      'predefined': 1, 'common_targets': 1, 'tabular': 1}
 

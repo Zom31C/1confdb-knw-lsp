@@ -32,6 +32,12 @@ def build_parser():
     c = subparsers.add_parser('check', help='проверить запросы СКД в готовой базе')
     c.add_argument('db', help='путь к базе SQLite')
 
+    q = subparsers.add_parser(
+        'check-queries',
+        help='проверить тексты запросов в модулях и сохранить нарушения '
+             'в таблицу query_violation (для LSP-диагностики)')
+    q.add_argument('db', help='путь к базе SQLite')
+
     b = subparsers.add_parser(
         'bench',
         help='бенчмарк: подбор числа процессов под железо (результат в конфиг)')
@@ -95,6 +101,16 @@ def main(argv=None):
 
     if args.cmd == 'check':
         return run_check(args.db)
+
+    if args.cmd == 'check-queries':
+        from .query_check import check_db
+        if not os.path.isfile(args.db):
+            print(f'Файл базы не найден: {args.db}', file=sys.stderr)
+            return 2
+        stats = check_db(args.db)
+        print(f'Тел модулей/методов с запросами: {stats["bodies"]}, '
+              f'нарушений сохранено: {stats["violations"]}')
+        return 0
 
     if args.cmd == '1confdb-knw':
         from .mcp_server import main as mcp_main
