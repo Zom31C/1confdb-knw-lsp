@@ -1,40 +1,41 @@
 @echo off
-rem Настройка окружения confdb: создание .venv и установка пакета.
-rem Запускать двойным кликом или из консоли: setup.bat
+rem confdb environment setup: create .venv and install the package.
+rem Run by double-click or from a console: setup.bat
+rem Pure ASCII: readable in any console code page (866/1251/65001); all other
+rem user-facing text is printed by the Python layer in UTF-8.
 setlocal
 cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
-    echo venv уже существует: .venv
+    echo venv already exists: .venv
     goto install
 )
 
-echo Создаю виртуальное окружение в .venv ...
+echo Creating virtual environment in .venv ...
 python -m venv .venv 2>nul
 if not exist ".venv\Scripts\python.exe" py -3 -m venv .venv 2>nul
 if not exist ".venv\Scripts\python.exe" (
-    echo Ошибка: Python 3.9+ не найден в PATH. Установите Python и повторите.
+    echo Error: Python 3.9+ not found in PATH. Install Python and re-run.
     exit /b 1
 )
 
 :install
-echo Устанавливаю confdb в venv ...
+echo Installing confdb into venv ...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 ".venv\Scripts\python.exe" -m pip install .
 if errorlevel 1 (
-    echo Повторяю установку без изоляции сборки ...
+    echo Retrying install without build isolation ...
     ".venv\Scripts\python.exe" -m pip install --no-build-isolation .
 )
 if errorlevel 1 (
-    echo Ошибка установки пакета.
+    echo Package installation failed.
     exit /b 1
 )
 
 echo.
-echo Готово. Запуск:
-echo   confdb.bat extract файл.cf --db out.sqlite [--dump каталог]
-echo   confdb-ui.bat              текстовый консольный интерфейс
-endlocal
+echo Done. Usage:
+echo   confdb.bat extract file.cf --db out.sqlite [--dump dir]
+echo   confdb-ui.bat              text console interface
 
 :jdk
 where java >nul 2>nul
@@ -42,25 +43,24 @@ if not errorlevel 1 goto jdk_ok
 if defined JAVA_HOME if exist "%JAVA_HOME%\bin\java.exe" goto jdk_ok
 where winget >nul 2>nul
 if errorlevel 1 (
-    echo Внимание: java не найдена, winget недоступен.
-    echo Для инструментов bsl_* установите JDK 21 вручную и выполните build-lsp-jar.bat
+    echo Warning: java not found and winget is unavailable.
+    echo For bsl_* tools install JDK 21 manually, then run build-lsp-jar.bat
     goto :eof
 )
-set /p INSTALL_JDK=Java не найдена. Установить JDK 21 Temurin через winget - может потребоваться подтверждение администратора? [Y/n]: 
+set /p INSTALL_JDK=Java not found. Install JDK 21 Temurin via winget (may require admin approval)? [Y/n]: 
 if /i "%INSTALL_JDK%"=="n" goto :eof
-if /i "%INSTALL_JDK%"=="Н" goto :eof
-if /i "%INSTALL_JDK%"=="нет" goto :eof
-echo Устанавливаю JDK 21 Temurin ...
+if /i "%INSTALL_JDK%"=="no" goto :eof
+echo Installing JDK 21 Temurin ...
 winget install --id EclipseAdoptium.Temurin.21.JDK -e --accept-source-agreements --accept-package-agreements
 if errorlevel 1 (
-    echo Ошибка установки JDK. Установите вручную: winget install EclipseAdoptium.Temurin.21.JDK
+    echo JDK install failed. Install manually: winget install EclipseAdoptium.Temurin.21.JDK
     goto :eof
 )
 for /d %%d in ("C:\Program Files\Eclipse Adoptium\jdk-21*") do set "JAVA_HOME=%%d"
-if defined JAVA_HOME echo JAVA_HOME для этой консоли: %JAVA_HOME% - можно сразу запускать build-lsp-jar.bat
+if defined JAVA_HOME echo JAVA_HOME for this console: %JAVA_HOME% - you can run build-lsp-jar.bat right away
 
 :jdk_ok
 echo.
-echo Для инструментов bsl_* - BSL Language Server в MCP-режиме:
-echo   build-lsp-jar.bat          соберёт jar в bin\
-echo   1confdb-knw.bat out.db --lsp-workspace каталог-дампа
+echo For bsl_* tools (BSL Language Server in MCP mode):
+echo   build-lsp-jar.bat          builds the jar into bin\
+echo   1confdb-knw.bat out.db --lsp-workspace dump-dir
