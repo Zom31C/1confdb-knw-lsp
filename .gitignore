@@ -6,5 +6,7 @@ _tmp/
 *.db
 *.sqlite
 .pytest_cache/
-# jar собирается build-lsp-jar.bat из форка (файл > 100 МБ в git не кладём)
+build/
+*.egg-info/
+# jar is built from the fork by build-lsp-jar.bat (>100 MB, not committed)
 bin/*.jar
