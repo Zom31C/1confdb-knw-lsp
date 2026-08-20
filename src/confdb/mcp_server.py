@@ -716,6 +716,15 @@ def make_handler(server):
         protocol_version = 'HTTP/1.1'
         server_version = '1confdb-knw'
 
+        def handle(self):
+            # MCP-клиенты часто закрывают соединение сразу после ответа
+            # (новый коннект на каждый запрос) — обрыв на keep-alive не ошибка
+            try:
+                super().handle()
+            except (ConnectionResetError, ConnectionAbortedError,
+                    BrokenPipeError, TimeoutError):
+                self.close_connection = True
+
         def _send(self, code, body=None, extra=None):
             data = None if body is None else (
                 json.dumps(body, ensure_ascii=False).encode('utf-8'))
@@ -809,9 +818,20 @@ def make_handler(server):
     return Handler
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """Не печатает traceback на штатные обрывы связи со стороны клиента."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def start_http_server(server, host='127.0.0.1', port=0):
     """Поднимает ThreadingHTTPServer; возвращает (httpd, фактический порт)."""
-    httpd = ThreadingHTTPServer((host, port), make_handler(server))
+    httpd = _QuietThreadingHTTPServer((host, port), make_handler(server))
     httpd.daemon_threads = True
     return httpd, httpd.server_address[1]
 

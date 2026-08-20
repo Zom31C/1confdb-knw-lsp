@@ -352,3 +352,46 @@ def test_optional_masks(tmp_path_factory):
     text = _call(server, 'find_methods',
                  path='Справочник.Справочник1')['content'][0]['text']
     assert 'Тест' in text
+
+
+def test_http_client_reset_is_quiet(tmp_path_factory):
+    """Обрыв соединения клиентом (RST на keep-alive) не должен печатать
+    traceback и не должен ронять сервер."""
+    import contextlib
+    import http.client
+    import io
+    import socket
+    import struct
+    import time
+
+    server = _server(tmp_path_factory)
+    httpd, port = start_http_server(server)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                       'params': {}}).encode('utf-8')
+    headers = {'Content-Type': 'application/json'}
+    try:
+        conn = http.client.HTTPConnection('127.0.0.1', port)
+        conn.request('POST', '/mcp', body=body, headers=headers)
+        assert conn.getresponse().status == 200
+        conn.close()
+
+        # клиент обрывает соединение с RST (SO_LINGER с нулевой задержкой)
+        sock = socket.create_connection(('127.0.0.1', port))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack('ii', 1, 0))
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            sock.close()
+            time.sleep(0.5)
+        assert 'Traceback' not in err_buf.getvalue()
+
+        # сервер жив и обслуживает следующие запросы
+        conn = http.client.HTTPConnection('127.0.0.1', port)
+        conn.request('POST', '/mcp', body=body, headers=headers)
+        assert conn.getresponse().status == 200
+        conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
