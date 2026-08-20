@@ -79,6 +79,38 @@ def ru_type_str(text):
 _METHOD_PAGE = 250
 _OUTLINE_PAGE = 300
 
+# суффиксы в пути модуля, которые модели передают вместо code_name:
+# 'Документ.Х.mgr', 'Документ.Х.МодульМенеджера', 'Документ.Х.obj.bsl'
+_CODE_ALIASES = {
+    'obj': 'obj', 'mgr': 'mgr', 'val': 'val', 'recordset': 'val',
+    'seance': 'seance', 'app': 'app', '802': '802', 'con': 'con',
+    'модульобъекта': 'obj', 'модульменеджера': 'mgr',
+    'модульнаборазаписей': 'val', 'модуль': 'obj',
+}
+
+
+def split_module_path(path, code_name):
+    """Нормализует путь модуля к виду (путь объекта, code_name).
+
+    Понимает: 'Документ.Х.mgr', 'Документ.Х.obj.bsl', 'Документ.Х.МодульМенеджера'
+    (суффикс переносится в code_name) и полные пути файлов дампа
+    'Document/Х/Document.mgr.bsl' (маппятся на объект и code_name).
+    """
+    path = (path or '').strip()
+    code_name = (code_name or 'obj').strip() or 'obj'
+    norm = path.replace('\\', '/')
+    if norm.endswith('.bsl') and '/' in norm:
+        # путь файла дампа: объект и code_name возьмём из таблиц file/module
+        return path, code_name, True
+    parts = path.split('.')
+    if len(parts) >= 2:
+        with_ext = parts[-1].lower() == 'bsl' and len(parts) >= 3
+        tail = parts[-2].lower() if with_ext else parts[-1].lower()
+        if tail in _CODE_ALIASES:
+            cut = 2 if with_ext else 1
+            return '.'.join(parts[:-cut]), _CODE_ALIASES[tail], False
+    return path, code_name, False
+
 
 def _paginate_lines(text, offset, limit, default_page, header=''):
     """Постраничный вывод текста: строки offset..offset+limit (0-нумерация).
@@ -248,7 +280,7 @@ class McpServer:
             'code': -32601, 'message': f'method not found: {method}'}}
 
     # -- инструменты ---------------------------------------------------------
-    def find_objects(self, mask, type=None, limit=20):  # noqa: A002
+    def find_objects(self, mask='', type=None, limit=20):  # noqa: A002
         like = f'%{mask}%'
         # имена в 1С пишутся Слитно, а маски часто приходят с пробелами
         # и в другой раскладке регистра
@@ -411,8 +443,26 @@ class McpServer:
                        if rows else '—'))
         return '\n'.join(out)
 
+    def _module_target(self, path, code_name):
+        """(путь объекта, code_name) из разных форм записи пути модуля:
+        'Объект.mgr', 'Объект.obj.bsl', 'Объект.МодульМенеджера' или путь
+        файла дампа 'Document/Х/Document.mgr.bsl'."""
+        p, cn, is_file = split_module_path(path, code_name)
+        if is_file:
+            row = self.conn().execute(
+                "SELECT o.path, m.code_name FROM file f "
+                "JOIN meta_object o ON o.id=f.object_id "
+                "JOIN module m ON m.object_id=f.object_id "
+                "WHERE f.kind='bsl' AND f.path=? "
+                "AND f.path LIKE '%.' || m.code_name || '.bsl'",
+                (p.replace('\\', '/'),)).fetchone()
+            if row:
+                return row[0], row[1]
+            return p, cn
+        return self.resolve_path(p), cn
+
     def module_outline(self, path, code_name='obj', offset=0, limit=0):
-        path = self.resolve_path(path)
+        path, code_name = self._module_target(path, code_name)
         row = self.conn().execute(
             'SELECT m.body FROM module m JOIN meta_object o ON o.id=m.object_id '
             'WHERE o.path=? AND m.code_name=?', (path, code_name)).fetchone()
@@ -422,7 +472,7 @@ class McpServer:
                                _OUTLINE_PAGE)
 
     def get_method(self, path, code_name, name, offset=0, limit=0):
-        path = self.resolve_path(path)
+        path, code_name = self._module_target(path, code_name)
         row = self.conn().execute(
             'SELECT mt.kind, mt.name, mt.signature, mt.directives, '
             'mt.description, mt.body, mt.is_export FROM method mt '
@@ -446,7 +496,7 @@ class McpServer:
             parts.append('метод длинный — листай: offset/limit')
         return '\n'.join(parts)
 
-    def find_methods(self, mask, path=None, limit=20):
+    def find_methods(self, mask='', path=None, limit=20):
         path = self.resolve_path(path) if path else None
         like = f'%{mask}%'
         like_ns = f'%{mask.replace(" ", "").lower()}%'
@@ -570,9 +620,10 @@ TOOLS = [
          'Search metadata objects by name or path substring. Returns '
          "configurator-style dotted paths ('Справочник.Имя') with Russian and "
          'English type labels. First step for anything: locate '
-         'справочник/документ/регистр by its Russian name.',
+         'справочник/документ/регистр by its Russian name. mask is optional: '
+         'omit it to browse all objects of a given type.',
          _schema({'mask': _STR, 'type': _STR,
-                  'limit': _INT}, ('mask',)),
+                  'limit': _INT}),
          McpServer.find_objects),
     Tool('object_card',
          "Full 'passport' of one object in a single call: type, header "
@@ -598,8 +649,10 @@ TOOLS = [
          McpServer.refs_of),
     Tool('module_outline',
          'Table of contents of a 1C module: signatures, comments, #Если '
-         "regions, WITHOUT method bodies. code_name: 'obj' (object module), "
-         "'mgr' (manager module) etc. Cheap way to inspect a module. "
+         "regions, WITHOUT method bodies. path — object path ('Документ.Х' "
+         "or 'Document/Х'); code_name: 'obj' (object module), 'mgr' (manager "
+         'module) etc. Path forms are also accepted: Документ.Х.mgr, '
+         'Документ.Х.obj.bsl, Document/Х/Document.mgr.bsl. '
          'For very long modules use offset/limit (0-based lines) to page.',
          _schema({'path': _STR, 'code_name': _STR,
                   'offset': _INT, 'limit': _INT}, ('path',)),
@@ -607,7 +660,9 @@ TOOLS = [
     Tool('get_method',
          'Full source of one procedure/function: signature, directives '
          '(&НаСервере…), description comment and body. Use after '
-         'find_methods/module_outline. Long methods are paginated: the '
+         'find_methods/module_outline. Path forms are also accepted: '
+         'Документ.Х.mgr, Документ.Х.obj.bsl, Document/Х/Document.mgr.bsl. '
+         'Long methods are paginated: the '
          'response shows which lines are given and how to fetch the rest '
          '(offset/limit, 0-based lines) — nothing is silently truncated.',
          _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
@@ -616,8 +671,11 @@ TOOLS = [
          McpServer.get_method),
     Tool('find_methods',
          'Search 1C methods by name/signature/description substring '
-         "(e.g. 'ПриПроведении'). Reuse existing code instead of inventing.",
-         _schema({'mask': _STR, 'path': _STR, 'limit': _INT}, ('mask',)),
+         "(e.g. 'ПриПроведении'). Reuse existing code instead of inventing. "
+         'mask is optional: with only path it lists all methods of the object. '
+         'Not sure about the exact name — give a partial mask (piece of the '
+         'name), do not guess the full name.',
+         _schema({'mask': _STR, 'path': _STR, 'limit': _INT}),
          McpServer.find_methods),
     Tool('skd_of',
          'All SKD (report) queries of an object — the best examples of how '

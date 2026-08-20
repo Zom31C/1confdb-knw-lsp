@@ -318,3 +318,37 @@ def test_find_db_candidates_dedup(tmp_path, monkeypatch):
     assert found == [str(tmp_path / 'a.db'),
                      str(tmp_path / 'db' / 'b.sqlite'),
                      str(tmp_path / '_out' / 'c.db')]
+
+
+# -- удобные формы путей модулей и опциональные маски -------------------
+
+def test_module_path_forms(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    base = _call(server, 'module_outline', path='Справочник.Справочник1',
+                 code_name='obj')['content'][0]['text']
+    assert 'не найден' not in base
+    for form in ('Справочник.Справочник1.obj',
+                 'Справочник.Справочник1.obj.bsl',
+                 'Справочник.Справочник1.МодульОбъекта'):
+        text = _call(server, 'module_outline',
+                     path=form)['content'][0]['text']
+        assert text == base, form
+    # путь файла дампа
+    text = _call(server, 'module_outline',
+                 path='Catalog/Справочник1/Catalog.obj.bsl')['content'][0]['text']
+    assert text == base
+    # get_method с формой 'Объект.mgr'/'объект.obj.bsl'
+    m = _call(server, 'get_method', path='Справочник.Справочник1.obj.bsl',
+              code_name='obj', name='Тест')['content'][0]['text']
+    assert 'Процедура Тест' in m
+
+
+def test_optional_masks(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    # просмотр объектов типа без маски
+    text = _call(server, 'find_objects', type='Catalog')['content'][0]['text']
+    assert 'Справочник.Справочник1' in text
+    # список методов объекта без маски
+    text = _call(server, 'find_methods',
+                 path='Справочник.Справочник1')['content'][0]['text']
+    assert 'Тест' in text
