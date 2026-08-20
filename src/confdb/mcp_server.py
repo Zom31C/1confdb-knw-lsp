@@ -475,6 +475,19 @@ class McpServer:
             out.append(' | '.join(cells))
         return '\n'.join(out)
 
+    def db_schema(self):
+        conn = self.conn()
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        out = []
+        for name in tables:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{name}")')]
+            cnt = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+            out.append(f'{name} ({cnt} строк): ' + ', '.join(cols))
+        return ('Таблицы базы знаний (используй в sql; повторно схему не '
+                'запрашивай):\n' + '\n'.join(out))
+
 
 class Tool:
     def __init__(self, name, description, schema, fn):
@@ -563,9 +576,16 @@ TOOLS = [
          'run it on a query you wrote before using it.',
          _schema({'text': _STR}, ('text',)),
          McpServer.check_query),
+    Tool('schema',
+         'Knowledge base schema reference: all tables, their columns and row '
+         'counts. Call it ONCE before writing sql — do not guess column names, '
+         'do not query sqlite_master/PRAGMA.',
+         _schema({}),
+         McpServer.db_schema),
     Tool('sql',
          'Read-only SELECT escape hatch for anything not covered by the '
-         'dedicated tools. Non-SELECT is rejected; LIMIT 200 enforced.',
+         'dedicated tools. Call `schema` first if unsure about tables/columns. '
+         'Non-SELECT is rejected; LIMIT 200 enforced.',
          _schema({'query': _STR}, ('query',)),
          McpServer.sql),
 ]

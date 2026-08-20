@@ -43,7 +43,15 @@ def test_tools_list(tmp_path_factory):
     names = {t['name'] for t in resp['result']['tools']}
     assert names == {'find_objects', 'object_card', 'object_tree', 'find_field',
                      'refs_of', 'module_outline', 'get_method', 'find_methods',
-                     'skd_of', 'find_skd', 'check_query', 'sql'}
+                     'skd_of', 'find_skd', 'check_query', 'schema', 'sql'}
+
+
+def test_db_schema(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    resp = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                          'params': {'name': 'schema', 'arguments': {}}})
+    text = resp['result']['content'][0]['text']
+    assert 'meta_object' in text and 'module' in text and 'строк' in text
 
 
 def test_find_objects_and_card(tmp_path_factory):
