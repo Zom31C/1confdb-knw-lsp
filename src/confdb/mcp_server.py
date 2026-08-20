@@ -74,6 +74,34 @@ def ru_type_str(text):
         return text
     return _TYPE_SLASH_RE.sub(lambda m: TYPE_RU[m.group(0)[:-1]] + '.', text)
 
+
+# страница пагинации (строк) для очень длинных тел методов и оглавлений модулей
+_METHOD_PAGE = 250
+_OUTLINE_PAGE = 300
+
+
+def _paginate_lines(text, offset, limit, default_page, header=''):
+    """Постраничный вывод текста: строки offset..offset+limit (0-нумерация).
+
+    limit=0 — страница по умолчанию, если текст длиннее неё, иначе весь текст.
+    Всегда видно, сколько строк показано и как получить продолжение —
+    содержимое не обрезается молча.
+    """
+    lines = text.split('\n')
+    total = len(lines)
+    offset = max(0, offset)
+    page = limit if limit > 0 else (default_page if total > default_page else total)
+    chunk = lines[offset:offset + page]
+    shown_end = offset + len(chunk)
+    prefix = f'{header}: ' if header else ''
+    out = [f'{prefix}строки {offset + 1}-{shown_end} из {total}',
+           '\n'.join(chunk)]
+    if shown_end < total:
+        out.append(f'… продолжение: offset={shown_end}' +
+                   (f', limit={page}' if limit > 0 else ''))
+    return '\n'.join(out)
+
+
 PRIMER = """1confdb-knw: MCP server over a knowledge base of a 1C:Enterprise 8 configuration — metadata, BSL code and SKD queries, extracted from a binary .cf file into SQLite. 1C is a Russian business-automation platform; a configuration contains metadata objects, their fields, modules of 1C-language code (Russian keywords) and SKD report queries. All object/field names are in Russian.
 
 GLOSSARY: Catalog=справочник (directory), Document=документ, InformationRegister/AccumulationRegister=регистры, Enum=перечисление, DataProcessor=обработка, Report=отчет, DefinedType=определяемый тип, CommonAttribute=общий реквизит, CommonModule=общий модуль. Tabular section (табличная часть) = row table of an object (e.g. Документ.ЗаказПокупателя has section Запасы with fields Номенклатура, Цена…).
@@ -270,6 +298,26 @@ class McpServer:
         if mods:
             out.append('Модули: ' + ', '.join(
                 c + (f' [{x}]' if x else '') for c, x in mods))
+        if row[0] == 'Enum':
+            vals = [v[0] for v in q(
+                'SELECT name FROM enum_value WHERE object_id=? '
+                'ORDER BY ord LIMIT 60', (oid,))]
+            cnt = q('SELECT COUNT(*) FROM enum_value WHERE object_id=?',
+                    (oid,)).fetchone()[0]
+            if vals:
+                extra = f' (всего {cnt})' if cnt > len(vals) else ''
+                out.append('Значения перечисления' + extra + ': ' +
+                           ', '.join(vals))
+        elif row[0] == 'Catalog':
+            pre = q('SELECT name, code FROM predefined WHERE object_id=? '
+                    'ORDER BY ord LIMIT 60', (oid,)).fetchall()
+            cnt = q('SELECT COUNT(*) FROM predefined WHERE object_id=?',
+                    (oid,)).fetchone()[0]
+            if pre:
+                extra = f' (всего {cnt})' if cnt > len(pre) else ''
+                out.append('Предопределённые элементы' + extra + ': ' +
+                           ', '.join(n + (f' [{c}]' if c else '')
+                                     for n, c in pre))
         nskd = q('SELECT COUNT(*) FROM skd_query WHERE object_id=?',
                  (oid,)).fetchone()[0]
         if nskd:
@@ -363,16 +411,17 @@ class McpServer:
                        if rows else '—'))
         return '\n'.join(out)
 
-    def module_outline(self, path, code_name='obj'):
+    def module_outline(self, path, code_name='obj', offset=0, limit=0):
         path = self.resolve_path(path)
         row = self.conn().execute(
             'SELECT m.body FROM module m JOIN meta_object o ON o.id=m.object_id '
             'WHERE o.path=? AND m.code_name=?', (path, code_name)).fetchone()
         if not row or not row[0]:
             return f'модуль не найден: {path} ({code_name})'
-        return row[0]
+        return _paginate_lines(row[0], int(offset or 0), int(limit or 0),
+                               _OUTLINE_PAGE)
 
-    def get_method(self, path, code_name, name):
+    def get_method(self, path, code_name, name, offset=0, limit=0):
         path = self.resolve_path(path)
         row = self.conn().execute(
             'SELECT mt.kind, mt.name, mt.signature, mt.directives, '
@@ -389,7 +438,12 @@ class McpServer:
             parts.append('директивы: ' + row[3])
         if row[4]:
             parts.append('описание:\n' + row[4])
-        parts.append('тело:\n' + row[5])
+        body = row[5] or ''
+        total = body.count('\n') + 1
+        parts.append(_paginate_lines(body, int(offset or 0), int(limit or 0),
+                                     _METHOD_PAGE, header='тело'))
+        if total > _METHOD_PAGE and int(offset or 0) + _METHOD_PAGE < total:
+            parts.append('метод длинный — листай: offset/limit')
         return '\n'.join(parts)
 
     def find_methods(self, mask, path=None, limit=20):
@@ -545,14 +599,19 @@ TOOLS = [
     Tool('module_outline',
          'Table of contents of a 1C module: signatures, comments, #Если '
          "regions, WITHOUT method bodies. code_name: 'obj' (object module), "
-         "'mgr' (manager module) etc. Cheap way to inspect a module.",
-         _schema({'path': _STR, 'code_name': _STR}, ('path',)),
+         "'mgr' (manager module) etc. Cheap way to inspect a module. "
+         'For very long modules use offset/limit (0-based lines) to page.',
+         _schema({'path': _STR, 'code_name': _STR,
+                  'offset': _INT, 'limit': _INT}, ('path',)),
          McpServer.module_outline),
     Tool('get_method',
          'Full source of one procedure/function: signature, directives '
          '(&НаСервере…), description comment and body. Use after '
-         'find_methods/module_outline.',
-         _schema({'path': _STR, 'code_name': _STR, 'name': _STR},
+         'find_methods/module_outline. Long methods are paginated: the '
+         'response shows which lines are given and how to fetch the rest '
+         '(offset/limit, 0-based lines) — nothing is silently truncated.',
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
+                  'offset': _INT, 'limit': _INT},
                  ('path', 'code_name', 'name')),
          McpServer.get_method),
     Tool('find_methods',

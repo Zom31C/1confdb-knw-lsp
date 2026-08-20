@@ -1,6 +1,7 @@
 """Тесты MCP-сервера: протокол и инструменты на синтетической базе."""
 import json
 import os
+import sqlite3
 import sys
 import threading
 import urllib.request
@@ -16,12 +17,16 @@ from confdb.mcp_server import McpServer, resolve_db, start_http_server  # noqa: 
 from test_writer import make_dump  # noqa: E402
 
 
-def _server(tmp_path_factory):
+def _make_db(tmp_path_factory):
     dump = str(tmp_path_factory.mktemp('dump'))
     make_dump(dump)
     db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
     write_db(dump, db, source_file='t.cf')
-    return McpServer(db)
+    return db
+
+
+def _server(tmp_path_factory):
+    return McpServer(_make_db(tmp_path_factory))
 
 
 def _call(server, tool, **args):
@@ -52,6 +57,62 @@ def test_db_schema(tmp_path_factory):
                           'params': {'name': 'schema', 'arguments': {}}})
     text = resp['result']['content'][0]['text']
     assert 'meta_object' in text and 'module' in text and 'строк' in text
+
+
+def test_get_method_pagination(tmp_path_factory):
+    db = _make_db(tmp_path_factory)
+    long_body = '\n'.join(['\tА = 1;'] +
+                          [f'\t// строка {i}' for i in range(320)] +
+                          ['\tБ = 2;'])
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE method SET body=? WHERE name='Тест'", (long_body,))
+    server = McpServer(db)
+    text = _call(server, 'get_method', path='Справочник.Справочник1',
+                 code_name='obj', name='Тест')['content'][0]['text']
+    assert 'строки 1-250 из 322' in text
+    assert 'продолжение: offset=250' in text
+    tail = _call(server, 'get_method', path='Справочник.Справочник1',
+                 code_name='obj', name='Тест',
+                 offset=250, limit=100)['content'][0]['text']
+    assert 'строки 251-322 из 322' in tail
+    assert 'продолжение' not in tail
+    assert 'Б = 2;' in tail
+
+
+def test_module_outline_pagination(tmp_path_factory):
+    db = _make_db(tmp_path_factory)
+    long_body = '\n'.join(f'// заголовок {i}' for i in range(400))
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE module SET body=? WHERE code_name='obj'",
+                     (long_body,))
+    server = McpServer(db)
+    text = _call(server, 'module_outline', path='Справочник.Справочник1',
+                 code_name='obj')['content'][0]['text']
+    assert 'строки 1-300 из 400' in text and 'продолжение: offset=300' in text
+
+
+def test_object_card_enum_and_predefined(tmp_path_factory):
+    db = _make_db(tmp_path_factory)
+    with sqlite3.connect(db) as conn:
+        oid = conn.execute("SELECT id FROM meta_object "
+                           "WHERE path='Catalog/Справочник1'").fetchone()[0]
+        # перечисление
+        conn.execute("UPDATE meta_object SET type='Enum' WHERE id=?", (oid,))
+        conn.execute("INSERT INTO enum_value (object_id, ord, name) "
+                     "VALUES (?, 1, 'Значение1'), (?, 2, 'Значение2')",
+                     (oid, oid))
+    server = McpServer(db)
+    text = _call(server, 'object_card',
+                 path='Catalog/Справочник1')['content'][0]['text']
+    assert 'Значения перечисления' in text and 'Значение1' in text
+    # предопределённые элементы справочника
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE meta_object SET type='Catalog' WHERE id=?", (oid,))
+        conn.execute("INSERT INTO predefined (object_id, ord, name, code) "
+                     "VALUES (?, 1, 'Основной', '001')", (oid,))
+    text = _call(server, 'object_card',
+                 path='Catalog/Справочник1')['content'][0]['text']
+    assert 'Предопределённые элементы' in text and 'Основной [001]' in text
 
 
 def test_find_objects_and_card(tmp_path_factory):
