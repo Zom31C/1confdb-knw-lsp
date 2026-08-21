@@ -439,11 +439,18 @@ class Tui:
                 print(f'  {{"mcpServers": {{"1confdb-knw": '
                       f'{{"url": "http://127.0.0.1:{port}/mcp"}}}}}}')
                 print()
-                from .mcp_server import serve_http
+                from .mcp_server import create_bsl_proxy, serve_http
+                from types import SimpleNamespace
+                _proxy_args = SimpleNamespace(
+                    lsp_workspace=None, bsl_jar=None, java=None)
+                bsl = create_bsl_proxy(_proxy_args, db)
                 try:
-                    serve_http(db, '127.0.0.1', int(port))
+                    serve_http(db, '127.0.0.1', int(port), bsl=bsl)
                 except KeyboardInterrupt:
                     pass
+                finally:
+                    if bsl is not None:
+                        bsl.stop()
                 print('Сервер остановлен.')
                 input('Нажмите Enter…')
                 return
