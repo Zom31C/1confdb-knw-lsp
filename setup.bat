@@ -20,12 +20,12 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 :install
-echo Installing confdb into venv ...
+echo Installing confdb into venv (editable) ...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install .
+".venv\Scripts\python.exe" -m pip install -e .
 if errorlevel 1 (
     echo Retrying install without build isolation ...
-    ".venv\Scripts\python.exe" -m pip install --no-build-isolation .
+    ".venv\Scripts\python.exe" -m pip install --no-build-isolation -e .
 )
 if errorlevel 1 (
     echo Package installation failed.
