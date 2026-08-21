@@ -428,3 +428,109 @@ def test_http_chunked_request(tmp_path_factory):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_http_unknown_path_drains_body(tmp_path_factory):
+    """404 на неизвестный путь обязан дочитать тело, иначе keep-alive
+    соединение съезжает (следующий запрос ломается)."""
+    import http.client
+
+    server = _server(tmp_path_factory)
+    httpd, port = start_http_server(server)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection('127.0.0.1', port)
+        conn.request('POST', '/register',
+                     body=b'{"client_name": "test"}',
+                     headers={'Content-Type': 'application/json'})
+        resp = conn.getresponse()
+        assert resp.status == 201  # регистрация клиентов поддерживается
+        resp.read()
+        # то же соединение должно остаться рабочим
+        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                           'params': {}}).encode('utf-8')
+        conn.request('POST', '/mcp', body=body,
+                     headers={'Content-Type': 'application/json'})
+        assert conn.getresponse().status == 200
+        conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_http_oauth_flow(tmp_path_factory):
+    """OAuth 2.1 для клиентов типа Claude Code: метаданные, регистрация,
+    authorize с авто-редиректом, обмен кода с PKCE, работа MCP с токеном."""
+    import base64
+    import hashlib
+    import http.client
+    from urllib.parse import parse_qs, urlparse
+
+    server = _server(tmp_path_factory)
+    httpd, port = start_http_server(server)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection('127.0.0.1', port)
+
+        conn.request('GET', '/.well-known/oauth-protected-resource')
+        resp = conn.getresponse()
+        assert resp.status == 200
+        meta = json.loads(resp.read())
+        assert meta['authorization_servers']
+
+        conn.request('GET', '/.well-known/oauth-authorization-server')
+        meta = json.loads(conn.getresponse().read())
+        assert meta['registration_endpoint'].endswith('/oauth/register')
+        assert 'S256' in meta['code_challenge_methods_supported']
+
+        reg = json.dumps({'client_name': 'Claude Code',
+                          'redirect_uris': ['http://localhost:9/cb'],
+                          'grant_types': ['authorization_code'],
+                          'token_endpoint_auth_method': 'none'}).encode()
+        conn.request('POST', '/oauth/register', body=reg,
+                     headers={'Content-Type': 'application/json'})
+        resp = conn.getresponse()
+        assert resp.status == 201
+        client_id = json.loads(resp.read())['client_id']
+        assert client_id
+
+        verifier = 'verifier-1234567890abcdef'
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+        conn.request('GET', '/oauth/authorize?'
+                     f'client_id={client_id}&redirect_uri=http://localhost:9/cb'
+                     f'&code_challenge={challenge}&code_challenge_method=S256'
+                     '&state=xyz')
+        resp = conn.getresponse()
+        assert resp.status == 302
+        location = resp.getheader('Location')
+        resp.read()
+        qs = parse_qs(urlparse(location).query)
+        assert qs['state'] == ['xyz']
+        code = qs['code'][0]
+
+        conn.request('POST', '/oauth/token',
+                     body=(f'grant_type=authorization_code&code={code}'
+                           f'&code_verifier={verifier}'
+                           '&redirect_uri=http://localhost:9/cb'
+                           f'&client_id={client_id}').encode(),
+                     headers={'Content-Type':
+                              'application/x-www-form-urlencoded'})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        token = json.loads(resp.read())
+        assert token['access_token'] and token['token_type'] == 'Bearer'
+
+        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                           'params': {}}).encode('utf-8')
+        conn.request('POST', '/mcp', body=body,
+                     headers={'Content-Type': 'application/json',
+                              'Authorization':
+                                  'Bearer ' + token['access_token']})
+        assert conn.getresponse().status == 200
+        conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

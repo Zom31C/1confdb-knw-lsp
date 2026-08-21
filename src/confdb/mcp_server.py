@@ -22,7 +22,9 @@
 без ручной правки конфига.
 """
 import argparse
+import base64
 import glob
+import hashlib
 import json
 import os
 import queue
@@ -32,7 +34,7 @@ import sys
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote as urllib_quote, urlparse
 
 from .config import load_config, save_config
 from .db.writer import TYPE_RU
@@ -709,8 +711,16 @@ TOOLS = [
 
 
 def make_handler(server):
-    """HTTP-обработчик MCP: Streamable HTTP (POST /mcp) и legacy SSE (/sse)."""
-    state = {'lock': threading.Lock(), 'sessions': {}}
+    """HTTP-обработчик MCP: Streamable HTTP (POST /mcp), legacy SSE (/sse)
+    и минимальный OAuth 2.1 для клиентов, которым он нужен (Claude Code).
+
+    OAuth реализован по спецификации MCP (RFC 9728/8414/7591, authorization
+    code + PKCE) с автоматическим одобрением: сервер локальный, база
+    отдаётся read-only, реальная авторизация не требуется — поток нужен
+    только чтобы клиенты, ожидающие OAuth, могли подключиться.
+    """
+    state = {'lock': threading.Lock(), 'sessions': {},
+             'oauth_clients': {}, 'oauth_codes': {}, 'oauth_tokens': set()}
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -737,6 +747,19 @@ def make_handler(server):
             self.end_headers()
             if data:
                 self.wfile.write(data)
+
+        def _base_url(self):
+            return 'http://' + (self.headers.get('Host') or 'localhost')
+
+        def _read_body_bytes(self):
+            if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
+                return self._read_chunked()
+            length = int(self.headers.get('Content-Length') or 0)
+            return self.rfile.read(length) if length > 0 else b''
+
+        def _drain_body(self):
+            """Дочитать тело запроса, чтобы keep-alive соединение не съехало."""
+            self._read_body_bytes()
 
         def _read_msg(self):
             if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
@@ -775,18 +798,121 @@ def make_handler(server):
                 self.rfile.readline(65536)  # CRLF после чанка
             return b''.join(parts)
 
+        # -- OAuth 2.1 (авто-одобрение) -------------------------------------
+
+        def _oauth_resource_metadata(self):
+            base = self._base_url()
+            return self._send(200, {
+                'resource': base + '/mcp',
+                'authorization_servers': [base]})
+
+        def _oauth_server_metadata(self):
+            base = self._base_url()
+            return self._send(200, {
+                'issuer': base,
+                'authorization_endpoint': base + '/oauth/authorize',
+                'token_endpoint': base + '/oauth/token',
+                'registration_endpoint': base + '/oauth/register',
+                'response_types_supported': ['code'],
+                'grant_types_supported': ['authorization_code',
+                                          'refresh_token'],
+                'code_challenge_methods_supported': ['S256'],
+                'token_endpoint_auth_methods_supported': ['none']})
+
+        def _oauth_register(self):
+            try:
+                meta = json.loads(self._read_body_bytes() or b'{}')
+            except ValueError:
+                meta = {}
+            client_id = uuid.uuid4().hex
+            with state['lock']:
+                state['oauth_clients'][client_id] = meta
+            resp = {'client_id': client_id,
+                    'token_endpoint_auth_method': 'none'}
+            for key in ('client_name', 'redirect_uris', 'grant_types',
+                        'response_types'):
+                if meta.get(key) is not None:
+                    resp[key] = meta[key]
+            return self._send(201, resp)
+
+        def _oauth_authorize(self, qs):
+            params = parse_qs(qs)
+            redirect_uri = params.get('redirect_uri', [''])[0]
+            if not redirect_uri:
+                self._drain_body()
+                return self._send(400, {'error': 'redirect_uri required'})
+            code = uuid.uuid4().hex
+            with state['lock']:
+                state['oauth_codes'][code] = {
+                    'client_id': params.get('client_id', [''])[0],
+                    'redirect_uri': redirect_uri,
+                    'challenge': params.get('code_challenge', [''])[0]}
+            location = redirect_uri + ('&' if '?' in redirect_uri else '?') \
+                + 'code=' + code
+            if params.get('state'):
+                location += '&state=' + urllib_quote(params['state'][0])
+            self.send_response(302)
+            self.send_header('Location', location)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def _oauth_token(self):
+            params = parse_qs(self._read_body_bytes().decode('utf-8', 'replace'))
+            grant = params.get('grant_type', [''])[0]
+            if grant == 'refresh_token':
+                token = uuid.uuid4().hex
+                with state['lock']:
+                    state['oauth_tokens'].add(token)
+                return self._send(200, {'access_token': token,
+                                        'token_type': 'Bearer',
+                                        'expires_in': 3600,
+                                        'refresh_token': uuid.uuid4().hex})
+            code = params.get('code', [''])[0]
+            with state['lock']:
+                stored = state['oauth_codes'].pop(code, None)
+            if stored is None:
+                return self._send(400, {'error': 'invalid_grant'})
+            challenge = stored.get('challenge') or ''
+            if challenge:
+                verifier = params.get('code_verifier', [''])[0]
+                digest = hashlib.sha256(verifier.encode('ascii', 'ignore')).digest()
+                expect = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+                if expect != challenge:
+                    return self._send(400, {'error': 'invalid_grant'})
+            token = uuid.uuid4().hex
+            with state['lock']:
+                state['oauth_tokens'].add(token)
+            return self._send(200, {'access_token': token,
+                                    'token_type': 'Bearer',
+                                    'expires_in': 3600,
+                                    'refresh_token': uuid.uuid4().hex})
+
+        # -- маршрутизация ----------------------------------------------------
+
         def do_OPTIONS(self):
             self._send(204, extra={
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Mcp-Session-Id'})
+                'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers':
+                    'Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, '
+                    'Authorization'})
 
         def do_GET(self):
             path = urlparse(self.path)
             if path.path in ('/sse', '/mcp'):
                 return self._sse_stream()
+            if path.path in ('/.well-known/oauth-protected-resource',
+                             '/.well-known/oauth-protected-resource/mcp'):
+                return self._oauth_resource_metadata()
+            if path.path in ('/.well-known/oauth-authorization-server',
+                             '/.well-known/oauth-authorization-server/mcp'):
+                return self._oauth_server_metadata()
+            if path.path == '/oauth/authorize':
+                return self._oauth_authorize(path.query)
+            self._drain_body()
             return self._send(404, {'error': f'not found: {path.path}'})
 
         def do_DELETE(self):
+            self._drain_body()
             self._send(405, {'error': 'сессии не сохраняются'},
                        extra={'Allow': 'GET, POST'})
 
@@ -826,7 +952,12 @@ def make_handler(server):
 
         def do_POST(self):
             path = urlparse(self.path)
+            if path.path in ('/oauth/register', '/register'):
+                return self._oauth_register()
+            if path.path == '/oauth/token':
+                return self._oauth_token()
             if path.path not in ('/mcp', '/messages'):
+                self._drain_body()
                 return self._send(404, {'error': f'not found: {path.path}'})
             msg = self._read_msg()
             if msg is None:
