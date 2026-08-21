@@ -13,6 +13,7 @@ LLM-клиент подключается к одному серверу и по
 - лог Java-процесса уходит в ``bsl-lsp-server.log`` в каталоге workspace,
   чтобы не смешиваться с JSON-RPC в stdout.
 """
+import glob
 import json
 import os
 import subprocess
@@ -46,7 +47,11 @@ def find_jar(explicit=None):
 
 
 def find_java(explicit=None):
-    """java из JAVA_HOME либо из PATH."""
+    """java: явный путь → JAVA_HOME → PATH → типовые каталоги установки JDK.
+
+    JDK из winget (Temurin) не прописывает себя ни в JAVA_HOME, ни в PATH —
+    поэтому последними проверяются стандартные каталоги установки.
+    """
     if explicit:
         return explicit
     home = os.environ.get('JAVA_HOME')
@@ -55,7 +60,20 @@ def find_java(explicit=None):
         if os.path.isfile(exe):
             return exe
     import shutil
-    return shutil.which('java')
+    found = shutil.which('java')
+    if found:
+        return found
+    if os.name == 'nt':
+        patterns = (
+            r'C:\Program Files\Eclipse Adoptium\jdk*\bin\java.exe',
+            r'C:\Program Files\Java\jdk*\bin\java.exe',
+            r'C:\Program Files\Microsoft\jdk*\bin\java.exe',
+        )
+        for pattern in patterns:
+            matches = sorted(glob.glob(pattern), reverse=True)
+            if matches:
+                return matches[0]
+    return None
 
 
 class BslMcpProxy:
@@ -84,7 +102,9 @@ class BslMcpProxy:
         Бросает RuntimeError с человекочитаемой причиной при неудаче.
         """
         if not self.command and not self.java:
-            raise RuntimeError('не найдена java (JAVA_HOME или PATH)')
+            raise RuntimeError(
+                'не найдена java: установите JDK 21 (setup.bat предложит winget) '
+                'и перезапустите сервер, либо задайте JAVA_HOME/--java')
         self._ensure_workspace_config()
         log_path = os.path.join(self.workspace, 'bsl-lsp-server.log')
         try:
