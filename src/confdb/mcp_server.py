@@ -739,11 +739,41 @@ def make_handler(server):
                 self.wfile.write(data)
 
         def _read_msg(self):
-            length = int(self.headers.get('Content-Length') or 0)
+            if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
+                body = self._read_chunked()
+            else:
+                length = int(self.headers.get('Content-Length') or 0)
+                body = self.rfile.read(length)
             try:
-                return json.loads(self.rfile.read(length))
+                return json.loads(body)
             except ValueError:
                 return None
+
+        def _read_chunked(self):
+            """Тело запроса в chunked-кодировке (так шлют Node-клиенты,
+            например Claude Code)."""
+            parts = []
+            while True:
+                size_line = self.rfile.readline(65536)
+                if not size_line:
+                    break
+                size_token = size_line.strip().split(b';')[0]
+                if not size_token:
+                    continue
+                try:
+                    size = int(size_token, 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    # финальный блок: дочитать трейлеры до пустой строки
+                    while True:
+                        trailer = self.rfile.readline(65536)
+                        if trailer in (b'\r\n', b'\n', b''):
+                            break
+                    break
+                parts.append(self.rfile.read(size))
+                self.rfile.readline(65536)  # CRLF после чанка
+            return b''.join(parts)
 
         def do_OPTIONS(self):
             self._send(204, extra={

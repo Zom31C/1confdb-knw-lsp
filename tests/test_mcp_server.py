@@ -395,3 +395,36 @@ def test_http_client_reset_is_quiet(tmp_path_factory):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_http_chunked_request(tmp_path_factory):
+    """Claude Code шлёт POST с Transfer-Encoding: chunked — сервер обязан
+    прочитать тело и ответить 200."""
+    import http.client
+
+    server = _server(tmp_path_factory)
+    httpd, port = start_http_server(server)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                       'params': {}}).encode('utf-8')
+    try:
+        conn = http.client.HTTPConnection('127.0.0.1', port)
+        # iterable-тело — http.client сам включает chunked-кодировку
+        conn.request('POST', '/mcp', body=iter([body]),
+                     headers={'Content-Type': 'application/json'})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        data = json.loads(resp.read().decode('utf-8'))
+        assert data['result']['serverInfo']['name'] == '1confdb-knw'
+        conn.close()
+
+        # сервер продолжает работать и отвечать на обычные запросы
+        conn = http.client.HTTPConnection('127.0.0.1', port)
+        conn.request('POST', '/mcp', body=body,
+                     headers={'Content-Type': 'application/json'})
+        assert conn.getresponse().status == 200
+        conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
