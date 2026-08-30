@@ -147,6 +147,7 @@ class Tui:
         self.prefix = opts.get('prefix', '')
         self.keep_temp = bool(opts.get('keep_temp'))
         self.store_blobs = bool(opts.get('store_blobs'))
+        self.skip_errors = bool(opts.get('skip_errors'))
         self.workers = int(opts.get('workers') or bench_workers() or 1)
 
     def _save(self):
@@ -158,7 +159,8 @@ class Tui:
             'options': {
                 'src': self.src, 'db': self.db, 'dump': self.dump, 'temp': self.temp,
                 'prefix': self.prefix, 'keep_temp': self.keep_temp,
-                'store_blobs': self.store_blobs, 'workers': self.workers,
+                'store_blobs': self.store_blobs, 'skip_errors': self.skip_errors,
+                'workers': self.workers,
             },
         })
 
@@ -333,6 +335,8 @@ class Tui:
         options = {'store_blobs': self.store_blobs}
         if self.prefix:
             options['prefix'] = self.prefix
+        if self.skip_errors:
+            options['skip_errors'] = True
         _cls()
         try:
             stats = extract(
@@ -371,6 +375,7 @@ class Tui:
             print(f' 3. Префикс имён для снятия:   {self.prefix or "<нет>"}')
             print(f' 4. Не удалять рабочий каталог: {"да" if self.keep_temp else "нет"}')
             print(f' 5. Хранить бинарники (BLOB):  {"да" if self.store_blobs else "нет"}')
+            print(f' 6. Пропускать ошибки объектов: {"да" if self.skip_errors else "нет"}')
             print(' 0. Назад')
             choice = input('Выбор: ').strip()
             if choice == '0':
@@ -391,6 +396,10 @@ class Tui:
                 self.keep_temp = _yes_no('Не удалять рабочий каталог?', self.keep_temp)
             elif choice == '5':
                 self.store_blobs = _yes_no('Хранить бинарники в БД (BLOB)?', self.store_blobs)
+            elif choice == '6':
+                self.skip_errors = _yes_no(
+                    'Пропускать объекты с ошибками декодирования (дамп/база будут неполными)?',
+                    self.skip_errors)
             else:
                 print('Неизвестный пункт меню.')
                 input('Нажмите Enter…')

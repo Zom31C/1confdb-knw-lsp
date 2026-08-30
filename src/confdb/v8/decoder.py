@@ -1,9 +1,15 @@
 """Диспетчер типов/версий и рекурсивный разбор метаданных.
 
 Порт decode-части v8unpack.decoder (MIT) — только разбор, без сборки.
+
+Отклонение от эталона (осознанное): опция options['skip_errors'] — объект,
+упавший при декодировании, пропускается с сообщением, разбор продолжается
+(у эталона любая ошибка прерывает весь файл). В штатном режиме поведение
+идентично эталону.
 """
 import os
 import shutil
+import sys
 from datetime import datetime
 
 from . import helper
@@ -18,6 +24,43 @@ available_types = {
     'Configuration': Configuration,
     'ConfigurationExtension': ConfigurationExtension
 }
+
+# счётчик пропущенных объектов (общий для пула процессов)
+_ERR_COUNT = None
+
+
+def _err_counter():
+    global _ERR_COUNT
+    if _ERR_COUNT is None:
+        import multiprocessing
+        _ERR_COUNT = multiprocessing.get_context('spawn').Value('I', 0)
+    return _ERR_COUNT
+
+
+def _reset_err_counter():
+    global _ERR_COUNT
+    _ERR_COUNT = None
+
+
+def _worker_init(shared, err_count):
+    """Инициализатор дочернего процесса пула: прогресс + счётчик ошибок."""
+    global _ERR_COUNT
+    _ERR_COUNT = err_count
+    progress.attach_shared(shared)
+
+
+def _skip_error(err, include_type):
+    """В режиме skip_errors: учесть и напечатать ошибку вместо прерывания."""
+    counter = _err_counter()
+    with counter.get_lock():
+        counter.value += 1
+    inner = ''
+    stack = getattr(err, 'stack', None)
+    if stack:
+        last = stack[-1]
+        inner = f' ({last.get("message", "")}: {last.get("detail", "")})'
+    title = getattr(err, 'title', None) or str(err)
+    print(f'\nПропуск объекта {include_type}: {title}{inner}', file=sys.stderr)
 
 
 class Decoder:
@@ -88,12 +131,14 @@ class Decoder:
                 total += os.path.getsize(os.path.join(dirpath, fn))
 
         own_pool = False
+        _reset_err_counter()
+        err_count = _err_counter()
         if workers and workers > 1 and pool is None:
             import multiprocessing
             ctx = multiprocessing.get_context('spawn')
             shared = ctx.Value('Q', 0)
             progress.start('Декодируем метаданные', total, shared=shared)
-            pool = ctx.Pool(workers, initializer=progress.attach_shared, initargs=(shared,))
+            pool = ctx.Pool(workers, initializer=_worker_init, initargs=(shared, err_count))
             own_pool = True
         else:
             progress.start('Декодируем метаданные', total)
@@ -109,6 +154,9 @@ class Decoder:
                 pool.close()
                 pool.join()
             progress.finish()
+        if err_count.value:
+            print(f'ВНИМАНИЕ: пропущено объектов с ошибками декодирования: '
+                  f'{err_count.value} — дамп и база неполные.')
         print(f'{"Разбор объекта закончен":30}: {datetime.now() - begin}')
 
     @classmethod
@@ -121,11 +169,17 @@ class Decoder:
                                    parent_type=include_type)
             return tasks
         except ExtException as err:
+            if (options or {}).get('skip_errors'):
+                _skip_error(err, include_type)
+                return []
             raise ExtException(
                 parent=err,
                 action=f'{cls.__name__}.decode_include {include_type}'
             )
         except Exception as err:
+            if (options or {}).get('skip_errors'):
+                _skip_error(ExtException(parent=err), include_type)
+                return []
             raise ExtException(parent=err, action=f'{cls.__name__}.decode_include')
 
 

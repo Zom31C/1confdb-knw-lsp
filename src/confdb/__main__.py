@@ -28,6 +28,9 @@ def build_parser():
     p.add_argument('--workers', metavar='N', type=int, default=None,
                    help='число процессов стадии 3 и записи БД '
                         '(по умолчанию — результат "confdb bench" или 1)')
+    p.add_argument('--skip-errors', action='store_true',
+                   help='не прерываться на ошибке декодирования объекта: '
+                        'пропустить его и продолжить (дамп и база будут неполными)')
 
     c = subparsers.add_parser('check', help='проверить запросы СКД в готовой базе')
     c.add_argument('db', help='путь к базе SQLite')
@@ -57,9 +60,10 @@ def build_parser():
         '1confdb-knw',
         help='MCP-сервер знаний по конфигурации 1С и BSL для внешних LLM '
              '(stdio; --port — HTTP для SSH-туннеля)')
-    m.add_argument('db', nargs='?', default=None,
-                   help='путь к базе SQLite; без пути — last_db из конфига '
-                        'или автопоиск *.db/*.sqlite')
+    m.add_argument('db', nargs='*', default=None,
+                   help='пути к базам SQLite (можно несколько: основная '
+                        'конфигурация + расширения/обработки); без путей — '
+                        'last_db из конфига или автопоиск *.db/*.sqlite')
     m.add_argument('--lsp-workspace', metavar='DIR', default=None,
                    help='каталог дампа для инструментов bsl_* (BSL Language Server)')
     m.add_argument('--bsl-jar', metavar='JAR', default=None,
@@ -120,7 +124,7 @@ def main(argv=None):
 
     if args.cmd == '1confdb-knw':
         from .mcp_server import main as mcp_main
-        argv = [args.db] if args.db else []
+        argv = list(args.db or ())
         if args.port:
             argv += ['--host', args.host, '--port', str(args.port)]
         if args.lsp_workspace:
@@ -166,6 +170,8 @@ def main(argv=None):
     options = {'store_blobs': args.store_blobs}
     if args.prefix:
         options['prefix'] = args.prefix
+    if args.skip_errors:
+        options['skip_errors'] = True
 
     try:
         stats = extract(

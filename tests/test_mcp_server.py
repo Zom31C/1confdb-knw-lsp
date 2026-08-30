@@ -48,7 +48,8 @@ def test_tools_list(tmp_path_factory):
     names = {t['name'] for t in resp['result']['tools']}
     assert names == {'find_objects', 'object_card', 'object_tree', 'find_field',
                      'refs_of', 'module_outline', 'get_method', 'find_methods',
-                     'skd_of', 'find_skd', 'check_query', 'schema', 'sql'}
+                     'skd_of', 'find_skd', 'check_query', 'schema', 'sql',
+                     'db_list', 'db_open', 'db_use', 'db_close'}
 
 
 def test_db_schema(tmp_path_factory):

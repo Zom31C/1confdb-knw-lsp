@@ -1,6 +1,7 @@
 """Тесты MCP-шлюза к BSL Language Server (mcp_bsl_proxy)."""
 import json
 import os
+import sqlite3
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -11,11 +12,19 @@ from confdb.mcp_server import McpServer  # noqa: E402
 FAKE_SERVER = os.path.join(os.path.dirname(__file__), 'fake_bsl_mcp.py')
 
 
+def _make_db(path):
+    """Минимальная валидная база confdb: мульти-БД open_db требует meta_object."""
+    conn = sqlite3.connect(str(path))
+    conn.execute('CREATE TABLE meta_object (id INTEGER PRIMARY KEY)')
+    conn.commit()
+    conn.close()
+
+
 def make_proxy(tmp_path):
     workspace = tmp_path / 'ws'
     workspace.mkdir()
     db = tmp_path / 'test.db'
-    db.write_bytes(b'')
+    _make_db(db)
     return BslMcpProxy(jar='не-используется.jar', workspace=str(workspace),
                        db_path=str(db),
                        command=[sys.executable, FAKE_SERVER])
@@ -55,7 +64,9 @@ def test_mcp_server_merges_bsl_tools(tmp_path):
 
 
 def test_mcp_server_without_bsl_rejects_bsl_tools(tmp_path):
-    server = McpServer(str(tmp_path / 'нет.db'))
+    db = tmp_path / 'нет.db'
+    _make_db(db)
+    server = McpServer(str(db))
     resp = server.handle({'method': 'tools/call', 'id': 1, 'params': {
         'name': 'bsl_hover', 'arguments': {}}})
     assert resp['error']['code'] == -32602

@@ -29,11 +29,12 @@ def test_main_missing_file(tmp_path):
 
 
 def test_mcp_db_optional():
-    # без пути база ищется автоматически (last_db из конфига, затем обход)
+    # без пути база ищется автоматически (last_db из конфига, затем обход);
+    # nargs='*' даёт пустой список, а не None
     args = build_parser().parse_args(['1confdb-knw'])
-    assert args.db is None
+    assert args.db == []
     args = build_parser().parse_args(['1confdb-knw', 'out.db', '--port', '8765'])
-    assert args.db == 'out.db' and args.port == 8765
+    assert args.db == ['out.db'] and args.port == 8765
 
 
 def test_main_mcp_missing_db(tmp_path):
