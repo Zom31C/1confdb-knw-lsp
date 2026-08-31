@@ -216,30 +216,27 @@ class Tui:
             _cls()
             print(f'confdb {__version__} — экстрактор конфигурации 1С в SQLite')
             print('===========================================================')
-            print(' 1. Извлечь конфигурацию (.cf/.cfe/.epf -> SQLite)')
-            print(' 2. Запросы к базе данных')
-            print(' 3. Проверка запросов СКД')
-            print(' 4. Запустить MCP-сервер (1confdb-knw)')
-            print(' 5. Опции извлечения')
-            print(' 6. Бенчмарк: подбор числа процессов под железо')
-            print(' 7. Группы баз: именованные наборы для MCP-сервера')
+            print(' 1. Запустить MCP-сервер (1confdb-knw)')
+            print(' 2. Извлечь конфигурацию (.cf/.cfe/.epf -> SQLite)')
+            print(' 3. Опции извлечения')
+            print(' 4. Запросы к базе данных')
+            print(' 5. Проверка запросов СКД')
+            print(' 6. Группы баз: именованные наборы для MCP-сервера')
             print(' 0. Выход')
             if self.last_db:
                 print(f'Последняя БД: {self.last_db}')
             choice = input('Выбор: ').strip()
             if choice == '1':
-                self._extract_menu()
-            elif choice == '2':
-                self._query_menu()
-            elif choice == '3':
-                self._check_queries()
-            elif choice == '4':
                 self._run_mcp()
-            elif choice == '5':
+            elif choice == '2':
+                self._extract_menu()
+            elif choice == '3':
                 self._options_menu()
+            elif choice == '4':
+                self._query_menu()
+            elif choice == '5':
+                self._check_queries()
             elif choice == '6':
-                self._run_bench()
-            elif choice == '7':
                 self._groups_menu()
             elif choice in ('0', 'q', 'exit', 'выход'):
                 _cls()
@@ -423,7 +420,9 @@ class Tui:
             print(f' 3. Префикс имён для снятия:   {self.prefix or "<нет>"}')
             print(f' 4. Не удалять рабочий каталог: {"да" if self.keep_temp else "нет"}')
             print(f' 5. Хранить бинарники (BLOB):  {"да" if self.store_blobs else "нет"}')
-            print(f' 6. Пропускать ошибки объектов: {"да" if self.skip_errors else "нет"}')
+            print(f' 6. Пропускать ошибки объектов (--skip-errors): '
+                  f'{"да" if self.skip_errors else "нет"}')
+            print(' 7. Бенчмарк: подобрать число процессов под железо')
             print(' 0. Назад')
             choice = input('Выбор: ').strip()
             if choice == '0':
@@ -448,6 +447,8 @@ class Tui:
                 self.skip_errors = _yes_no(
                     'Пропускать объекты с ошибками декодирования (дамп/база будут неполными)?',
                     self.skip_errors)
+            elif choice == '7':
+                self._run_bench()
             else:
                 print('Неизвестный пункт меню.')
                 input('Нажмите Enter…')
@@ -467,13 +468,13 @@ class Tui:
             print('--- MCP-сервер 1confdb-knw: что открыть ---')
             names = list(self.groups)
             if names:
-                print('Группы баз (создать/изменить — пункт 7 главного меню):')
+                print('Группы баз (создать/изменить — пункт 6 главного меню):')
                 for i, name in enumerate(names, 1):
                     shown = ', '.join(os.path.basename(d)
                                       for d in self.groups[name])
                     print(f' {i}. {name}: {shown}')
             else:
-                print('Групп баз пока нет — создать можно в пункте 7.')
+                print('Групп баз пока нет — создать можно в пункте 6.')
             print()
             print(' m. Выбрать базы вручную (одну или несколько)')
             print(' 0. Назад')
@@ -520,7 +521,7 @@ class Tui:
             else:
                 print(' Групп пока нет.')
             print()
-            print('База может входить в несколько групп; запуск — пункт 4.')
+            print('База может входить в несколько групп; запуск — пункт 1.')
             print(' n. Создать/переписать группу')
             print(' d. Удалить группу')
             print(' 0. Назад')
@@ -750,7 +751,7 @@ class Tui:
             elif choice == '4':
                 names = list(self.groups)
                 if not names:
-                    print('Групп нет — создать можно в пункте 7 главного меню.')
+                    print('Групп нет — создать можно в пункте 6 главного меню.')
                     input('Нажмите Enter…')
                     continue
                 for i, name in enumerate(names, 1):
