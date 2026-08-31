@@ -1,8 +1,10 @@
 """Консольный интерфейс confdb (только стандартная библиотека).
 
 Меню с обновлением экрана: извлечение конфигурации, SQL-запросы к базе,
-проверка запросов СКД, запуск MCP-сервера 1confdb-knw.
-Недавние пути .cf/.sqlite и опции запоминаются в ~/.confdb/config.json.
+проверка запросов СКД, запуск MCP-сервера 1confdb-knw (одна база,
+несколько баз или именованная группа баз).
+Недавние пути .cf/.sqlite, опции и группы баз запоминаются
+в ~/.confdb/config.json.
 Запуск: confdb-ui.bat (или python -m confdb.tui)
 """
 import glob
@@ -134,6 +136,41 @@ def _cell(value):
     return text
 
 
+def load_groups(config):
+    """Группы баз из конфига; старый ключ 'packs' читается как группы."""
+    raw = config.get('groups')
+    if raw is None:
+        raw = config.get('packs') or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(name): [str(p) for p in dbs]
+            for name, dbs in raw.items()
+            if isinstance(dbs, (list, tuple))}
+
+
+def replace_server_dbs(server, paths):
+    """Заменяет открытые базы запущенного сервера на указанный набор.
+
+    Всё открытое закрывается и открывается заново — свежие соединения,
+    в том числе после пересборки баз. Возвращает (алиасы, ошибки).
+    """
+    for alias in list(server.dbs):
+        server.close_db(alias)
+    opened, errors = [], []
+    for path in paths:
+        try:
+            opened.append(server.open_db(path, activate=False))
+        except ValueError as err:
+            errors.append(str(err))
+    return opened, errors
+
+
+def _bsl_proxy_args():
+    """Аргументы прокси BSL при запуске из TUI (пути берутся из конфига)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(lsp_workspace=None, bsl_jar=None, java=None)
+
+
 class Tui:
     def __init__(self):
         config = _load_config()
@@ -151,8 +188,7 @@ class Tui:
         self.store_blobs = bool(opts.get('store_blobs'))
         self.skip_errors = bool(opts.get('skip_errors'))
         self.workers = int(opts.get('workers') or bench_workers() or 1)
-        self.packs = {str(k): [str(p) for p in v]
-                      for k, v in (config.get('packs') or {}).items()}
+        self.groups = load_groups(config)
 
     def _save(self):
         # сливаем с текущим конфигом, чтобы не затереть чужие ключи
@@ -163,7 +199,7 @@ class Tui:
             'recent_db': self.recent_db,
             'db_dirs': self.db_dirs,
             'last_db': self.last_db,
-            'packs': self.packs,
+            'groups': self.groups,
             'options': {
                 'src': self.src, 'db': self.db, 'dump': self.dump, 'temp': self.temp,
                 'prefix': self.prefix, 'keep_temp': self.keep_temp,
@@ -186,8 +222,7 @@ class Tui:
             print(' 4. Запустить MCP-сервер (1confdb-knw)')
             print(' 5. Опции извлечения')
             print(' 6. Бенчмарк: подбор числа процессов под железо')
-            print(' 7. Извлечь пакет файлов (основная + расширения, --skip-errors)')
-            print(' 8. Паки баз: несколько конфигураций/расширений в MCP-сервере')
+            print(' 7. Группы баз: именованные наборы для MCP-сервера')
             print(' 0. Выход')
             if self.last_db:
                 print(f'Последняя БД: {self.last_db}')
@@ -205,9 +240,7 @@ class Tui:
             elif choice == '6':
                 self._run_bench()
             elif choice == '7':
-                self._run_batch_extract()
-            elif choice == '8':
-                self._packs_menu()
+                self._groups_menu()
             elif choice in ('0', 'q', 'exit', 'выход'):
                 _cls()
                 print('До свидания.')
@@ -422,195 +455,116 @@ class Tui:
     # ---------- MCP-сервер ----------
 
     def _run_mcp(self):
-        db = self._pick_db('База для MCP-сервера 1confdb-knw')
-        if not db:
+        dbs, title = self._pick_launch_set()
+        if not dbs:
             return
+        self._launch_mcp(dbs, title)
+
+    def _pick_launch_set(self):
+        """Что открыть: группа баз либо одна/несколько баз вручную."""
         while True:
             _cls()
-            print('--- MCP-сервер 1confdb-knw ---')
-            print(f' База: {db}')
-            print(' 1. stdio — клиент сам запускает процесс')
-            print(' 2. Сеть (HTTP-порт) — удалённые клиенты через SSH-туннель')
+            print('--- MCP-сервер 1confdb-knw: что открыть ---')
+            names = list(self.groups)
+            if names:
+                print('Группы баз (создать/изменить — пункт 7 главного меню):')
+                for i, name in enumerate(names, 1):
+                    shown = ', '.join(os.path.basename(d)
+                                      for d in self.groups[name])
+                    print(f' {i}. {name}: {shown}')
+            else:
+                print('Групп баз пока нет — создать можно в пункте 7.')
+            print()
+            print(' m. Выбрать базы вручную (одну или несколько)')
             print(' 0. Назад')
             choice = input('Выбор: ').strip()
             if choice == '0':
-                return
-            if choice == '1':
-                _cls()
-                print('Сервер работает по stdio; остановка — Ctrl+C.')
-                print(f'  {{"command": "{sys.executable}", '
-                      f'"args": ["-m", "confdb.mcp_server", "{db}"]}}')
-                print()
-                try:
-                    subprocess.run([sys.executable, '-m', 'confdb.mcp_server', db])
-                except KeyboardInterrupt:
-                    pass
-                print('Сервер остановлен.')
-                input('Нажмите Enter…')
-                return
-            if choice == '2':
-                port = _ask('Порт', '8765')
-                if not port.isdigit():
-                    print('Нужно целое число.')
+                return [], ''
+            if choice == 'm':
+                dbs = self._multi_select(
+                    'Базы для MCP-сервера (первая — основная)',
+                    self._db_pool(), ordered=True)
+                return (dbs or []), 'выбранные базы'
+            if choice.isdigit() and 1 <= int(choice) <= len(names):
+                name = names[int(choice) - 1]
+                raw = self.groups[name]
+                dbs = [d for d in raw if os.path.isfile(d)]
+                for d in raw:
+                    if not os.path.isfile(d):
+                        print(f'Не найдена база (пропущена): {d}')
+                if not dbs:
+                    print('В группе нет доступных баз.')
                     input('Нажмите Enter…')
                     continue
-                _cls()
-                print(f'Сервер слушает http://127.0.0.1:{port}/mcp '
-                      '(legacy SSE: /sse); остановка — Ctrl+C.')
-                print('С другой машины — через SSH-туннель:')
-                print(f'  ssh -L {port}:127.0.0.1:{port} user@host')
-                print('Конфигурация клиента:')
-                print(f'  {{"mcpServers": {{"1confdb-knw": '
-                      f'{{"url": "http://127.0.0.1:{port}/mcp"}}}}}}')
-                print()
-                from .mcp_server import create_bsl_proxy, serve_http
-                from types import SimpleNamespace
-                _proxy_args = SimpleNamespace(
-                    lsp_workspace=None, bsl_jar=None, java=None)
-                bsl = create_bsl_proxy(_proxy_args, db)
-                try:
-                    serve_http(db, '127.0.0.1', int(port), bsl=bsl)
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    if bsl is not None:
-                        bsl.stop()
-                print('Сервер остановлен.')
-                input('Нажмите Enter…')
-                return
-            print('Неизвестный пункт меню.')
+                return dbs, f'группа «{name}»'
+            print('Неизвестный пункт.')
             input('Нажмите Enter…')
 
-    # ---------- пакетное извлечение ----------
-
-    def _run_batch_extract(self):
-        pool = _cf_candidates() + [r for r in self.recent_src if os.path.isfile(r)]
-        sources = self._multi_select(
-            'Пакетное извлечение: файлы .cf/.cfe/.epf (первый — основная конфигурация)',
-            pool, ordered=True)
-        if not sources:
-            return
-        _cls()
-        print('Пакетное извлечение (для каждого файла применяется --skip-errors):')
-        for s in sources:
-            print(f'  {s}')
-        if not _yes_no('Запустить распаковку?', True):
-            return
-        produced = []
-        for src in sources:
-            db, _dump = _out_defaults(src)
-            os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
-            options = {'store_blobs': self.store_blobs, 'skip_errors': True}
-            if self.prefix:
-                options['prefix'] = self.prefix
-            print(f'\n== {os.path.basename(src)} -> {db} ==')
-            try:
-                stats = extract(src, db_path=db, dump_dir=None,
-                                temp_dir=self.temp or None,
-                                keep_temp=self.keep_temp, options=options,
-                                workers=self.workers)
-                produced.append(stats.get('db') or db)
-                self.recent_src = _remember(self.recent_src, src)
-                self.recent_db = _remember(self.recent_db, db)
-            except Exception as err:
-                print(f'Ошибка извлечения {os.path.basename(src)}: {err}')
-        if produced:
-            self.last_db = produced[0]
-        self._save()
-        print(f'\nГотово баз: {len(produced)} из {len(sources)}.')
-        if produced and _yes_no('Собрать из полученных баз пак?', True):
-            name = _ask('Имя пака', 'пак')
-            if name:
-                self.packs[name] = produced
-                self._save()
-                print(f'Пак «{name}» сохранён ({len(produced)} баз).')
-        input('Нажмите Enter…')
-
-    # ---------- паки ----------
+    # ---------- группы баз ----------
 
     def _db_pool(self):
         recent = [r for r in ([self.last_db] + self.recent_db)
                   if r and os.path.isfile(r)]
         return self._db_candidates() + recent
 
-    def _packs_menu(self):
+    def _groups_menu(self):
         while True:
             _cls()
-            print('--- Паки баз: несколько конфигураций/расширений в MCP ---')
-            names = list(self.packs)
+            print('--- Группы баз для MCP-сервера ---')
+            names = list(self.groups)
             if names:
                 for i, name in enumerate(names, 1):
-                    dbs = self.packs[name]
+                    dbs = self.groups[name]
                     shown = ', '.join(os.path.basename(d) for d in dbs)
                     print(f' {i}. {name}: {shown}')
             else:
-                print(' Паков пока нет.')
+                print(' Групп пока нет.')
             print()
-            print(' n. Создать/переписать пак')
-            print(' d. Удалить пак')
-            print(' l. Запустить без пака (выбрать базы вручную)')
+            print('База может входить в несколько групп; запуск — пункт 4.')
+            print(' n. Создать/переписать группу')
+            print(' d. Удалить группу')
             print(' 0. Назад')
             choice = input('Выбор: ').strip()
             if choice == '0':
                 self._save()
                 return
             if choice == 'n':
-                self._edit_pack()
+                self._edit_group()
             elif choice == 'd':
-                self._delete_pack()
-            elif choice == 'l':
-                dbs = self._multi_select(
-                    'Запуск нескольких баз (первая — основная)',
-                    self._db_pool(), ordered=True)
-                if dbs:
-                    self._launch_mcp_multi(dbs)
-            elif choice.isdigit() and 1 <= int(choice) <= len(names):
-                self._launch_pack(names[int(choice) - 1])
+                self._delete_group()
             else:
                 print('Неизвестный пункт.')
                 input('Нажмите Enter…')
 
-    def _edit_pack(self):
-        name = _ask('Имя пака')
+    def _edit_group(self):
+        name = _ask('Имя группы')
         if not name:
             return
-        dbs = self._multi_select(f'Базы пака «{name}» (первая — основная)',
+        dbs = self._multi_select(f'Базы группы «{name}» (первая — основная)',
                                  self._db_pool(),
-                                 selected=self.packs.get(name, []), ordered=True)
+                                 selected=self.groups.get(name, []), ordered=True)
         if dbs is None:
             return
         if dbs:
-            self.packs[name] = dbs
+            self.groups[name] = dbs
         else:
-            self.packs.pop(name, None)
+            self.groups.pop(name, None)
         self._save()
 
-    def _delete_pack(self):
-        names = list(self.packs)
+    def _delete_group(self):
+        names = list(self.groups)
         if not names:
-            print('Паков нет.')
+            print('Групп нет.')
             input('Нажмите Enter…')
             return
         for i, n in enumerate(names, 1):
             print(f' {i}. {n}')
-        pick = _ask('Номер пака для удаления')
+        pick = _ask('Номер группы для удаления')
         if pick.isdigit() and 1 <= int(pick) <= len(names):
             name = names[int(pick) - 1]
-            if _yes_no(f'Удалить пак «{name}»?', False):
-                self.packs.pop(name, None)
+            if _yes_no(f'Удалить группу «{name}»?', False):
+                self.groups.pop(name, None)
                 self._save()
-
-    def _launch_pack(self, name):
-        raw = self.packs.get(name, [])
-        dbs = [d for d in raw if os.path.isfile(d)]
-        for d in raw:
-            if not os.path.isfile(d):
-                print(f'Не найдена база (пропущена): {d}')
-        if not dbs:
-            print('В паке нет доступных баз.')
-            input('Нажмите Enter…')
-            return
-        self._launch_mcp_multi(dbs, title=f'пак «{name}»')
 
     # ---------- выбор нескольких файлов ----------
 
@@ -662,9 +616,9 @@ class Tui:
             print('Непонятная команда.')
             input('Нажмите Enter…')
 
-    # ---------- MCP: несколько баз ----------
+    # ---------- MCP: запуск выбранного набора баз ----------
 
-    def _launch_mcp_multi(self, dbs, title='несколько баз'):
+    def _launch_mcp(self, dbs, title):
         while True:
             _cls()
             print(f'--- MCP-сервер: {title} ---')
@@ -704,15 +658,15 @@ class Tui:
             input('Нажмите Enter…')
             return
         from .mcp_server import McpServer, start_http_server, create_bsl_proxy
-        from types import SimpleNamespace
-        _proxy_args = SimpleNamespace(lsp_workspace=None, bsl_jar=None, java=None)
-        bsl = create_bsl_proxy(_proxy_args, dbs[0])
+        bsl = create_bsl_proxy(_bsl_proxy_args(), dbs[0])
         server = McpServer(dbs, bsl=bsl)
         try:
             httpd, real_port = start_http_server(server, '127.0.0.1', int(port))
         except OSError as err:
             print(f'Не удалось занять порт {port}: {err}')
             input('Нажмите Enter…')
+            if bsl is not None:
+                bsl.stop()
             return
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _cls()
@@ -734,6 +688,17 @@ class Tui:
         print('Сервер остановлен.')
         input('Нажмите Enter…')
 
+    def _rebind_bsl(self, server, alias):
+        """Перепривязывает BSL-шлюз к новой первой базе после перезагрузки."""
+        if getattr(server, 'bsl', None) is None:
+            return
+        from .mcp_server import create_bsl_proxy
+        new_bsl = create_bsl_proxy(_bsl_proxy_args(),
+                                   server.dbs[alias]['path'])
+        if new_bsl is not None:
+            server.bsl.stop()
+            server.bsl = new_bsl
+
     def _server_control(self, server):
         while True:
             _cls()
@@ -743,6 +708,7 @@ class Tui:
             print(' 1. Сменить активную базу')
             print(' 2. Открыть ещё базу')
             print(' 3. Закрыть базу')
+            print(' 4. Применить группу (заменить открытые базы)')
             print(' 0. Остановить сервер и выйти')
             choice = input('Выбор: ').strip()
             if choice == '0':
@@ -780,6 +746,26 @@ class Tui:
                         server.close_db(aliases[int(pick) - 1])
                     except ValueError as err:
                         print(f'Ошибка: {err}')
+                    input('Нажмите Enter…')
+            elif choice == '4':
+                names = list(self.groups)
+                if not names:
+                    print('Групп нет — создать можно в пункте 7 главного меню.')
+                    input('Нажмите Enter…')
+                    continue
+                for i, name in enumerate(names, 1):
+                    print(f'  {i}. {name}')
+                pick = _ask('Номер группы (открытые базы будут заменены)')
+                if pick.isdigit() and 1 <= int(pick) <= len(names):
+                    group = self.groups[names[int(pick) - 1]]
+                    opened, errors = replace_server_dbs(server, group)
+                    for err in errors:
+                        print(f'Ошибка: {err}')
+                    if opened:
+                        print('Открыты базы: ' + ', '.join(opened))
+                        self._rebind_bsl(server, opened[0])
+                    else:
+                        print('Сервер остался без баз — откройте вручную (пункт 2).')
                     input('Нажмите Enter…')
             else:
                 print('Неизвестный пункт.')

@@ -151,7 +151,7 @@ COMMON MODULES: in BSL code a common module is called by its bare name: 'Имя�
 
 DATABASE FILE: the SQLite file is internal to the server. Do NOT search for it, open it, read it from disk, or ask the user for its location — you have no filesystem access to it. Everything is available through the tools below; the sql tool runs arbitrary read-only SELECTs.
 
-MULTIPLE DATABASES: the server can hold several knowledge bases at once — typically the MAIN configuration plus extensions/data processors (.cfe/.epf extracted into their own .db files). Each open base has an alias. All tools query the ACTIVE base; to query a specific base without switching, pass its alias as the db parameter (e.g. find_objects(mask=…, db='расш_интеграция')). Management tools: db_list (what is open, which is active), db_open (open another base file while the server runs — the path comes from the user), db_use (switch the active base), db_close. An extension usually adds/overrides objects of the main configuration — if something is not found in one base, check the other.
+MULTIPLE DATABASES: the server can hold several knowledge bases at once — typically the MAIN configuration plus extensions/data processors (.cfe/.epf extracted into their own .db files). Each open base has an alias. All tools query the ACTIVE base; to query a specific base without switching, pass its alias as the db parameter (e.g. find_objects(mask=…, db='расш_интеграция')). Management tools: db_list (what is open, which is active), db_open (open another base file while the server runs — the path comes from the user), db_use (switch the active base), db_close. An extension usually adds/overrides objects of the main configuration — if something is not found in one base, check the other. Special db value '*': run a tool on every open base at once (the answer is sectioned per base) — one call to compare the main configuration with all extensions.
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
@@ -727,6 +727,15 @@ class Tool:
                 'inputSchema': self.schema}
 
     def run(self, server, **args):
+        if args.get('db') == '*' and 'db' in self.schema.get('properties', {}):
+            # db='*' — выполнить инструмент по всем открытым базам сразу
+            parts = []
+            for alias, info in server.dbs.items():
+                part = self.fn(server, **dict(args, db=alias))
+                parts.append(f'=== база {alias} ({info["path"]}) ===\n{part}')
+            if not parts:
+                raise ValueError('нет открытых баз — укажите путь в db_open')
+            return '\n\n'.join(parts)
         return self.fn(server, **args)
 
 
@@ -738,7 +747,9 @@ _STR = {'type': 'string'}
 _INT = {'type': 'integer'}
 _DB = {'type': 'string',
        'description': 'Alias of the knowledge base to query INSTEAD of the '
-                      'active one (see db_list). Omit to use the active base.'}
+                      'active one (see db_list). Omit to use the active base. '
+                      "Special value '*': run the tool on EVERY open base at "
+                      'once; the answer comes back sectioned per base.'}
 
 TOOLS = [
     Tool('find_objects',
