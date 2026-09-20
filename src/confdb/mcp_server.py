@@ -153,6 +153,8 @@ DATABASE FILE: the SQLite file is internal to the server. Do NOT search for it, 
 
 MULTIPLE DATABASES: the server can hold several knowledge bases at once — typically the MAIN configuration plus extensions/data processors (.cfe/.epf extracted into their own .db files). Each open base has an alias. All tools query the ACTIVE base; to query a specific base without switching, pass its alias as the db parameter (e.g. find_objects(mask=…, db='расш_интеграция')). Management tools: db_list (what is open, which is active), db_open (open another base file while the server runs — the path comes from the user), db_use (switch the active base), db_close. An extension usually adds/overrides objects of the main configuration — if something is not found in one base, check the other. Special db value '*': run a tool on every open base at once (the answer is sectioned per base) — one call to compare the main configuration with all extensions.
 
+DATABASE IDENTIFIER: every tool response includes a header line identifying the source database: '=== база <алиас> (<путь>) ==='. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
+
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
 - meta_attribute(object_id, ord, name, type_str, tabular). Object fields; tabular NULL = header attribute, else the tabular section the field belongs to. type_str examples: 'Строка(50)', 'Число', 'Ссылка: Справочник.Валюты', 'ОпределяемыйТип: … (Ссылка: …)', composites joined with ' | '; 'Ссылка' alone = abstract/any reference.
@@ -736,7 +738,17 @@ class Tool:
             if not parts:
                 raise ValueError('нет открытых баз — укажите путь в db_open')
             return '\n\n'.join(parts)
-        return self.fn(server, **args)
+        
+        # Обычный запрос к одной базе
+        result = self.fn(server, **args)
+        
+        # Если у инструмента есть параметр db — добавляем заголовок с идентификатором базы
+        if 'db' in self.schema.get('properties', {}):
+            alias = server._alias(args.get('db'))  # разрешает None → активная база
+            info = server.dbs[alias]
+            return f'=== база {alias} ({info["path"]}) ===\n{result}'
+        
+        return result
 
 
 def _schema(props, required=()):

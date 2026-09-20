@@ -155,7 +155,9 @@ def test_check_and_sql(tmp_path_factory):
     server = _server(tmp_path_factory)
     ok = _call(server, 'check_query',
                text='ВЫБРАТЬ Т.СсылкаАтрибут ИЗ Справочник.Справочник1 КАК Т')
-    assert ok['content'][0]['text'].startswith('OK')
+    text = ok['content'][0]['text']
+    # Ответ содержит заголовок базы и 'OK'
+    assert '=== база' in text and 'OK' in text
     bad = _call(server, 'check_query',
                 text='ВЫБРАТЬ Т.Х ИЗ Справочник.Нет КАК Т')['content'][0]['text']
     assert 'неизвестная таблица' in bad
