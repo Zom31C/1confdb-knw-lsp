@@ -624,18 +624,18 @@ def _find_objects(dump_dir):
 
 
 def _read_json(path):
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(helper.long_path(path), 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
 def _read_text(path):
     for encoding in ('utf-8-sig', 'windows-1251'):
         try:
-            with open(path, 'r', encoding=encoding) as f:
+            with open(helper.long_path(path), 'r', encoding=encoding) as f:
                 return f.read()
         except UnicodeDecodeError:
             continue
-    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+    with open(helper.long_path(path), 'r', encoding='utf-8', errors='replace') as f:
         return f.read()
 
 
@@ -695,7 +695,7 @@ def _extract_skd_queries(path):
     Возвращает список строк запросов или None, если файл не является СКД.
     """
     try:
-        with open(path, 'rb') as f:
+        with open(helper.long_path(path), 'rb') as f:
             raw = f.read()
     except OSError:
         return None
@@ -733,7 +733,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     if os.path.isdir(db_path):
         raise ValueError(f'Путь БД указывает на каталог: {db_path}')
     parent = os.path.dirname(os.path.abspath(db_path))
-    os.makedirs(parent, exist_ok=True)
+    os.makedirs(helper.long_path(parent), exist_ok=True)
     if os.path.exists(db_path):
         os.remove(db_path)
 
@@ -1014,7 +1014,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                     data = _read_text(full).encode('utf-8')
                     stats['files_content'] += 1
                 elif store_blobs:
-                    with open(full, 'rb') as f:
+                    with open(helper.long_path(full), 'rb') as f:
                         data = f.read()
                     stats['files_content'] += 1
                 if object_id and ext == 'bin':

@@ -8,6 +8,7 @@ from .ext_exception import ExtException
 from .metadata_types import MetaDataTypes
 from . import __version__
 from .metadata_types import MetaDataGroup
+from .helper import long_path
 
 
 # --- MetaObject/__init__.py ---
@@ -97,7 +98,7 @@ class MetaObject:
                 obj_data = _metadata[j + 2]
                 if isinstance(obj_data, str):
                     if j == 0:
-                        os.mkdir(os.path.join(dest_dir, new_dest_path))
+                        os.mkdir(long_path(os.path.join(dest_dir, new_dest_path)))
 
                     tasks.append([metadata_type.name,
                                   [src_dir, obj_data, dest_dir, new_dest_path, self.container_uuid, self.options]])
@@ -110,7 +111,7 @@ class MetaObject:
                     except Exception as err:
                         continue
                     if j == 0:
-                        os.mkdir(os.path.join(dest_dir, new_dest_path))
+                        os.mkdir(long_path(os.path.join(dest_dir, new_dest_path)))
                     obj_uuid = handler.decode_internal_include(self, obj_data, src_dir, dest_dir, new_dest_path,
                                                                self.options)
                     if not auto_include:

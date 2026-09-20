@@ -8,6 +8,7 @@ from . import helper
 from . import progress
 from .container import Container, Container64
 from .ext_exception import ExtException
+from .helper import long_path
 
 
 def extract(filename, folder, deflate=True, recursive=True):
@@ -26,7 +27,7 @@ def extract(filename, folder, deflate=True, recursive=True):
     begin = datetime.now()
     print(f'{"Распаковываем бинарник":30}:', end="")
     helper.clear_dir(folder)
-    with open(filename, 'rb') as f:
+    with open(long_path(filename), 'rb') as f:
         offset = 0
         container_index = 0
         while True:
@@ -106,8 +107,8 @@ def decompress_file_and_extract(params):
     # wbits = -15 т.к. у архивированных файлов нет заголовков
     decompressor = zlib.decompressobj(-15)
     try:
-        with open(dest_path, 'wb') as dest:
-            with open(src_path, 'rb') as src:
+        with open(long_path(dest_path), 'wb') as dest:
+            with open(long_path(src_path), 'rb') as src:
                 while True:
                     buf = decompressor.unconsumed_tail
                     if buf == b'':
@@ -127,12 +128,12 @@ def decompress_file_and_extract(params):
 
         if file_is_container:
             temp_filename = dest_path + ".temp"
-            os.rename(dest_path, temp_filename)
-            with open(temp_filename, 'rb') as f:
+            os.rename(long_path(dest_path), long_path(temp_filename))
+            with open(long_path(temp_filename), 'rb') as f:
                 container = Container()
                 container.read(f)
                 container.extract(dest_path, recursive=True)
-            os.remove(temp_filename)
+            os.remove(long_path(temp_filename))
 
     except Exception as err:
         raise ExtException(

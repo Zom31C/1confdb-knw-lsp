@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from struct import pack, unpack, calcsize
 
 from .container_doc import Document
-from .helper import clear_dir
+from .helper import clear_dir, long_path
 
 Header = collections.namedtuple('Header', 'first_empty_block_offset, default_block_size, count_files')
 Block = collections.namedtuple('Block', 'doc_size, current_block_size, next_block_offset, data')
@@ -77,7 +77,7 @@ class Container:
     @staticmethod
     def extract_file(filename, file_obj, path, deflate=False, recursive=False):
         file_path = os.path.join(path, filename)
-        with open(file_path, 'wb') as f:
+        with open(long_path(file_path), 'wb') as f:
             if deflate:
                 # wbits = -15 т.к. у архивированных файлов нет заголовков
                 decompressor = zlib.decompressobj(-15)
@@ -95,17 +95,17 @@ class Container:
         # Для проверки является ли файл контейнером проверим первые 4 бита
         # Способ проверки ненадежный - нужно придумать что-то другое
         file_is_container = False
-        with open(file_path, 'rb') as f:
+        with open(long_path(file_path), 'rb') as f:
             if f.read(4) == b'\xFF\xFF\xFF\x7F':
                 file_is_container = True
         if file_is_container:
             temp_name = file_path + '.tmp'
-            os.rename(file_path, temp_name)
-            with open(temp_name, 'rb') as f:
+            os.rename(long_path(file_path), long_path(temp_name))
+            with open(long_path(temp_name), 'rb') as f:
                 _container = Container()
                 _container.read(f)
                 _container.extract(file_path, recursive=True)
-            os.remove(temp_name)
+            os.remove(long_path(temp_name))
 
     def read_header(self, file):
         """

@@ -14,13 +14,30 @@ from .json_container_decoder import JsonContainerDecoder, BigBase64
 from . import progress
 
 
+def long_path(path):
+    """Добавляет префикс \\\\?\\ для длинных путей на Windows (обход MAX_PATH 260).
+    
+    На Windows максимальная длина пути ограничена 260 символами (MAX_PATH).
+    Префикс \\\\?\\ позволяет работать с путями до ~32,767 символов.
+    Префикс работает только с абсолютными путями.
+    """
+    if os.name != 'nt':
+        return path
+    # Префикс работает только с абсолютными путями
+    path = os.path.abspath(path)
+    # Не добавляем префикс, если он уже есть
+    if path.startswith('\\\\?\\'):
+        return path
+    return '\\\\?\\' + path
+
+
 def brace_file_read(path, file_name):
     _path = os.path.normpath(os.path.join(path, file_name))
     progress.note_read(_path)
     try:
         for code_page in ['utf-8-sig', 'windows-1251']:
             try:
-                with open(_path, 'r', encoding=code_page) as file:
+                with open(long_path(_path), 'r', encoding=code_page) as file:
                     decoder = JsonContainerDecoder(src_dir=path, file_name=file_name)
                     data = decoder.decode_file(file)
                     return data
@@ -37,7 +54,7 @@ def json_read(path, file_name):
     _path = os.path.normpath(os.path.join(path, file_name))
     progress.note_read(_path)
     try:
-        with open(_path, 'r', encoding='utf-8') as file:
+        with open(long_path(_path), 'r', encoding='utf-8') as file:
             return json.load(file)
     except FileNotFoundError as err:
         raise err
@@ -49,7 +66,7 @@ def json_write(data, path, file_name):
     _path = os.path.normpath(os.path.join(path, file_name))
     makedirs(path, exist_ok=True)
     try:
-        with open(_path, 'w', encoding='utf-8') as file:
+        with open(long_path(_path), 'w', encoding='utf-8') as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
     except Exception as err:
         raise ExtException(message='Ошибка записи', detail=f'{err} в файле ({_path})')
@@ -69,7 +86,7 @@ def txt_read_detect_encoding(path, file_name, encoding=None):
     progress.note_read(_path)
     if encoding is None:
         encoding = detect_by_bom(_path, 'utf-8')
-    with open(_path, 'r', encoding=encoding) as file:
+    with open(long_path(_path), 'r', encoding=encoding) as file:
         return file.read(), encoding
 
 
@@ -81,7 +98,7 @@ def txt_write(data, path, file_name, encoding='utf-8'):
         makedirs(path, exist_ok=True)
         for i in range(3):
             try:
-                with open(_path, 'w', encoding=encoding) as file:
+                with open(long_path(_path), 'w', encoding=encoding) as file:
                     file.write(data)
                 return
             except PermissionError:
@@ -94,14 +111,14 @@ def txt_write(data, path, file_name, encoding='utf-8'):
 def bin_write(data, path, file_name):
     _path = os.path.normpath(os.path.join(path, file_name))
     makedirs(path, exist_ok=True)
-    with open(_path, 'wb') as file:
+    with open(long_path(_path), 'wb') as file:
         file.write(data)
 
 
 def bin_read(path, file_name):
     _path = os.path.normpath(os.path.join(path, file_name))
     progress.note_read(_path)
-    with open(_path, 'rb') as file:
+    with open(long_path(_path), 'rb') as file:
         return file.read()
 
 
@@ -204,7 +221,7 @@ def detect_by_bom(path, default=None):
         ('utf-16', BOM_UTF16_BE),
     )
 
-    with open(path, 'rb') as f:
+    with open(long_path(path), 'rb') as f:
         raw = f.read(4)  # will read less if the file is smaller
     for enc, bom in boms:
         if raw.startswith(bom):
@@ -229,7 +246,7 @@ def get_extension_from_comment(comment: str) -> str:
 def makedirs(name, exist_ok=False):
     for i in range(3):
         try:
-            os.makedirs(name, exist_ok=exist_ok)
+            os.makedirs(long_path(name), exist_ok=exist_ok)
             return
         except PermissionError:
             time.sleep(0.5)
