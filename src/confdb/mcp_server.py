@@ -37,10 +37,13 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote as urllib_quote, urlparse
 
+from . import compare
+from . import header_props
 from .config import load_config, save_config
 from .db.writer import TYPE_RU
 
@@ -52,17 +55,30 @@ _RU2TYPES = {}
 for _stem, _ru in TYPE_RU.items():
     _RU2TYPES.setdefault(_ru, []).append(_stem)
     _RU2TYPES.setdefault(_ru.replace(' ', ''), []).append(_stem)
+# Русское имя типа принимается в любом регистре и без пробелов: сервер печатает
+# 'Регистр накопления.Имя', а язык запросов и BSL пишут 'РегистрНакопления.Имя'
+# — это один и тот же тип.
+_RU2TYPES_LOW = {}
+for _key, _stems in _RU2TYPES.items():
+    for _stem in _stems:
+        if _stem not in _RU2TYPES_LOW.setdefault(_key.lower(), []):
+            _RU2TYPES_LOW[_key.lower()].append(_stem)
 _TYPE_SLASH_RE = re.compile(
     '(?:' + '|'.join(map(re.escape, sorted(TYPE_RU, key=len, reverse=True))) + ')/')
 # 'Справочник.Имя' в строковых литералах sql -> внутренний 'Catalog/Имя'
 _RU_PATH_LIT_RE = re.compile(
     "'(" + '|'.join(map(re.escape, sorted(_RU2TYPES, key=len, reverse=True))) +
-    r")\.([^'.]+)'")
+    r")\.([^'.]+)'", re.IGNORECASE)
+
+
+def _type_stems(name):
+    """Англ. stem'ы типа метаданных по его русскому имени (регистр не важен)."""
+    return _RU2TYPES_LOW.get((name or '').strip().lower())
 
 
 def _sql_rewrite(query):
     def sub(match):
-        stems = _RU2TYPES.get(match.group(1))
+        stems = _type_stems(match.group(1))
         return f"'{stems[0]}/{match.group(2)}'" if stems else match.group(0)
     return _RU_PATH_LIT_RE.sub(sub, query)
 
@@ -75,8 +91,25 @@ def ru_path(path):
     return '.'.join([TYPE_RU[parts[0]]] + parts[1::2])
 
 
-def ru_type_str(text):
-    """'Ссылка: Catalog/Валюты' -> 'Ссылка: Справочник.Валюты'."""
+_REGISTER_TYPES = frozenset({
+    'InformationRegister', 'AccumulationRegister',
+    'AccountingRegister', 'CalculationRegister',
+})
+
+_PERIODICITY = header_props.PERIODICITY
+
+
+def _register_card_info(obj_type, header_json):
+    """Свойства регистра из header_json: периодичность, режим записи."""
+    return header_props.register_props(obj_type, header_json)
+
+
+def ru_text(text):
+    """Внутренние слэш-пути 'Catalog/Х' -> 'Справочник.Х' в произвольном тексте.
+
+    Применяется и к сообщениям валидатора запросов: наружу всё отдаётся в форме
+    «как в конфигураторе», внутренний формат пути не должен попадать в ответ.
+    """
     if not text:
         return text
     return _TYPE_SLASH_RE.sub(lambda m: TYPE_RU[m.group(0)[:-1]] + '.', text)
@@ -141,6 +174,24 @@ def _paginate_lines(text, offset, limit, default_page, header=''):
     return '\n'.join(out)
 
 
+
+def ru_type_str(text):
+    """'Ссылка: Catalog/Валюты' -> 'Ссылка: Справочник.Валюты'.
+
+    Голая 'Ссылка' без целевого объекта помечается '(цель не определена)'.
+    """
+    if not text:
+        return text
+    text = ru_text(text)
+    parts = [p.strip() for p in text.split(' | ')]
+    annotated = []
+    for part in parts:
+        if part == 'Ссылка':
+            annotated.append('Ссылка (цель не определена)')
+        else:
+            annotated.append(part)
+    return ' | '.join(annotated)
+
 PRIMER = """1confdb-knw: MCP server over one or several knowledge bases of a 1C:Enterprise 8 configuration — metadata, BSL code and SKD queries, extracted from binary .cf/.cfe/.epf files into SQLite. 1C is a Russian business-automation platform; a configuration contains metadata objects, their fields, modules of 1C-language code (Russian keywords) and SKD report queries. All object/field names are in Russian.
 
 GLOSSARY: Catalog=справочник (directory), Document=документ, InformationRegister/AccumulationRegister=регистры, Enum=перечисление, DataProcessor=обработка, Report=отчет, DefinedType=определяемый тип, CommonAttribute=общий реквизит, CommonModule=общий модуль. Tabular section (табличная часть) = row table of an object (e.g. Документ.ЗаказПокупателя has section Запасы with fields Номенклатура, Цена…).
@@ -155,6 +206,10 @@ MULTIPLE DATABASES: the server can hold several knowledge bases at once — typi
 
 DATABASE IDENTIFIER: every tool response includes a header line identifying the source database: '=== база <алиас> (<путь>) ==='. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
 
+COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds (name, version, compatibility mode, source file, build date). These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
+
+REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
+
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
 - meta_attribute(object_id, ord, name, type_str, tabular). Object fields; tabular NULL = header attribute, else the tabular section the field belongs to. type_str examples: 'Строка(50)', 'Число', 'Ссылка: Справочник.Валюты', 'ОпределяемыйТип: … (Ссылка: …)', composites joined with ' | '; 'Ссылка' alone = abstract/any reference.
@@ -167,7 +222,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
-RECOMMENDED WORKFLOW to write a query or 1C code: 1) find_objects to locate objects; 2) object_card for its fields, sections and references; 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods + get_method to reuse existing code instead of inventing; 5) check_query to validate your query before use.
+RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections and references; 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods, then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns. This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
 
 All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing."""
 
@@ -291,7 +346,7 @@ class McpServer:
         if not value or '/' in value or '.' not in value:
             return value
         parts = value.split('.')
-        stems = _RU2TYPES.get(parts[0])
+        stems = _type_stems(parts[0])
         if not stems:
             return value
         conn = self.conn(db)
@@ -368,7 +423,7 @@ class McpServer:
                     'content': [{'type': 'text', 'text': text}]}}
             except Exception as err:  # noqa: BLE001 — ошибка инструмента, не сервера
                 return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
-                    'content': [{'type': 'text', 'text': f'ошибка: {err}'}],
+                    'content': [{'type': 'text', 'text': error_text(err)}],
                     'isError': True}}
         return {'jsonrpc': '2.0', 'id': msg_id, 'error': {
             'code': -32601, 'message': f'method not found: {method}'}}
@@ -397,18 +452,36 @@ class McpServer:
     def object_card(self, path, db=None):
         path = self.resolve_path(path, db)
         q = self.conn(db).execute
-        row = q('SELECT type, type_ru, name, comment FROM meta_object '
-                'WHERE path=?', (path,)).fetchone()
+        row = q('SELECT type, type_ru, name, comment, header_json '
+                'FROM meta_object WHERE path=?', (path,)).fetchone()
         if not row:
             return f'объект не найден: {path}'
         oid = q('SELECT id FROM meta_object WHERE path=?', (path,)).fetchone()[0]
         out = [f'{ru_path(path)} — {row[1]} ({row[0]}), имя {row[2]}' +
                (f'; комментарий: {row[3]}' if row[3] else '')]
+        # свойства регистра (периодичность, режим записи)
+        out.extend(_register_card_info(row[0], row[4]))
         attrs = q('SELECT name, type_str FROM meta_attribute '
                   'WHERE object_id=? AND tabular IS NULL ORDER BY ord',
                   (oid,)).fetchall()
-        out.append('Реквизиты: ' + ('; '.join(
-            f'{n}: {ru_type_str(t) or "?"}' for n, t in attrs) if attrs else 'нет'))
+        kinds = (header_props.register_field_kinds(row[4])
+                 if row[0] in _REGISTER_TYPES else {})
+        if kinds:
+            # у регистра измерения/ресурсы/реквизиты показываются раздельно:
+            # по плоскому списку не понять, что входит в ключ записи
+            groups = {}
+            for name, tstr in attrs:
+                groups.setdefault(kinds.get(name, 'Прочие поля'), []).append(
+                    f'{name}: {ru_type_str(tstr) or "?"}')
+            for kind in header_props.REGISTER_KINDS + ('Прочие поля',):
+                if kind in groups:
+                    out.append(f'{kind}: ' + '; '.join(groups[kind]))
+            if not attrs:
+                out.append('Реквизиты: нет')
+        else:
+            out.append('Реквизиты: ' + ('; '.join(
+                f'{n}: {ru_type_str(t) or "?"}' for n, t in attrs)
+                if attrs else 'нет'))
         tabs = q('SELECT t.name, a.name, a.type_str FROM meta_tabular t '
                  'LEFT JOIN meta_attribute a ON a.object_id=t.object_id '
                  'AND a.tabular=t.name WHERE t.object_id=? '
@@ -444,6 +517,7 @@ class McpServer:
                 out.append('Предопределённые элементы' + extra + ': ' +
                            ', '.join(n + (f' [{c}]' if c else '')
                                      for n, c in pre))
+        out.extend(self._children_lines(q, oid))
         nskd = q('SELECT COUNT(*) FROM skd_query WHERE object_id=?',
                  (oid,)).fetchone()[0]
         if nskd:
@@ -464,6 +538,156 @@ class McpServer:
             'WHERE t.path=? LIMIT 12', (path,))]
         if rev:
             out.append('На него ссылаются: ' + ', '.join(ru_path(p) for p in rev))
+        return '\n'.join(out)
+
+    @staticmethod
+    def _children_lines(q, oid):
+        """Строки вложенных объектов: формы, команды, макеты.
+
+        Путь к ним — '<путь родителя>.<имя>', поэтому имена достаточно
+        перечислить: object_card/get_method принимают его целиком.
+        """
+        buckets = {}
+        for name, ktype in q('SELECT name, type FROM meta_object '
+                             'WHERE parent_id=? ORDER BY ord', (oid,)):
+            if ktype.endswith('Form'):
+                key = 'Формы'
+            elif ktype.endswith('Command'):
+                key = 'Команды'
+            elif ktype.endswith('Template'):
+                key = 'Макеты'
+            else:
+                key = 'Прочие подобъекты'
+            buckets.setdefault(key, []).append(name)
+        lines = []
+        for key in ('Формы', 'Команды', 'Макеты', 'Прочие подобъекты'):
+            if key in buckets:
+                lines.append(f'{key}: ' + ', '.join(buckets[key]))
+        return lines
+
+    def configuration_info(self, db=None):
+        """Паспорт конфигурации/расширения: имя, версия, режим совместимости."""
+        alias = self._alias(db)
+        props = self.cfg_props(alias)
+        if not props:
+            return 'корневой объект конфигурации не найден'
+        label = {'Configuration': 'Конфигурация',
+                 'ConfigurationExtension': 'Расширение конфигурации',
+                 'ExternalDataProcessor': 'Внешняя обработка'}.get(
+                     props.get('root_type'),
+                     props.get('root_type_ru') or props.get('root_type') or '?')
+        head = f'{label}: {props.get("name") or "?"}'
+        if props.get('synonym') and props['synonym'] != props.get('name'):
+            head += f' ({props["synonym"]})'
+        out = [head]
+        root_ru = props.get('root_type_ru')
+        root_type = props.get('root_type')
+        # type_ru в meta_object допускает NULL — без запасного варианта
+        # получилось бы «Тип корня: None (Configuration)»
+        out.append('Тип корня: '
+                   + (f'{root_ru} ({root_type})' if root_ru and root_type
+                      else (root_ru or root_type or '?')))
+        out.append('Версия '
+                   + ('расширения'
+                      if props.get('root_type') == 'ConfigurationExtension'
+                      else 'конфигурации') + ': '
+                   + (props.get('version') or 'в файле не указана'))
+        if props.get('name_prefix'):
+            out.append(f'Префикс имён расширения: {props["name_prefix"]}')
+        out.append('Режим совместимости: '
+                   + (props.get('compatibility') or 'не определён'))
+        out.append('Версия платформы: в файле конфигурации не хранится '
+                   '(см. режим совместимости)')
+        if props.get('obj_version'):
+            out.append(f'Формат метаданных (obj_version): {props["obj_version"]}')
+        src = self.conn(db).execute(
+            'SELECT file, created, root_uuid FROM source '
+            'ORDER BY id LIMIT 1').fetchone()
+        if src:
+            if src[0]:
+                out.append(f'Источник выгрузки: {src[0]}')
+            if src[1]:
+                out.append(f'База знаний собрана: {src[1]}')
+            if src[2]:
+                out.append(f'UUID корня: {src[2]}')
+        nobj, nmod, nmeth = self.db_stats(db)
+        nskd = self.conn(db).execute(
+            'SELECT COUNT(*) FROM skd_query').fetchone()[0]
+        out.append(f'Состав: объектов {nobj}, модулей {nmod}, методов {nmeth}, '
+                   f'запросов СКД {nskd}')
+        return '\n'.join(out)
+
+    # -- сравнение двух баз --------------------------------------------------
+    def compare_object(self, path, db_left, db_right, path_right=None):
+        """Различия одного объекта в двух базах знаний."""
+        left_alias = self._alias(db_left)
+        right_alias = self._alias(db_right)
+        left_path = self.resolve_path(path, left_alias)
+        right_path = (self.resolve_path(path_right, right_alias)
+                      if path_right else left_path)
+        left = compare.object_snapshot(self.conn(left_alias), left_path)
+        right = compare.object_snapshot(self.conn(right_alias), right_path)
+        title = ru_path(left_path if left else right_path) or path
+        head = [f'Сравнение объекта: {title}',
+                f'  {left_alias}: {self.dbs[left_alias]["path"]} '
+                f'(путь {left_path})',
+                f'  {right_alias}: {self.dbs[right_alias]["path"]} '
+                f'(путь {right_path})']
+        if left is None and right is None:
+            head.append(f'объект не найден ни в базе «{left_alias}», '
+                        f'ни в базе «{right_alias}»')
+            return '\n'.join(head)
+        if left is None:
+            head.append(f'объект есть только в базе «{right_alias}»; '
+                        f'в базе «{left_alias}» его нет')
+            return '\n'.join(head)
+        if right is None:
+            head.append(f'объект есть только в базе «{left_alias}»; '
+                        f'в базе «{right_alias}» его нет')
+            return '\n'.join(head)
+        head.append(
+            f'Состав ({left_alias} / {right_alias}): реквизитов и полей '
+            f'{len(left["attrs"])} / {len(right["attrs"])}, методов '
+            f'{len(left["methods"])} / {len(right["methods"])}, модулей '
+            f'{len(left["modules"])} / {len(right["modules"])}, запросов СКД '
+            f'{len(left["skd"])} / {len(right["skd"])}')
+        lines = compare.diff_snapshots(left, right, left_alias, right_alias,
+                                       fmt_type=ru_type_str)
+        head.append('Различий нет: метаданные и код объекта совпадают'
+                    if not lines else 'Различия:')
+        return '\n'.join(head + lines)
+
+    def extension_diff(self, extension_db, base_db, limit=30):
+        """Что делает расширение относительно основной конфигурации."""
+        ext_alias = self._alias(extension_db)
+        base_alias = self._alias(base_db)
+        ext = self.cfg_props(ext_alias)
+        base = self.cfg_props(base_alias)
+        out = []
+        name = ext.get('name') or ext_alias
+        extra = [text for text in (
+            f'версия {ext["version"]}' if ext.get('version') else None,
+            f'режим совместимости {ext["compatibility"]}'
+            if ext.get('compatibility') else None) if text]
+        out.append(f'Расширение: {name}'
+                   + (' (' + '; '.join(extra) + ')' if extra else ''))
+        if ext.get('name_prefix'):
+            out.append(f'Префикс имён новых объектов: {ext["name_prefix"]}')
+        out.append(f'  база {ext_alias}: {self.dbs[ext_alias]["path"]}')
+        base_name = base.get('name') or base_alias
+        base_ver = f' {base["version"]}' if base.get('version') else ''
+        out.append(f'Основная конфигурация: {base_name}{base_ver}')
+        out.append(f'  база {base_alias}: {self.dbs[base_alias]["path"]}')
+        if ext.get('root_type') != 'ConfigurationExtension':
+            out.append(f'Внимание: корень базы {ext_alias} — '
+                       f'{ext.get("root_type_ru") or ext.get("root_type")}, '
+                       'а не расширение конфигурации; отчёт показывает '
+                       'различия двух баз как есть')
+        out.append('')
+        out.extend(compare.extension_report(
+            self.conn(ext_alias), self.conn(base_alias), fmt=ru_path,
+            prefix=ext.get('name_prefix'), limit=int(limit),
+            fmt_type=ru_type_str))
         return '\n'.join(out)
 
     def object_tree(self, path='', depth=2, db=None):
@@ -565,16 +789,31 @@ class McpServer:
         return _paginate_lines(row[0], int(offset or 0), int(limit or 0),
                                _OUTLINE_PAGE)
 
-    def get_method(self, path, code_name, name, offset=0, limit=0, db=None):
+    def _method_row(self, path, code_name, name, db=None):
+        """Строка метода: kind, name, signature, directives, description, body,
+        is_export, контекст модуля, line_start — либо None."""
         path, code_name = self._module_target(path, code_name, db)
-        row = self.conn(db).execute(
+        return self.conn(db).execute(
             'SELECT mt.kind, mt.name, mt.signature, mt.directives, '
-            'mt.description, mt.body, mt.is_export FROM method mt '
-            'JOIN module m ON m.id=mt.module_id '
+            'mt.description, mt.body, mt.is_export, m.context, mt.line_start '
+            'FROM method mt JOIN module m ON m.id=mt.module_id '
             'JOIN meta_object o ON o.id=m.object_id '
             'WHERE o.path=? AND m.code_name=? AND LOWER(mt.name)=LOWER(?)',
             (path, code_name, name)).fetchone()
+
+    def bsl_ctx(self, db=None):
+        """Контекст анализа BSL базы (кэш: строится секунды на большой базе)."""
+        alias = self._alias(db)
+        info = self.dbs[alias]
+        if info.get('bsl') is None:
+            from .bsl_analyzer import BslContext
+            info['bsl'] = BslContext(info['conn'])
+        return info['bsl']
+
+    def get_method(self, path, code_name, name, offset=0, limit=0, db=None):
+        row = self._method_row(path, code_name, name, db)
         if not row:
+            path, code_name = self._module_target(path, code_name, db)
             return f'метод не найден: {path} ({code_name}) :: {name}'
         head = f'{row[0]} {row[1]}({row[2]})' + (' Экспорт' if row[6] else '')
         parts = [head]
@@ -589,6 +828,145 @@ class McpServer:
         if total > _METHOD_PAGE and int(offset or 0) + _METHOD_PAGE < total:
             parts.append('метод длинный — листай: offset/limit')
         return '\n'.join(parts)
+
+    def find_method_context(self, path, code_name, name, match='', before=20,
+                            after=20, db=None):
+        """Фрагмент тела метода вокруг вхождения match + маркеры точки вставки."""
+        row = self._method_row(path, code_name, name, db)
+        if not row:
+            return (f'метод не найден: {self.resolve_path(path, db)} '
+                    f'({code_name}) :: {name}')
+        lines = (row[5] or '').splitlines()
+        start = row[8] or 1
+        before, after = max(0, int(before)), max(0, int(after))
+        out = [f'{row[0]} {row[1]}({row[2]}) — строки модуля '
+               f'{start}..{start + len(lines) - 1}'
+               + (f'; директивы {row[3]}' if row[3] else '')]
+        needle = (match or '').strip()
+        if needle:
+            hits = [i for i, line in enumerate(lines)
+                    if needle.lower() in line.lower()]
+            if not hits:
+                out.append(f'в теле метода не найдено: {needle}')
+                out.append('Полное тело — get_method; поиск по другим методам '
+                           '— find_methods')
+                return '\n'.join(out)
+        else:
+            out.append('match не задан — показано начало тела; передайте match '
+                       '(строку или вызов), чтобы получить точку вставки')
+            hits = [0]
+        for i in hits[:3]:
+            low, high = max(0, i - before), min(len(lines), i + after + 1)
+            out.append(f'--- вхождение: строка {start + i} '
+                       f'(показано {start + low}..{start + high - 1}) ---')
+            for j in range(low, high):
+                out.append(f'{">>" if j == i else "  "} {start + j}: {lines[j]}')
+            prev_op = next((lines[k].strip() for k in range(i - 1, -1, -1)
+                            if lines[k].strip()), '')
+            next_op = next((lines[k].strip() for k in range(i + 1, len(lines))
+                            if lines[k].strip()), '')
+            out.append(f'Маркеры вставки у строки {start + i}:')
+            out.append(f'  предыдущий оператор: {prev_op or "(начало метода)"}')
+            out.append(f'  следующий оператор:  {next_op or "(конец метода)"}')
+        if len(hits) > 3:
+            out.append(f'… и ещё {len(hits) - 3} вхождений (уточните match)')
+        return '\n'.join(out)
+
+    def method_dependencies(self, path, code_name, name, db=None):
+        """Что использует метод: общие модули, метаданные, запросы, параметры."""
+        from .bsl_analyzer import analyze, caller_context, split_params
+        row = self._method_row(path, code_name, name, db)
+        if not row:
+            return (f'метод не найден: {self.resolve_path(path, db)} '
+                    f'({code_name}) :: {name}')
+        kind, mname, sig, dirs, _desc, body, exp, mod_ctx, start = row
+        params = split_params(sig)
+        ctx = self.bsl_ctx(db)
+        report = analyze(body or '', ctx, params=params,
+                         caller_context=caller_context(dirs, mod_ctx),
+                         self_name=mname)
+        out = [f'{kind} {mname}({sig})' + (' Экспорт' if exp else '')]
+        out.append(f'Контекст: {dirs or "директив нет"}'
+                   + (f'; контекст модуля: {mod_ctx}' if mod_ctx else ''))
+        out.append(f'Параметры: {", ".join(params) if params else "нет"}')
+
+        out.append('\nОбщие модули и их методы:')
+        if not report['modules']:
+            out.append('  вызовов общих модулей не найдено')
+        for module, method, line, state in report['modules']:
+            out.append(f'  строка {start + line - 1}: {module}.{method} — {state}')
+
+        out.append('\nМетаданные в коде:')
+        if not report['metadata']:
+            out.append('  обращений к менеджерам метаданных не найдено')
+        for manager, obj, line, target in report['metadata']:
+            shown = ru_path(target) if target else 'НЕ НАЙДЕНО в этой базе'
+            out.append(f'  строка {start + line - 1}: {manager}.{obj} -> {shown}')
+
+        out.append('\nЗапросы в коде:')
+        if not report['queries']:
+            out.append('  текстов запросов не найдено')
+        for line, query, complete, errors, unverified in report['queries']:
+            head = f'  строка {start + line - 1}'
+            if not complete:
+                out.append(f'{head}: запрос собирается по частям — '
+                           'проверка парсером пропущена')
+                continue
+            out.append(f'{head}: ошибок {len(errors)}, '
+                       f'непроверенных полей {len(unverified)}')
+            for err in errors[:6]:
+                out.append(f'    ! {ru_text(err)}')
+            for ref in unverified[:6]:
+                out.append(f'    ? {ref} (схема параметра-таблицы неизвестна)')
+        if report['tables']:
+            out.append('  таблицы запросов: ' + ', '.join(report['tables'][:20]))
+        if report['fields']:
+            out.append('  поля запросов: ' + ', '.join(report['fields'][:30]))
+
+        if report['context_warnings']:
+            out.append('\nКонтекст клиент/сервер:')
+            out.extend(f'  ! {w}' for w in report['context_warnings'])
+        if report['unknown']:
+            out.append('\nНе разрешено (не общий модуль, не менеджер '
+                       'метаданных и не локальная переменная — вероятно, '
+                       'реквизит формы/объекта или глобальный контекст):')
+            out.extend(f'  строка {start + line - 1}: {left}.{right}'
+                       for left, right, line in report['unknown'][:20])
+        if report['plain_calls']:
+            out.append('\nВызовы без точки (методы этого модуля или глобальные '
+                       'методы платформы — не проверялись): '
+                       + ', '.join(report['plain_calls'][:25]))
+        return '\n'.join(out)
+
+    def method_result_schema(self, path, code_name, name, db=None):
+        """Из чего состоит таблица/структура, которую возвращает метод."""
+        from .bsl_analyzer import result_schema
+        row = self._method_row(path, code_name, name, db)
+        if not row:
+            return (f'метод не найден: {self.resolve_path(path, db)} '
+                    f'({code_name}) :: {name}')
+        kind, mname, sig, _dirs, _desc, body, _exp, _ctx, start = row
+        found, notes = result_schema(body or '')
+        out = [f'{kind} {mname}({sig})']
+        if not found and not notes:
+            out.append('Признаков создания таблицы значений, структуры или '
+                       'запроса в теле не найдено — состав результата по коду '
+                       'не определяется (возможно, он возвращается из другого '
+                       'метода или это объект метаданных).')
+            return '\n'.join(out)
+        by_kind = {}
+        for line_kind, column, line in found:
+            by_kind.setdefault(line_kind, []).append((column, line))
+        for line_kind, items in by_kind.items():
+            out.append(f'{line_kind.capitalize()} '
+                       f'({len(items)}): ' + '; '.join(
+                           f'{c} [стр. {start + ln - 1}]' for c, ln in items[:40]))
+        for note in notes:
+            out.append(note)
+        out.append('Внимание: это эвристика по тексту — имена из переменных и '
+                   'колонки, добавленные в цикле или другом методе, сюда не '
+                   'попадают. Точный состав даёт только выполнение кода.')
+        return '\n'.join(out)
 
     def find_methods(self, mask='', path=None, limit=20, db=None):
         path = self.resolve_path(path, db) if path else None
@@ -646,11 +1024,19 @@ class McpServer:
         return '\n'.join(out)
 
     def check_query(self, text, db=None):
-        from .query_lang import check_query as _check
-        errs = _check(text, self.ctx(db))
-        if not errs:
-            return 'OK: синтаксис корректен, таблицы/поля/цепочки существуют'
-        return 'Ошибки:\n' + '\n'.join(errs)
+        from .query_lang import check_query_full
+        errs, unverified = check_query_full(text, self.ctx(db))
+        parts = []
+        if errs:
+            parts.append('Ошибки:\n' + '\n'.join(ru_text(e) for e in errs))
+        else:
+            msg = 'OK: синтаксис корректен, таблицы/поля/цепочки существуют'
+            if unverified:
+                msg += ('\n\nНепроверенные поля параметров-таблиц '
+                        '(схема неизвестна):\n' +
+                        '\n'.join(f'  {ref}' for ref in unverified))
+            parts.append(msg)
+        return '\n'.join(parts)
 
     def sql(self, query, db=None):
         stripped = _sql_rewrite(query).strip().rstrip(';')
@@ -687,6 +1073,35 @@ class McpServer:
                 'запрашивай):\n' + '\n'.join(out))
 
     # -- управление базами ---------------------------------------------------
+    def cfg_props(self, alias):
+        """Свойства конфигурации базы; разбираются один раз и кэшируются.
+
+        Заголовок корня большой (у УНФ ~4 МБ из-за списка versions), поэтому
+        повторный разбор на каждый db_list/configuration_info не делается.
+        """
+        info = self.dbs[alias]
+        if info.get('cfg') is None:
+            row = info['conn'].execute(
+                'SELECT type, type_ru, name, header_json FROM meta_object '
+                'WHERE parent_id IS NULL ORDER BY id LIMIT 1').fetchone()
+            props = header_props.config_props(row[3]) if row else {}
+            if row:
+                props.setdefault('name', row[2])
+                props['root_type'] = row[0]
+                props['root_type_ru'] = row[1]
+            info['cfg'] = props
+        return info['cfg']
+
+    def cfg_summary(self, alias):
+        """(имя конфигурации, строка версий) базы — коротко для db_list."""
+        props = self.cfg_props(alias)
+        bits = [props.get('version') or 'версия не указана']
+        if props.get('compatibility'):
+            bits.append(f'режим совместимости {props["compatibility"]}')
+        if props.get('name_prefix'):
+            bits.append(f'префикс имён {props["name_prefix"]}')
+        return props.get('name') or '?', '; '.join(bits)
+
     def db_list(self):
         if not self.dbs:
             return 'нет открытых баз — откройте через db_open'
@@ -696,6 +1111,8 @@ class McpServer:
             mark = '*' if alias == self.active else ' '
             out.append(f'{mark} {alias} — {info["path"]} '
                        f'(объектов: {nobj}, модулей: {nmod}, методов: {nmeth})')
+            name, meta = self.cfg_summary(alias)
+            out.append(f'    {name}: {meta} (configuration_info — подробно)')
         return 'Открытые базы (* — активная):\n' + '\n'.join(out)
 
     def db_open(self, path, alias=None):
@@ -717,6 +1134,50 @@ class McpServer:
         return f'база {alias} закрыта; активная: {self.active}'
 
 
+# Категории ошибок инструмента: клиенту нужен понятный код, а не «Unknown».
+LOCKED_RE = re.compile(r'lock|busy', re.I)
+RETRY_DELAY = 0.05
+
+
+def error_text(err):
+    """'ошибка [КАТЕГОРИЯ]: сообщение' — категория по типу исключения.
+
+    Отдельно выделена занятая база (SQLITE_BUSY/locked): она транзитна, и
+    вызывающая сторона может повторить запрос.
+    """
+    if isinstance(err, sqlite3.OperationalError):
+        low = str(err).lower()
+        if LOCKED_RE.search(low):
+            code = 'DB_LOCKED'
+        elif 'no such' in low:
+            code = 'DB_SCHEMA'
+        else:
+            code = 'DB_ERROR'
+    elif isinstance(err, sqlite3.Error):
+        code = 'DB_ERROR'
+    elif isinstance(err, TypeError):
+        code = 'BAD_ARGS'
+    elif isinstance(err, ValueError):
+        code = 'BAD_REQUEST'
+    elif isinstance(err, OSError):
+        code = 'IO_ERROR'
+    else:
+        code = 'INTERNAL'
+    detail = f'{type(err).__name__}: {err}' if code == 'INTERNAL' else str(err)
+    return f'ошибка [{code}]: {detail}'
+
+
+def call_with_retry(fn, *args, **kwargs):
+    """Вызов инструмента с повтором, если база оказалась занята."""
+    for attempt in range(3):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as err:
+            if attempt == 2 or not LOCKED_RE.search(str(err)):
+                raise
+            time.sleep(RETRY_DELAY * (attempt + 1))
+
+
 class Tool:
     def __init__(self, name, description, schema, fn):
         self.name = name
@@ -733,21 +1194,21 @@ class Tool:
             # db='*' — выполнить инструмент по всем открытым базам сразу
             parts = []
             for alias, info in server.dbs.items():
-                part = self.fn(server, **dict(args, db=alias))
+                part = call_with_retry(self.fn, server, **dict(args, db=alias))
                 parts.append(f'=== база {alias} ({info["path"]}) ===\n{part}')
             if not parts:
                 raise ValueError('нет открытых баз — укажите путь в db_open')
             return '\n\n'.join(parts)
-        
+
         # Обычный запрос к одной базе
-        result = self.fn(server, **args)
-        
+        result = call_with_retry(self.fn, server, **args)
+
         # Если у инструмента есть параметр db — добавляем заголовок с идентификатором базы
         if 'db' in self.schema.get('properties', {}):
             alias = server._alias(args.get('db'))  # разрешает None → активная база
             info = server.dbs[alias]
             return f'=== база {alias} ({info["path"]}) ===\n{result}'
-        
+
         return result
 
 
@@ -818,6 +1279,36 @@ TOOLS = [
                   'offset': _INT, 'limit': _INT, 'db': _DB},
                  ('path', 'code_name', 'name')),
          McpServer.get_method),
+    Tool('find_method_context',
+         'A WINDOW into a method body instead of the whole body: lines around '
+         'each occurrence of match, with the module line numbers, plus stable '
+         'insertion markers (the previous and the next statement). Cheaper '
+         'than get_method on a big method and the right way to pick a place '
+         'to insert code. before/after = how many lines to show (default 20).',
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
+                  'match': _STR, 'before': _INT, 'after': _INT, 'db': _DB},
+                 ('path', 'code_name', 'name')),
+         McpServer.find_method_context),
+    Tool('method_dependencies',
+         'Static analysis of ONE method: its parameters, the common modules it '
+         'calls (and whether those methods exist and are Экспорт), the '
+         'metadata it touches (Справочники.Х, Документы.Х…), the tables and '
+         'fields of the queries inside it (each query is validated), and what '
+         'could not be resolved. Use it before porting a customization to '
+         'another configuration — it lists everything the code needs there.',
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB},
+                 ('path', 'code_name', 'name')),
+         McpServer.method_dependencies),
+    Tool('method_result_schema',
+         'Best-effort shape of the value a method RETURNS: columns added with '
+         'Колонки.Добавить, keys of Новая Структура, and the result columns of '
+         'the queries in the body (aliases / field names). Use it when a stock '
+         'function returns a temporary table and you need to know its columns '
+         'without guessing. HEURISTIC: names built at runtime are reported as '
+         'dynamic, and the answer says what it could not see.',
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB},
+                 ('path', 'code_name', 'name')),
+         McpServer.method_result_schema),
     Tool('find_methods',
          'Search 1C methods by name/signature/description substring '
          "(e.g. 'ПриПроведении'). Reuse existing code instead of inventing. "
@@ -854,6 +1345,38 @@ TOOLS = [
          'Non-SELECT is rejected; LIMIT 200 enforced.',
          _schema({'query': _STR, 'db': _DB}, ('query',)),
          McpServer.sql),
+    Tool('compare_object',
+         'Compare ONE metadata object between two open knowledge bases in a '
+         'single call: presence, attributes and their types, tabular sections, '
+         'register dimensions/resources, forms and commands, modules, methods '
+         '(signature, directives, body), SKD queries. Use it for a standard vs '
+         'a customized configuration, or for the same object in two releases. '
+         'db_left/db_right are aliases from db_list (NOT the db parameter); '
+         'path_right is needed only when the object is named differently in '
+         'the right base.',
+         _schema({'path': _STR, 'db_left': _STR, 'db_right': _STR,
+                  'path_right': _STR}, ('path', 'db_left', 'db_right')),
+         McpServer.compare_object),
+    Tool('extension_diff',
+         'What an EXTENSION does relative to the main configuration, in one '
+         'call: new objects (marked with the extension name prefix), borrowed '
+         'objects, the extension methods inside them with their directives '
+         '(&Вместо replaces a stock method, &После/&Перед insert code around '
+         'it), attributes the extension adds, and external dependencies '
+         '(references to objects living outside the extension). Both arguments '
+         'are aliases from db_list.',
+         _schema({'extension_db': _STR, 'base_db': _STR, 'limit': _INT},
+                 ('extension_db', 'base_db')),
+         McpServer.extension_diff),
+    Tool('configuration_info',
+         'Passport of the knowledge base itself: configuration/extension name '
+         'and synonym, its VERSION, compatibility mode (режим совместимости), '
+         'extension name prefix, source .cf/.cfe/.epf file and the date the '
+         'base was built, object/module/method counts. Call it first when you '
+         'need to know WHICH configuration and which release you are looking '
+         'at (e.g. before porting code between configurations).',
+         _schema({'db': _DB}),
+         McpServer.configuration_info),
     Tool('db_list',
          'List the knowledge bases open on this server: alias, file path, '
          'object/module/method counts; * marks the ACTIVE base that the other '

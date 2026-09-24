@@ -4,6 +4,8 @@ import os
 import sqlite3
 
 from confdb.db.writer import VT_FIELDS_KEY, write_db
+from confdb.header_props import (AR_DIMENSIONS, AR_RESOURCES, IR_ATTRIBUTES,
+                                 IR_DIMENSIONS, IR_FORMS, IR_RESOURCES)
 
 ROOT_UUID = 'aaaaaaaa-0000-0000-0000-000000000001'
 CAT_UUID = 'bbbbbbbb-0000-0000-0000-000000000002'
@@ -12,14 +14,52 @@ DT_UUID = 'dddddddd-0000-0000-0000-000000000004'
 ENUM_UUID = 'eeeeeeee-0000-0000-0000-000000000005'
 COMMON_UUID = 'ffffffff-0000-0000-0000-000000000006'
 DOC_UUID = '0d0d0d0d-0000-0000-0000-000000000007'
+IR_UUID = '0e0e0e0e-0000-0000-0000-000000000008'
+AR_UUID = '0f0f0f0f-0000-0000-0000-000000000009'
+CM_UUID = '0a0a0a0a-0000-0000-0000-00000000000a'
 REF_CAT = '11111111-1111-1111-1111-111111111111'  # ссылочный uuid справочника в .10
 REF_DT = '22222222-2222-2222-2222-222222222222'   # собственный ссылочный uuid DT
+
+# модуль общего назначения с экспортной функцией (запрос многострочным
+# литералом с '|') и закрытой процедурой, создающей таблицу значений
+COMMON_MODULE_BSL = (
+    'Функция Экспортная(Парам) Экспорт\n'
+    '\tЗапрос = Новый Запрос;\n'
+    '\tЗапрос.Текст = "ВЫБРАТЬ\n'
+    '|\tСправочник1.СсылкаАтрибут КАК Ссылка\n'
+    '|ИЗ\n'
+    '|\tСправочник.Справочник1 КАК Справочник1";\n'
+    '\tВозврат Запрос.Выполнить().Выгрузить();\n'
+    'КонецФункции\n'
+    '\n'
+    'Процедура Закрытая()\n'
+    '\tТаблица = Новый ТаблицаЗначений;\n'
+    '\tТаблица.Колонки.Добавить("Сотрудник");\n'
+    'КонецПроцедуры\n')
 
 
 def _core(name):
     return ['3', ['1', '0', 'в отдельном файле'], f'"{name}"',
             ['1', '"ru"', f'"{name}"'], '""', '0', '0',
             '00000000-0000-0000-0000-000000000000', '0']
+
+
+def _attr(name, typedesc):
+    """Запись реквизита внутри узла коллекции — как в реальном заголовке."""
+    return ['7', ['27', ['2', _core(name), typedesc]]]
+
+
+def _cfg_props(version='"1.2.3.4"', prefix='""'):
+    """Узел свойств конфигурации header[0][3][1][1]: [15] версия, [42] префикс."""
+    node = ['66', ['0', _core('ТестКонф')]] + ['""'] * 44
+    node[15] = version
+    node[42] = prefix
+    return node
+
+
+def _register_header(inner_flags, collections):
+    """header регистра: [0]=версия, [1]=флаги объекта, [2]=коллекции."""
+    return [['1', inner_flags, '6'] + collections]
 
 
 def _write(path, data):
@@ -40,7 +80,12 @@ def make_dump(base):
     """Минимальное дерево в стиле вывода декодера (стадия 3)."""
     _json(os.path.join(base, 'Configuration.json'), {
         'uuid': ROOT_UUID, 'name': 'ТестКонф', 'comment': 'комментарий',
-        'obj_version': '803', 'header': {},
+        'name2': {'ru': 'Тестовая конфигурация'},
+        'compatibility_version': '80321',
+        'obj_version': '803',
+        'header': [['2', [ROOT_UUID], '7',
+                    ['9cd510cd-abfc-11d4-9434-004095e12fc7',
+                     ['1', _cfg_props()]]]],
     })
     _write(os.path.join(base, 'Configuration.con.bsl'), 'Перем Тест;')
     _write(os.path.join(base, 'help.html'), '<html></html>')
@@ -125,6 +170,46 @@ def make_dump(base):
     })
     _json(os.path.join(dt_dir, 'DefinedType.id.json'), {'uuid': DT_UUID})
 
+    # регистр сведений: коллекции измерений/ресурсов/реквизитов — узлы header[0],
+    # начинающиеся каноническим uuid; флаги объекта: [18]=код периодичности
+    # (4 = день), [19]='1' = подчинение регистратору
+    ir_dir = os.path.join(base, 'InformationRegister', 'РегистрСведений1')
+    _json(os.path.join(ir_dir, 'InformationRegister.json'), {
+        'name': 'РегистрСведений1', 'comment': '', 'obj_version': '803',
+        'header': _register_header(
+            ['33'] + ['0'] * 17 + ['4', '1', '0'],
+            [[IR_RESOURCES, '1', _attr('Ресурс1', ['"Pattern"', ['"N"', '15', '3', '1']])],
+             [IR_DIMENSIONS, '1', _attr('Измерение1', ['"Pattern"', ['"#"', REF_CAT]])],
+             [IR_FORMS, '0'],
+             [IR_ATTRIBUTES, '1', _attr('Реквизит1', ['"Pattern"', ['"S"', '10', '1']])]]),
+    })
+    _json(os.path.join(ir_dir, 'InformationRegister.id.json'), {'uuid': IR_UUID})
+
+    # регистр накопления: периодичности у него нет, режим записи всегда
+    # «подчинение регистратору»
+    ar_dir = os.path.join(base, 'AccumulationRegister', 'РегистрНакопления1')
+    _json(os.path.join(ar_dir, 'AccumulationRegister.json'), {
+        'name': 'РегистрНакопления1', 'comment': '', 'obj_version': '803',
+        'header': _register_header(
+            ['28'] + ['0'] * 20,
+            [[AR_RESOURCES, '1',
+              _attr('РесурсНакопления', ['"Pattern"', ['"N"', '15', '3', '1']])],
+             [AR_DIMENSIONS, '1',
+              _attr('ИзмерениеНакопления', ['"Pattern"', ['"#"', REF_CAT]])]]),
+    })
+    _json(os.path.join(ar_dir, 'AccumulationRegister.id.json'), {'uuid': AR_UUID})
+
+    # общий модуль: контекст «Сервер» (флаги rec[2:], позиция 1), экспортный и
+    # закрытый методы, запрос многострочным литералом и таблица значений
+    cm_dir = os.path.join(base, 'CommonModule', 'ОбщийМодуль1')
+    _json(os.path.join(cm_dir, 'CommonModule.json'), {
+        'name': 'ОбщийМодуль1', 'comment': '', 'obj_version': '803',
+        'header': [['1', ['81', '00000000-0000-0000-0000-000000000000',
+                          '0', '1', '0', '0', '0', '0', '0', '0']]],
+    })
+    _json(os.path.join(cm_dir, 'CommonModule.id.json'), {'uuid': CM_UUID})
+    _write(os.path.join(cm_dir, 'CommonModule.obj.bsl'), COMMON_MODULE_BSL)
+
     form_dir = os.path.join(cat_dir, 'Form', 'ФормаЭлемента')
     _json(os.path.join(form_dir, 'CatalogForm.json'), {
         'name': 'ФормаЭлемента', 'comment': '', 'obj_version': '803', 'header': {},
@@ -139,9 +224,9 @@ def test_write_db(tmp_path):
     db_path = str(tmp_path / 'out.sqlite')
 
     stats = write_db(dump, db_path, source_file='test.cf')
-    # files: 4 прочих файла дампа + 3 файла модулей .bsl (карта объект→файл)
-    assert stats == {'objects': 7, 'modules': 3, 'methods': 1, 'files': 7, 'files_content': 3,
-                     'skd': 0, 'attributes': 6, 'refs': 6, 'enum_values': 2,
+    # files: 4 прочих файла дампа + 4 файла модулей .bsl (карта объект→файл)
+    assert stats == {'objects': 10, 'modules': 4, 'methods': 3, 'files': 8, 'files_content': 3,
+                     'skd': 0, 'attributes': 11, 'refs': 8, 'enum_values': 2,
                      'predefined': 1, 'common_targets': 1, 'tabular': 1}
 
     conn = sqlite3.connect(db_path)
@@ -175,6 +260,8 @@ def test_write_db(tmp_path):
         ('СоставнойАтрибут', CAT_UUID, 'Catalog/Справочник1'),
         ('СоставнойАтрибут', '3ea29ea5-0000-0000-0000-000000000000', None),
         ('ТоварыНоменклатура', REF_CAT, 'Catalog/Справочник1'),
+        ('Измерение1', REF_CAT, 'Catalog/Справочник1'),
+        ('ИзмерениеНакопления', REF_CAT, 'Catalog/Справочник1'),
     }
 
     # методы: только процедуры/функции, без «преамбул»
@@ -182,14 +269,19 @@ def test_write_db(tmp_path):
         'SELECT o.path, mt.kind, mt.name FROM method mt'
         ' JOIN module mo ON mo.id = mt.module_id'
         ' JOIN meta_object o ON o.id = mo.object_id')}
-    assert methods == {('Catalog/Справочник1', 'процедура', 'Тест')}
+    assert methods == {('Catalog/Справочник1', 'процедура', 'Тест'),
+                       ('CommonModule/ОбщийМодуль1', 'функция', 'Экспортная'),
+                       ('CommonModule/ОбщийМодуль1', 'процедура', 'Закрытая')}
 
     objects = {r[1]: r for r in q(
         'SELECT id, path, type, name, uuid, parent_id FROM meta_object ORDER BY path')}
     assert set(objects) == {'', 'Catalog/Справочник1',
                             'Catalog/Справочник1/Form/ФормаЭлемента', 'DefinedType/ТипТест',
                             'Enum/ТестПеречисление', 'CommonAttribute/ОбщийТест',
-                            'Document/ЗаказПокупателя'}
+                            'Document/ЗаказПокупателя',
+                            'InformationRegister/РегистрСведений1',
+                            'AccumulationRegister/РегистрНакопления1',
+                            'CommonModule/ОбщийМодуль1'}
 
     # табличная часть и её поля
     assert [r[0] for r in q(
@@ -239,6 +331,9 @@ def test_write_db(tmp_path):
     assert files['help.html'][0] == 'html'
     assert files['help.html'][1] == b'<html></html>'
     assert 'Configuration.4.json' in files
+    # файлы модулей тоже отражаются в file (без data — тело в module)
+    assert files['Catalog/Справочник1/Catalog.obj.bsl'] == ('bsl', None)
+    assert sum(1 for kind, _ in files.values() if kind == 'bsl') == 4
     conn.close()
 
 

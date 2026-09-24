@@ -854,11 +854,26 @@ SYSTEM_PREFIXES = {
 
 def check_query(text, ctx):
     """Проверяет запрос; возвращает список сообщений об ошибках (пустой = ок)."""
+    errors, _ = _check_query_full(text, ctx)
+    return errors
+
+
+def check_query_full(text, ctx):
+    """Проверяет запрос; возвращает (errors, unverified).
+
+    unverified — список строк вида 'Параметр.Поле', обращения к которым
+    не удалось проверить (параметр-таблица не имеет известной схемы).
+    """
+    return _check_query_full(text, ctx)
+
+
+def _check_query_full(text, ctx):
     errors = []
+    unverified = []
     try:
         statements = parse_query(text)
     except QueryError as err:
-        return [f'синтаксис: {err}']
+        return [f'синтаксис: {err}'], unverified
     # первый проход: собираем временные таблицы ПОМЕСТИТЬ по всему скрипту
     temp = {}
     for st in statements:
@@ -866,8 +881,8 @@ def check_query(text, ctx):
             _collect_puts(st, temp)
     for st in statements:
         if 'destroy' not in st:
-            _check_select(st, ctx, temp, errors)
-    return errors
+            _check_select(st, ctx, temp, errors, unverified)
+    return errors, unverified
 
 
 def _collect_puts(node, temp):
@@ -889,31 +904,31 @@ def _select_columns(node):
     return cols
 
 
-def _check_select(node, ctx, temp, errors):
+def _check_select(node, ctx, temp, errors, unverified=None):
     scope = {}
     if node['source']:
         _register_source(node['source']['base'], ctx, temp, scope, errors)
         for _, source, on_expr in node['source']['joins']:
             _register_source(source, ctx, temp, scope, errors)
-            _check_expr(on_expr, ctx, scope, errors)
+            _check_expr(on_expr, ctx, scope, errors, unverified)
     if node['put']:
         temp[node['put']] = _select_columns(node)
     for item in node['items']:
         if item[0] == 'expr':
-            _check_expr(item[1], ctx, scope, errors)
+            _check_expr(item[1], ctx, scope, errors, unverified)
     for key in ('where', 'having'):
         if node[key]:
-            _check_expr(node[key], ctx, scope, errors)
+            _check_expr(node[key], ctx, scope, errors, unverified)
     for expr in (node['group'] or []):
-        _check_expr(expr, ctx, scope, errors)
+        _check_expr(expr, ctx, scope, errors, unverified)
     for expr, _ in (node['order'] or []):
-        _check_expr(expr, ctx, scope, errors)
+        _check_expr(expr, ctx, scope, errors, unverified)
     if node['totals']:
         for expr in (node['totals']['aggregates'] or []) + \
                 (node['totals']['fields'] or []):
-            _check_expr(expr, ctx, scope, errors)
+            _check_expr(expr, ctx, scope, errors, unverified)
     for _, sub in node['union']:
-        _check_select(sub, ctx, temp, errors)
+        _check_select(sub, ctx, temp, errors, unverified)
 
 
 def _register_source(source, ctx, temp, scope, errors):
@@ -939,7 +954,7 @@ def _register_source(source, ctx, temp, scope, errors):
             info = ('obj', ctx.resolve_table(segments))
         name = alias or name0
     elif kind == 'param':
-        info = ('open', None)
+        info = ('param', None)
         name = alias or source[1]
     else:
         info = ('derived', _select_columns(source[1]))
@@ -948,57 +963,57 @@ def _register_source(source, ctx, temp, scope, errors):
         scope[name] = info
 
 
-def _check_expr(expr, ctx, scope, errors):
+def _check_expr(expr, ctx, scope, errors, unverified=None):
     if not isinstance(expr, tuple):
         return
     kind = expr[0]
     if kind == 'field':
-        _check_field(expr[1], ctx, scope, errors)
+        _check_field(expr[1], ctx, scope, errors, unverified)
     elif kind == 'op':
-        _check_expr(expr[2], ctx, scope, errors)
-        _check_expr(expr[3], ctx, scope, errors)
+        _check_expr(expr[2], ctx, scope, errors, unverified)
+        _check_expr(expr[3], ctx, scope, errors, unverified)
     elif kind in ('not', 'un'):
-        _check_expr(expr[1], ctx, scope, errors)
+        _check_expr(expr[1], ctx, scope, errors, unverified)
     elif kind == 'func':
         for arg in expr[2]:
             if arg is not None:
-                _check_expr(arg, ctx, scope, errors)
+                _check_expr(arg, ctx, scope, errors, unverified)
     elif kind == 'refop':
-        _check_expr(expr[1], ctx, scope, errors)
+        _check_expr(expr[1], ctx, scope, errors, unverified)
         if not ctx.table_ok(expr[2]):
             errors.append(f'неизвестная таблица: {".".join(expr[2][:2])}')
     elif kind == 'cast':
-        _check_expr(expr[1], ctx, scope, errors)
+        _check_expr(expr[1], ctx, scope, errors, unverified)
     elif kind == 'case':
         for when, then in expr[1]:
-            _check_expr(when, ctx, scope, errors)
-            _check_expr(then, ctx, scope, errors)
+            _check_expr(when, ctx, scope, errors, unverified)
+            _check_expr(then, ctx, scope, errors, unverified)
         if expr[2]:
-            _check_expr(expr[2], ctx, scope, errors)
+            _check_expr(expr[2], ctx, scope, errors, unverified)
     elif kind == 'in':
-        _check_expr(expr[1], ctx, scope, errors)
+        _check_expr(expr[1], ctx, scope, errors, unverified)
         if expr[2][0] == 'list':
             for sub in expr[2][1]:
-                _check_expr(sub, ctx, scope, errors)
+                _check_expr(sub, ctx, scope, errors, unverified)
         elif expr[2][0] == 'query':
-            _check_select(expr[2][1], ctx, {}, errors)
+            _check_select(expr[2][1], ctx, {}, errors, unverified)
     elif kind == 'between':
         for sub in expr[1:]:
-            _check_expr(sub, ctx, scope, errors)
+            _check_expr(sub, ctx, scope, errors, unverified)
     elif kind == 'tuple':
         for sub in expr[1]:
-            _check_expr(sub, ctx, scope, errors)
+            _check_expr(sub, ctx, scope, errors, unverified)
     elif kind == 'subquery':
-        _check_select(expr[1], ctx, {}, errors)
+        _check_select(expr[1], ctx, {}, errors, unverified)
     elif kind == 'starof':
-        _check_expr(expr[1], ctx, scope, errors)
+        _check_expr(expr[1], ctx, scope, errors, unverified)
     elif kind == 'castref':
         _check_castref(expr, ctx, errors)
     elif kind == 'like':
-        _check_expr(expr[1], ctx, scope, errors)
-        _check_expr(expr[2], ctx, scope, errors)  # шаблон может быть выражением
+        _check_expr(expr[1], ctx, scope, errors, unverified)
+        _check_expr(expr[2], ctx, scope, errors, unverified)  # шаблон может быть выражением
     elif kind == 'isnull':
-        _check_expr(expr[1], ctx, scope, errors)
+        _check_expr(expr[1], ctx, scope, errors, unverified)
 
 
 def _check_castref(expr, ctx, errors):
@@ -1016,7 +1031,7 @@ def _check_castref(expr, ctx, errors):
                 return
 
 
-def _check_field(parts, ctx, scope, errors):
+def _check_field(parts, ctx, scope, errors, unverified=None):
     head = parts[0]
     if head in QUERY_PREFIXES:
         # аргумент вида ЗНАЧЕНИЕ(Справочник.Х.ПустаяСсылка); приведения к
@@ -1033,6 +1048,13 @@ def _check_field(parts, ctx, scope, errors):
     rest = parts[1:]
     if info[0] == 'derived':
         # временные/вложенные таблицы могут строиться в других наборах СКД
+        return
+    if info[0] == 'param':
+        # параметр-таблица: схема неизвестна, фиксируем обращение
+        if unverified is not None and rest:
+            ref = f'{head}.{".".join(rest)}'
+            if ref not in unverified:
+                unverified.append(ref)
         return
     if info[0] != 'obj' or info[1] is None:
         return
