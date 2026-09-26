@@ -124,9 +124,23 @@ def test_register_props_skips_null_and_bool_values():
         assert not any('код' in line for line in lines), lines
 
 
+def test_register_props_decodes_all_documented_periodicity_codes():
+    # полный набор перечисления ПериодичностьРегистраСведений из официальной
+    # справки платформы 8.3.26: номера значений 1582..1588, смещение 1582
+    expected = {
+        '0': 'непериодический', '1': 'год', '2': 'квартал', '3': 'месяц',
+        '4': 'день', '5': 'секунда', '6': 'позиция регистратора',
+    }
+    for code, name in expected.items():
+        lines = register_props('InformationRegister', _ir_header(code, '0'))
+        assert lines == ['Периодичность: ' + name,
+                         'Режим записи: независимый'], code
+
+
 def test_register_props_unknown_code_is_still_reported():
-    lines = register_props('InformationRegister', _ir_header('6', '0'))
-    assert lines == ['Периодичность: есть, код 6 (не расшифрован)',
+    # кода вне документированного набора в справке нет — не угадываем
+    lines = register_props('InformationRegister', _ir_header('42', '0'))
+    assert lines == ['Периодичность: есть, код 42 (не расшифрован)',
                      'Режим записи: независимый']
 
 

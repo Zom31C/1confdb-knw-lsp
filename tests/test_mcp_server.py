@@ -328,6 +328,122 @@ def test_analyze_resolves_modules_and_context(tmp_path_factory):
     assert 'серверный общий модуль' in report['context_warnings'][0]
 
 
+def test_find_methods_searches_bodies(tmp_path_factory):
+    """text ищет подстроку внутри тел методов — того, чего mask дать не может."""
+    server = _server(tmp_path_factory)
+    out = _call(server, 'find_methods',
+                text='Справочник.Справочник1')['content'][0]['text']
+    assert 'ОбщийМодуль1' in out          # запрос с этой таблицей — в его теле
+    assert 'строка ' in out               # с номером строки модуля
+    # по имени/сигнатуре/описанию такой подстроки нет: без text модель
+    # уходила бы в полнотекстовый sql
+    by_name = _call(server, 'find_methods',
+                    mask='Справочник.Справочник1')['content'][0]['text']
+    assert 'ничего не найдено' in by_name
+
+
+def test_find_methods_body_search_ignores_case(tmp_path_factory):
+    """LIKE в SQLite сворачивает регистр только для ASCII — кириллицу сворачиваем сами."""
+    server = _server(tmp_path_factory)
+    for needle in ('Справочник.Справочник1', 'справочник.справочник1'):
+        out = _call(server, 'find_methods',
+                    text=needle)['content'][0]['text']
+        assert 'ОбщийМодуль1' in out, needle
+
+
+def test_find_methods_path_is_a_real_filter(tmp_path_factory):
+    """path ограничивает поиск объектом.
+
+    AND связывается сильнее OR, поэтому без скобок вокруг OR-группы фильтр
+    применялся только к последней ветке и поиск «в одном объекте» молча
+    возвращал методы всей конфигурации.
+    """
+    server = _server(tmp_path_factory)
+    out = _call(server, 'find_methods', mask='Экспортная',
+                path='Catalog/Справочник1')['content'][0]['text']
+    assert 'ничего не найдено' in out
+    own = _call(server, 'find_methods', mask='Экспортная',
+                path=CM)['content'][0]['text']
+    assert 'Экспортная' in own
+
+
+def test_sql_body_has_folds_case_itself(tmp_path_factory):
+    """body_has видна модели через sql — сворачивать регистр она обязана сама.
+
+    Иначе вызов с иглой в верхнем или смешанном регистре молча вернул бы ноль,
+    и модель сделала бы вывод, что обращений к объекту в коде нет.
+    Игла намеренно не путь метаданных: литералы вида 'Справочник.Х'
+    инструмент sql переписывает в 'Catalog/Х' ещё до выполнения (_sql_rewrite).
+    """
+    server = _server(tmp_path_factory)
+    needle = 'КонецПроцедуры'
+    counts = []
+    for variant in (needle, needle.lower(), needle.upper()):
+        out = _call(server, 'sql',
+                    query='SELECT COUNT(*) AS n FROM method '
+                          "WHERE body_has(body, '%s')" % variant
+                    )['content'][0]['text']
+        counts.append(out.rstrip().split()[-1])
+    assert counts[0] != '0', counts
+    assert counts[0] == counts[1] == counts[2], counts
+
+
+def _ext_with_foreign_calls(tmp_path_factory):
+    """«Расширение»: нет ни общего модуля, ни справочника основной базы,
+    но есть метод, который к ним обращается (обычный случай для EPF/расширения)."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    conn = sqlite3.connect(ext_db)
+    for path in (CM, 'Catalog/Справочник1'):
+        conn.execute('DELETE FROM meta_object WHERE path=?', (path,))
+    oid = conn.execute('SELECT id FROM meta_object '
+                       "WHERE path='DataProcessor/ДопОбработка'").fetchone()[0]
+    conn.execute("INSERT INTO module (object_id, code_name, context, body) "
+                 "VALUES (?, 'obj', '', '')", (oid,))
+    mid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+    body = ('Процедура Обработать()\n'
+            '    ОбщийМодуль1.Экспортная();\n'
+            '    Справочники.Справочник1.НайтиПоКоду("1");\n'
+            '    Справочники.НетТакого.Создать();\n'
+            '    Запрос.Текст = "ВЫБРАТЬ 1 ИЗ Справочник.Справочник1";\n'
+            'КонецПроцедуры\n')
+    conn.execute('INSERT INTO method (module_id, ord, kind, name, signature, '
+                 'is_export, directives, description, line_start, body) '
+                 "VALUES (?, 1, 'процедура', 'Обработать', '', 0, '', '', 1, ?)",
+                 (mid, body))
+    conn.commit()
+    conn.close()
+    return main_db, ext_db
+
+
+def test_method_dependencies_resolves_in_other_open_base(tmp_path_factory):
+    """Зависимости EPF/расширения ищутся и в открытой рядом основной базе."""
+    main_db, ext_db = _ext_with_foreign_calls(tmp_path_factory)
+    server = McpServer([main_db, ext_db])
+    out = _call(server, 'method_dependencies', db='расширение',
+                path='DataProcessor/ДопОбработка', code_name='obj',
+                name='Обработать')['content'][0]['text']
+    # объект основной конфигурации найден в соседней базе, а не «не найден»
+    assert 'есть в базе «основная»' in out
+    assert 'Справочник.Справочник1' in out
+    # общий модуль — тоже оттуда, с проверкой Экспорт
+    assert 'Зависимости из другой открытой базы' in out
+    assert 'общий модуль в базе «основная»: Экспортная — Экспорт' in out
+    # чего нет нигде — честно сказано, что проверены и соседние базы
+    assert 'НЕ НАЙДЕНО в этой базе и в открытых рядом' in out
+    # запрос проверен по метаданным своей базы — подсказываем перепроверить
+    assert 'по метаданным ЭТОЙ базы' in out
+    assert 'check_query(text, db=' in out
+
+
+def test_method_dependencies_single_base_has_no_foreign_sections(tmp_path_factory):
+    """Когда база одна, никаких «соседних баз» в ответе не появляется."""
+    server = _server(tmp_path_factory)
+    out = _call(server, 'method_dependencies', path=CM, code_name='obj',
+                name='Экспортная')['content'][0]['text']
+    assert 'Зависимости из другой открытой базы' not in out
+    assert 'и в открытых рядом' not in out
+
+
 def test_error_categories(tmp_path_factory):
     server = _server(tmp_path_factory)
     denied = _call(server, 'sql', query='DELETE FROM meta_object')
