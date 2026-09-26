@@ -225,7 +225,7 @@ MULTIPLE DATABASES: the server can hold several knowledge bases at once — typi
 
 DATABASE IDENTIFIER: every tool response includes a header line identifying the source database: '=== база <алиас> (<путь>) ==='. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
 
-COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds (name, version, compatibility mode, source file, build date). These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
+COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds and WHAT KIND of file it came from — .cf configuration, .cfe extension, .epf external data processor, .erf external report (name, version, compatibility mode, source file, build date); db_list repeats the kind and the version in one line per open base. These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
 
 REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
 
@@ -597,36 +597,31 @@ class McpServer:
         return lines
 
     def configuration_info(self, db=None):
-        """Паспорт конфигурации/расширения: имя, версия, режим совместимости."""
+        """Паспорт базы: тип файла, имя, версия, режим совместимости."""
         alias = self._alias(db)
         props = self.cfg_props(alias)
         if not props:
             return 'корневой объект конфигурации не найден'
-        label = {'Configuration': 'Конфигурация',
-                 'ConfigurationExtension': 'Расширение конфигурации',
-                 'ExternalDataProcessor': 'Внешняя обработка'}.get(
-                     props.get('root_type'),
-                     props.get('root_type_ru') or props.get('root_type') or '?')
-        head = f'{label}: {props.get("name") or "?"}'
+        root_type = props.get('root_type')
+        kind, _ext = header_props.kind_of(root_type, props.get('root_type_ru'),
+                                          props.get('source_file'))
+        head = f'{kind or "?"}: {props.get("name") or "?"}'
         if props.get('synonym') and props['synonym'] != props.get('name'):
             head += f' ({props["synonym"]})'
         out = [head]
         root_ru = props.get('root_type_ru')
-        root_type = props.get('root_type')
         # type_ru в meta_object допускает NULL — без запасного варианта
         # получилось бы «Тип корня: None (Configuration)»
         out.append('Тип корня: '
                    + (f'{root_ru} ({root_type})' if root_ru and root_type
                       else (root_ru or root_type or '?')))
-        out.append('Версия '
-                   + ('расширения'
-                      if props.get('root_type') == 'ConfigurationExtension'
-                      else 'конфигурации') + ': '
+        out.append(f'Версия {header_props.version_noun(kind)}: '
                    + (props.get('version') or 'в файле не указана'))
         if props.get('name_prefix'):
             out.append(f'Префикс имён расширения: {props["name_prefix"]}')
         out.append('Режим совместимости: '
-                   + (props.get('compatibility') or 'не определён'))
+                   + header_props.compatibility_line(
+                       root_type, props.get('compatibility')))
         out.append('Версия платформы: в файле конфигурации не хранится '
                    '(см. режим совместимости)')
         if props.get('obj_version'):
@@ -1219,15 +1214,28 @@ class McpServer:
                 props.setdefault('name', row[2])
                 props['root_type'] = row[0]
                 props['root_type_ru'] = row[1]
+            src = info['conn'].execute(
+                'SELECT file FROM source ORDER BY id LIMIT 1').fetchone()
+            # путь исходника нужен для типа файла: .erf и .epf дают один
+            # и тот же root_type, различает их только расширение
+            props['source_file'] = src[0] if src else None
             info['cfg'] = props
         return info['cfg']
 
     def cfg_summary(self, alias):
-        """(имя конфигурации, строка версий) базы — коротко для db_list."""
+        """(имя конфигурации, строка свойств) базы — коротко для db_list."""
         props = self.cfg_props(alias)
-        bits = [props.get('version') or 'версия не указана']
-        if props.get('compatibility'):
-            bits.append(f'режим совместимости {props["compatibility"]}')
+        kind, ext = header_props.kind_of(props.get('root_type'),
+                                         props.get('root_type_ru'),
+                                         props.get('source_file'))
+        bits = []
+        if kind:
+            bits.append(f'{kind} ({ext})' if ext else kind)
+        bits.append(props.get('version') or 'версия не указана')
+        compat = header_props.compatibility_short(props.get('root_type'),
+                                                  props.get('compatibility'))
+        if compat:
+            bits.append(f'режим совместимости {compat}')
         if props.get('name_prefix'):
             bits.append(f'префикс имён {props["name_prefix"]}')
         return props.get('name') or '?', '; '.join(bits)
@@ -1510,9 +1518,12 @@ TOOLS = [
                  ('extension_db', 'base_db')),
          McpServer.extension_diff),
     Tool('configuration_info',
-         'Passport of the knowledge base itself: configuration/extension name '
-         'and synonym, its VERSION, compatibility mode (режим совместимости), '
-         'extension name prefix, source .cf/.cfe/.epf file and the date the '
+         'Passport of the knowledge base itself: WHAT KIND of file it was built '
+         'from (.cf configuration / .cfe extension / .epf external data '
+         'processor / .erf external report), its name and synonym, its VERSION, '
+         'compatibility mode (режим совместимости — external reports and data '
+         'processors have none, an extension inherits it from the main '
+         'configuration), extension name prefix, source file and the date the '
          'base was built, object/module/method counts. Call it first when you '
          'need to know WHICH configuration and which release you are looking '
          'at (e.g. before porting code between configurations).',
@@ -1520,8 +1531,9 @@ TOOLS = [
          McpServer.configuration_info),
     Tool('db_list',
          'List the knowledge bases open on this server: alias, file path, '
-         'object/module/method counts; * marks the ACTIVE base that the other '
-         'tools query by default.',
+         'object/module/method counts, and one line per base with the kind of '
+         'the source file (.cf/.cfe/.epf/.erf), its version and compatibility '
+         'mode; * marks the ACTIVE base that the other tools query by default.',
          _schema({}),
          McpServer.db_list),
     Tool('db_open',

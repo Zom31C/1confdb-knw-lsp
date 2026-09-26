@@ -255,20 +255,26 @@ class Tui:
             print(title)
             for i, path in enumerate(entries, 1):
                 print(f' {i}. {path}')
-            print(' p. Указать путь вручную')
+            print(' p. Указать путь вручную (или просто наберите путь)')
             if allow_empty:
                 print(f' e. Пусто ({empty_hint})')
             print(' 0. Отмена')
             choice = input('Выбор: ').strip()
+            if not choice:
+                continue
             if choice == '0':
                 return None
             if choice == 'e' and allow_empty:
                 return ''
             if choice == 'p':
                 return _ask_path('Путь')
-            if choice.isdigit() and 1 <= int(choice) <= len(entries):
-                return entries[int(choice) - 1]
-            print('Неизвестный пункт.')
+            if choice.isdigit():
+                if 1 <= int(choice) <= len(entries):
+                    return entries[int(choice) - 1]
+                print('Нет такого пункта.')
+                continue
+            # всё, что не номер и не команда, — путь, набранный вручную
+            return _unquote(choice)
 
     def _db_candidates(self):
         roots = [os.getcwd(),
@@ -292,12 +298,14 @@ class Tui:
             print(title)
             for i, path in enumerate(entries, 1):
                 print(f' {i}. {path}')
-            print(' p. Указать путь вручную')
+            print(' p. Указать путь вручную (или просто наберите путь)')
             print(' k. Добавить каталог с базами (его файлы появятся в списке)')
             if allow_empty:
                 print(f' e. Пусто ({empty_hint})')
             print(' 0. Отмена')
             choice = input('Выбор: ').strip()
+            if not choice:
+                continue
             if choice == '0':
                 return None
             if choice == 'e' and allow_empty:
@@ -315,9 +323,14 @@ class Tui:
                     print('Нет такого каталога.')
                     input('Нажмите Enter…')
                 continue
-            if choice.isdigit() and 1 <= int(choice) <= len(entries):
-                return entries[int(choice) - 1]
-            print('Неизвестный пункт.')
+            if choice.isdigit():
+                if 1 <= int(choice) <= len(entries):
+                    return entries[int(choice) - 1]
+                print('Нет такого пункта.')
+                continue
+            # всё, что не номер и не команда, — путь, набранный вручную;
+            # файла может ещё не быть (сюда же задают базу для извлечения)
+            return _unquote(choice)
 
     # ---------- извлечение ----------
 

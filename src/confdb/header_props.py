@@ -9,8 +9,14 @@
 (949 регистров сведений, 123 регистра накопления) и на паре
 configuration/extension из тестов v8unpack; подробности — в базе знаний
 проекта, страницы `register-header-structure` и `configuration-header-props`.
+
+Тип загруженного файла определяется расширением исходника, и оно точнее типа
+корневого объекта: .erf и .epf декодирует один класс ExternalDataProcessor
+(v8/decoder.py), поэтому корень внешнего отчёта попадает в базу как
+ExternalDataProcessor.
 """
 import json
+import os
 
 # Канонические uuid коллекций реквизитов регистра: узел коллекции в header[0]
 # начинается таким uuid, позиция узла у разных типов регистра разная.
@@ -67,6 +73,33 @@ IR_WRITE_MODE = 19
 CFG_VERSION = 15
 CFG_NAME_PREFIX = 42
 
+# Тип загруженного файла — по расширению исходника и по типу корневого объекта
+FILE_KINDS = {
+    '.cf': 'Конфигурация',
+    '.cfe': 'Расширение конфигурации',
+    '.epf': 'Внешняя обработка',
+    '.erf': 'Внешний отчёт',
+}
+
+ROOT_KINDS = {
+    'Configuration': 'Конфигурация',
+    'ConfigurationExtension': 'Расширение конфигурации',
+    'ExternalDataProcessor': 'Внешняя обработка',
+    'ExternalReport': 'Внешний отчёт',
+}
+
+# Родительный падеж названия типа — для строки «Версия …» паспорта
+VERSION_NOUNS = {
+    'Конфигурация': 'конфигурации',
+    'Расширение конфигурации': 'расширения',
+    'Внешняя обработка': 'обработки',
+    'Внешний отчёт': 'отчёта',
+}
+
+# Режим совместимости — свойство конфигурации: у внешних обработок и отчётов
+# он не задаётся, а расширение выполняется в режиме основной конфигурации.
+WITHOUT_COMPATIBILITY = frozenset({'ExternalDataProcessor', 'ExternalReport'})
+
 
 def unquote(value):
     """'"3.0.4.4"' -> '3.0.4.4'; не-строки возвращает как есть."""
@@ -82,6 +115,54 @@ def compatibility_str(code):
     if len(text) >= 4 and text.isdigit() and text[0] in '78':
         return f'{text[0]}.{int(text[1:3])}.{int(text[3:])}'
     return text or None
+
+
+def source_ext(path):
+    """Расширение исходного файла ('.cfe') или None."""
+    return os.path.splitext(str(path or ''))[1].lower() or None
+
+
+def kind_of(root_type=None, root_type_ru=None, source_file=None):
+    """(тип загруженного файла, его расширение) — ('Внешний отчёт', '.erf').
+
+    Расширение исходника важнее типа корня: корень .erf записывается в базу
+    как ExternalDataProcessor, и только '.erf' говорит, что это отчёт.
+    """
+    ext = source_ext(source_file)
+    name = (FILE_KINDS.get(ext) or ROOT_KINDS.get(root_type)
+            or root_type_ru or root_type)
+    return name, ext
+
+
+def version_noun(kind_name):
+    """'Расширение конфигурации' -> 'расширения' — для строки «Версия …»."""
+    return VERSION_NOUNS.get(kind_name, 'конфигурации')
+
+
+def compatibility_line(root_type, compatibility):
+    """Режим совместимости для паспорта базы, с учётом типа корневого объекта.
+
+    У внешних обработок и отчётов такого свойства нет вообще, а расширение
+    выполняется в режиме основной конфигурации — значение из его файла
+    показывается как справочное, а не как действующий режим.
+    """
+    if root_type in WITHOUT_COMPATIBILITY:
+        return compatibility or 'не задаётся'
+    if root_type == 'ConfigurationExtension':
+        text = 'наследуется от основной конфигурации'
+        return (f'{text}; в файле расширения указан {compatibility}'
+                if compatibility else text)
+    return compatibility or 'не определён'
+
+
+def compatibility_short(root_type, compatibility):
+    """То же одной фразой для списка баз; None — выводить нечего."""
+    if root_type in WITHOUT_COMPATIBILITY:
+        return compatibility
+    if root_type == 'ConfigurationExtension':
+        return (f'{compatibility} (наследуется)' if compatibility
+                else 'наследуется от основной конфигурации')
+    return compatibility
 
 
 def _load(header_json):

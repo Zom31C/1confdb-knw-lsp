@@ -241,9 +241,66 @@ def test_configuration_info(tmp_path_factory):
     assert 'Версия платформы: в файле конфигурации не хранится' in info
     assert 'Источник выгрузки: t.cf' in info
     assert 'запросов СКД' in info
-    # db_list кратко повторяет версию и режим совместимости
+    # db_list кратко повторяет тип файла, версию и режим совместимости
     lst = _call(server, 'db_list')['content'][0]['text']
     assert '1.2.3.4' in lst and '8.3.21' in lst
+    assert 'Конфигурация (.cf)' in lst
+
+
+# заголовок корня внешней обработки: ни версии, ни режима совместимости
+PROC_HEADER = json.dumps({'name': '"ТестОбработка"', 'obj_version': '803'},
+                         ensure_ascii=False)
+
+
+def _server_as(tmp_path_factory, root_type, root_type_ru, source_file,
+               header_json=None):
+    """Сервер над базой, чей корень переписан под другой тип файла."""
+    dump = str(tmp_path_factory.mktemp('dump-kind'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db-kind') / 'k.sqlite')
+    write_db(dump, db, source_file=source_file)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute('UPDATE meta_object SET type=?, type_ru=? '
+                     'WHERE parent_id IS NULL', (root_type, root_type_ru))
+        conn.execute('UPDATE source SET file=?', (source_file,))
+        if header_json is not None:
+            conn.execute('UPDATE meta_object SET header_json=? '
+                         'WHERE parent_id IS NULL', (header_json,))
+        conn.commit()
+    finally:
+        conn.close()
+    return McpServer(db)
+
+
+def test_configuration_info_extension(tmp_path_factory):
+    server = _server_as(tmp_path_factory, 'ConfigurationExtension',
+                        'Расширение конфигурации', 'Расширение1.cfe')
+    info = _call(server, 'configuration_info')['content'][0]['text']
+    assert 'Расширение конфигурации: ТестКонф' in info
+    assert 'Версия расширения: 1.2.3.4' in info
+    # режим совместимости расширение наследует, значение файла — справочное
+    assert ('Режим совместимости: наследуется от основной конфигурации; '
+            'в файле расширения указан 8.3.21') in info
+    lst = _call(server, 'db_list')['content'][0]['text']
+    assert 'Расширение конфигурации (.cfe)' in lst
+    assert 'режим совместимости 8.3.21 (наследуется)' in lst
+
+
+def test_configuration_info_external_report(tmp_path_factory):
+    # .erf декодирует класс ExternalDataProcessor: тип файла виден только
+    # по расширению исходника
+    server = _server_as(tmp_path_factory, 'ExternalDataProcessor',
+                        'Внешняя обработка', 'D:\\Отчёты\\МойОтчёт.erf',
+                        header_json=PROC_HEADER)
+    info = _call(server, 'configuration_info')['content'][0]['text']
+    assert 'Внешний отчёт: ТестОбработка' in info
+    assert 'Тип корня: Внешняя обработка (ExternalDataProcessor)' in info
+    assert 'Версия отчёта: в файле не указана' in info
+    assert 'Режим совместимости: не задаётся' in info
+    lst = _call(server, 'db_list')['content'][0]['text']
+    assert 'Внешний отчёт (.erf)' in lst
+    assert 'режим совместимости' not in lst
 
 
 # -- инструменты работы с кодом ---------------------------------------------
