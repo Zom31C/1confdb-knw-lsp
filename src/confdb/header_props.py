@@ -3,10 +3,11 @@
 Заголовок объекта хранится в meta_object.header_json как есть (порт v8unpack),
 поэтому часть сведений доступна без переизвлечения конфигурации: версия и режим
 совместимости конфигурации, префикс имён расширения, состав измерений/ресурсов/
-реквизитов регистра, его периодичность и режим записи.
+реквизитов регистра, его периодичность и режим записи, целевое пространство
+имён пакета XDTO.
 
 Соответствие позиций и канонических uuid проверено на реальной базе УНФ
-(949 регистров сведений, 123 регистра накопления) и на паре
+(949 регистров сведений, 123 регистра накопления, 334 пакета XDTO) и на паре
 configuration/extension из тестов v8unpack; подробности — в базе знаний
 проекта, страницы `register-header-structure` и `configuration-header-props`.
 
@@ -72,6 +73,11 @@ IR_WRITE_MODE = 19
 # Позиции в узле свойств конфигурации header[0][3][1][1]
 CFG_VERSION = 15
 CFG_NAME_PREFIX = 42
+
+# Пакет XDTO: запись header[0][1] = ['1', CORE, '"целевое пространство имён"'].
+# Позиция одинакова у всех 334 пакетов УНФ и значение совпадает с атрибутом
+# targetNamespace файла XDTOPackage.bin (проверено сверкой с XML).
+XDTO_NAMESPACE = 2
 
 # Тип загруженного файла — по расширению исходника и по типу корневого объекта
 FILE_KINDS = {
@@ -261,6 +267,27 @@ def register_props(obj_type, header_json):
     elif mode == '0':
         lines.append('Режим записи: независимый')
     return lines
+
+
+def xdto_props(obj_type, header_json):
+    """Строки свойств пакета XDTO из заголовка: целевое пространство имён.
+
+    Состав типов и свойств пакета в заголовке не хранится — он лежит в файле
+    XDTOPackage.bin (открытый XML), и его извлекает write_db.
+    """
+    if obj_type != 'XDTOPackage':
+        return []
+    data = _load(header_json)
+    if data is None:
+        return []
+    try:
+        inner = data['header'][0][1]
+    except (KeyError, IndexError, TypeError):
+        return []
+    if not isinstance(inner, list):
+        return []
+    namespace = unquote(_scalar(inner, XDTO_NAMESPACE) or '')
+    return [f'Пространство имён: {namespace}'] if namespace else []
 
 
 def _scalar(inner, index):

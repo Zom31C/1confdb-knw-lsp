@@ -16,6 +16,7 @@ import sqlite3
 import xml.sax.saxutils
 from datetime import datetime
 
+from .. import xdto
 from ..bsl_parser import parse_methods
 from ..v8 import helper
 
@@ -258,8 +259,11 @@ class _TypeResolver:
             if paths:
                 self.links.extend((uuid, p) for p in paths)
                 return ' | '.join(f'Ссылка: {p}' for p in paths)
+            # имя в таблице .10 есть, а объекта ссылочного типа с ним в этой
+            # базе нет — отличие от обобщённого типа ниже: цель известна по
+            # имени и просто отсутствует среди извлечённых объектов
             self.links.append((uuid, None))
-            return f'Ссылка: {name}'
+            return f'Ссылка: {name} (объект не найден в базе)'
         path = self.dt_map.get(uuid)
         if path is not None:
             self.links.append((uuid, path))
@@ -267,6 +271,9 @@ class _TypeResolver:
             if members:
                 return f'ОпределяемыйТип: {path} ({" | ".join(members)})'
             return f'ОпределяемыйТип: {path}'
+        # uuid не соответствует ни одному объекту и отсутствует в таблице .10:
+        # обобщённый тип платформы (ЛюбаяСсылка, Характеристика) — конкретной
+        # цели у него нет и в конфигурации она не описана
         self.links.append((uuid, None))
         return 'Ссылка'
 
@@ -300,6 +307,10 @@ def _extract_attributes(header, resolver=None):
     ["2", CORE, <uuid>, TYPEDESC, ..] (составной тип — дескриптор в node[3]).
     Поля табличной части — те же записи внутри блока полей секции; tabular —
     имя табличной части (иначе None).
+
+    Дедуп — только внутри одной секции: имя уникально в пределах табличной
+    части, а не объекта, поэтому одноимённые поля разных ТЧ и реквизит объекта
+    с именем поля ТЧ — разные записи.
     """
     result = []
     seen = set()
@@ -312,8 +323,8 @@ def _extract_attributes(header, resolver=None):
         if not isinstance(node, list):
             return
         name, typedesc = _attr_record(node)
-        if name and name not in seen:
-            seen.add(name)
+        if name and (section, name) not in seen:
+            seen.add((section, name))
             if resolver:
                 result.append((name, resolver.describe(typedesc),
                                list(resolver.links), section))
@@ -522,6 +533,45 @@ CREATE TABLE skd_query (
     query TEXT NOT NULL
 );
 CREATE INDEX ix_skd_query_object ON skd_query(object_id, ord);
+CREATE TABLE xdto_import (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    namespace TEXT NOT NULL
+);
+CREATE INDEX ix_xdto_import_object ON xdto_import(object_id, ord);
+CREATE INDEX ix_xdto_import_ns ON xdto_import(namespace);
+CREATE TABLE xdto_type (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    name TEXT,
+    kind TEXT NOT NULL,
+    base TEXT,
+    base_ns TEXT,
+    facets TEXT,
+    enum_values TEXT
+);
+CREATE INDEX ix_xdto_type_object ON xdto_type(object_id, ord);
+CREATE INDEX ix_xdto_type_name ON xdto_type(name);
+CREATE INDEX ix_xdto_type_base_ns ON xdto_type(base_ns);
+CREATE TABLE xdto_property (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type_id INTEGER REFERENCES xdto_type(id) ON DELETE CASCADE,
+    object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    name TEXT,
+    type TEXT,
+    type_ns TEXT,
+    lower_bound INTEGER,
+    upper_bound INTEGER,
+    nillable INTEGER,
+    form TEXT,
+    extra TEXT,
+    nested_type_id INTEGER REFERENCES xdto_type(id) ON DELETE CASCADE
+);
+CREATE INDEX ix_xdto_property_type ON xdto_property(type_id, ord);
+CREATE INDEX ix_xdto_property_name ON xdto_property(name);
 CREATE TABLE meta_attribute (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
@@ -708,6 +758,48 @@ def _extract_skd_queries(path):
     return queries or None
 
 
+def _insert_xdto_props(conn, object_id, type_id, props, stats):
+    """Пишет свойства типа; type_id None — свойства уровня самого пакета."""
+    for ord_no, prop in enumerate(props):
+        nested_id = (_insert_xdto_type(conn, object_id, ord_no,
+                                       prop['nested'], stats)
+                     if prop['nested'] is not None else None)
+        conn.execute(
+            'INSERT INTO xdto_property (type_id, object_id, ord, name, type,'
+            ' type_ns, lower_bound, upper_bound, nillable, form, extra,'
+            ' nested_type_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (type_id, object_id, ord_no, prop['name'], prop['type'],
+             prop['type_ns'], prop['lower_bound'], prop['upper_bound'],
+             prop['nillable'], prop['form'], prop['extra'], nested_id))
+        stats['xdto_properties'] += 1
+
+
+def _insert_xdto_type(conn, object_id, ord_no, item, stats):
+    """Пишет тип пакета XDTO и его свойства; возвращает id типа.
+
+    Вложенный анонимный тип пишется раньше свойства-владельца: на него
+    ссылается nested_type_id. Пакеты небольшие, поэтому вставка построчная.
+    """
+    type_id = conn.execute(
+        'INSERT INTO xdto_type (object_id, ord, name, kind, base, base_ns,'
+        ' facets, enum_values) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (object_id, ord_no, item['name'], item['kind'], item['base'],
+         item['base_ns'], item['facets'], item['values'])).lastrowid
+    stats['xdto_types'] += 1
+    _insert_xdto_props(conn, object_id, type_id, item['props'], stats)
+    return type_id
+
+
+def _insert_xdto(conn, object_id, package, stats):
+    """Пишет состав пакета XDTO: импорты, типы и свойства уровня пакета."""
+    for ord_no, namespace in enumerate(package['imports']):
+        conn.execute('INSERT INTO xdto_import (object_id, ord, namespace)'
+                     ' VALUES (?, ?, ?)', (object_id, ord_no, namespace))
+    for ord_no, item in enumerate(package['types']):
+        _insert_xdto_type(conn, object_id, ord_no, item, stats)
+    _insert_xdto_props(conn, object_id, None, package['props'], stats)
+
+
 # Разбор модулей масштабируется примерно до 8 процессов: дальше накладные
 # расходы на spawn и передачу тел методов через IPC превышают выигрыш.
 MAX_PARSE_WORKERS = 8
@@ -744,7 +836,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     conn = sqlite3.connect(db_path)
     stats = {'objects': 0, 'modules': 0, 'methods': 0, 'files': 0, 'files_content': 0,
              'skd': 0, 'attributes': 0, 'refs': 0, 'enum_values': 0, 'predefined': 0,
-             'common_targets': 0, 'tabular': 0}
+             'common_targets': 0, 'tabular': 0, 'xdto_types': 0, 'xdto_properties': 0}
     try:
         # база пересоздаётся с нуля при каждом запуске: отключаем fsync для скорости,
         # но журнал оставляем rollback (не MEMORY) — прерванная запись должна
@@ -1023,6 +1115,10 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                         for ord_no, query in enumerate(skd):
                             skd_params.append((object_id, ord_no, query))
                         stats['skd'] += len(skd)
+                    # содержимое пакета XDTO — тоже XML в .bin, но другой разметки
+                    package = xdto.parse_package(full)
+                    if package:
+                        _insert_xdto(conn, object_id, package, stats)
                 file_params.append((source_id, object_id, rel_file, ext or 'bin', size, data))
                 stats['files'] += 1
                 if len(file_params) >= 2000:

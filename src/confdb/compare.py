@@ -4,7 +4,7 @@
 типовой» и «что именно делает расширение» без ручного сопоставления двух
 паспортов объекта. Обе базы открыты read-only; объект сравнивается по снимку
 (snapshot): тип, реквизиты с типами, табличные части, группы полей регистра,
-модули, методы, вложенные объекты и запросы СКД.
+модули, методы, вложенные объекты, запросы СКД и состав пакета XDTO.
 
 Тела модулей и методов в снимке хранятся как sha1 — сравнение не тянет
 мегабайты кода в память второй раз, а разница «изменилось/не изменилось»
@@ -12,6 +12,7 @@
 """
 import hashlib
 import re
+import sqlite3
 
 from .header_props import REGISTER_KINDS, register_field_kinds
 
@@ -30,6 +31,46 @@ RE_REF = re.compile(r'Ссылка:\s*([^|()]+)')
 
 def sha1(text):
     return hashlib.sha1((text or '').encode('utf-8')).hexdigest()
+
+
+def _xdto_snapshot(conn, oid):
+    """{имя типа: (базовый тип, отпечаток свойств)} — состав пакета XDTO.
+
+    Сравниваются только именованные типы: свойства вложенного анонимного типа
+    входят в отпечаток свойства-владельца, поэтому его изменение видно как
+    изменение именованного типа, а не как пропавший тип без имени.
+    """
+    try:
+        types = {tid: (name, base, facets, values) for tid, name, base,
+                 facets, values in conn.execute(
+                     'SELECT id, name, base, facets, enum_values'
+                     ' FROM xdto_type WHERE object_id=?', (oid,))}
+        rows = conn.execute(
+            'SELECT type_id, ord, name, type, lower_bound, upper_bound,'
+            ' nillable, form, nested_type_id, extra FROM xdto_property'
+            ' WHERE object_id=? ORDER BY type_id, ord', (oid,)).fetchall()
+    except sqlite3.OperationalError:
+        # база извлечена версией без таблиц xdto_*: отсутствие состава пакета
+        # не должно ломать сравнение остальных разделов объекта
+        return {}
+    props = {}
+    for row in rows:
+        props.setdefault(row[0], []).append(row[1:])
+
+    def signature(tid):
+        parts = []
+        for pname, ptype, lower, upper, nill, form, nested, extra \
+                in props.get(tid, []):
+            parts.append(f'{pname}|{ptype}|{lower}|{upper}|{nill}|{form}|{extra}'
+                         + (f'|{signature(nested)}' if nested else ''))
+        return sha1(';'.join(parts))
+
+    out = {name: (base or '', sha1(f'{facets}|{values}|{signature(tid)}'))
+           for tid, (name, base, facets, values) in types.items() if name}
+    if props.get(None):
+        # свойства, объявленные в самом пакете вне типов
+        out['(свойства пакета)'] = ('', signature(None))
+    return out
 
 
 def object_snapshot(conn, path):
@@ -61,6 +102,7 @@ def object_snapshot(conn, path):
         'skd': [sha1(text) for text, in conn.execute(
             'SELECT query FROM skd_query WHERE object_id=? ORDER BY ord',
             (oid,))],
+        'xdto': _xdto_snapshot(conn, oid),
     }
     for code, mname, kind, sig, exp, dirs, body in conn.execute(
             'SELECT m.code_name, t.name, t.kind, t.signature, t.is_export, '
@@ -137,6 +179,24 @@ def diff_snapshots(left, right, title_left='слева', title_right='справ
         out.append('Табличные части:')
         out.extend(_list(only_l, lambda s: _only_in(title_left) + s))
         out.extend(_list(only_r, lambda s: _only_in(title_right) + s))
+
+    only_l, only_r, changed = _split(left.get('xdto', {}), right.get('xdto', {}))
+    if only_l or only_r or changed:
+        out.append(f'Типы XDTO ({title_left} {len(left.get("xdto", {}))}, '
+                   f'{title_right} {len(right.get("xdto", {}))}):')
+        out.extend(_list(only_l, lambda n: _only_in(title_left) + n))
+        out.extend(_list(only_r, lambda n: _only_in(title_right) + n))
+        for name in changed[:MAX_ITEMS]:
+            lbase, lsha = left['xdto'][name]
+            rbase, rsha = right['xdto'][name]
+            bits = []
+            if lbase != rbase:
+                bits.append(f'базовый тип {lbase or "—"} -> {rbase or "—"}')
+            if lsha != rsha:
+                bits.append('состав свойств, ограничения или значения изменились')
+            out.append(f'  отличается {name}: ' + '; '.join(bits))
+        if len(changed) > MAX_ITEMS:
+            out.append(f'  … и ещё {len(changed) - MAX_ITEMS}')
 
     only_l, only_r, changed = _split(left['children'], right['children'])
     if only_l or only_r or changed:

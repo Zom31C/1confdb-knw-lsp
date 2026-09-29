@@ -17,8 +17,10 @@ DOC_UUID = '0d0d0d0d-0000-0000-0000-000000000007'
 IR_UUID = '0e0e0e0e-0000-0000-0000-000000000008'
 AR_UUID = '0f0f0f0f-0000-0000-0000-000000000009'
 CM_UUID = '0a0a0a0a-0000-0000-0000-00000000000a'
+XDTO_UUID = '0b0b0b0b-0000-0000-0000-00000000000b'
 REF_CAT = '11111111-1111-1111-1111-111111111111'  # ссылочный uuid справочника в .10
 REF_DT = '22222222-2222-2222-2222-222222222222'   # собственный ссылочный uuid DT
+REF_ORPHAN = '44444444-4444-4444-4444-444444444444'  # имя в .10 есть, объекта в базе нет
 
 # модуль общего назначения с экспортной функцией (запрос многострочным
 # литералом с '|') и закрытой процедурой, создающей таблицу значений
@@ -36,6 +38,36 @@ COMMON_MODULE_BSL = (
     '\tТаблица = Новый ТаблицаЗначений;\n'
     '\tТаблица.Колонки.Добавить("Сотрудник");\n'
     'КонецПроцедуры\n')
+
+
+# содержимое XDTOPackage.bin: открытый XML с BOM, CRLF и пространством имён по
+# умолчанию — как в реальном дампе стадии 3 (_tmp\probe_xdto_out.txt)
+XDTO_PACKAGE_XML = (
+    '\ufeff<package xmlns="http://v8.1c.ru/8.1/xdto" '
+    'xmlns:xs="http://www.w3.org/2001/XMLSchema" '
+    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+    'targetNamespace="http://v8.1c.ru/test/package/1.0">\r\n'
+    '\t<import namespace="http://v8.1c.ru/test/base/1.0"/>\r\n'
+    '\t<objectType xmlns:d2p1="http://v8.1c.ru/test/base/1.0" name="Товар" '
+    'base="d2p1:БазовыйТовар">\r\n'
+    '\t\t<property name="Наименование" type="xs:string" lowerBound="1" '
+    'nillable="false" form="Attribute"/>\r\n'
+    '\t\t<property name="Количество" type="xs:decimal" lowerBound="0" '
+    'nillable="true"/>\r\n'
+    '\t\t<property name="Позиции" lowerBound="0" upperBound="-1" nillable="true">\r\n'
+    '\t\t\t<typeDef xsi:type="ObjectType">\r\n'
+    '\t\t\t\t<property name="Номер" type="xs:integer" lowerBound="0" '
+    'nillable="true" form="Element"/>\r\n'
+    '\t\t\t</typeDef>\r\n'
+    '\t\t</property>\r\n'
+    '\t</objectType>\r\n'
+    '\t<valueType name="ВидОперации" base="xs:string" maxLength="20">\r\n'
+    '\t\t<enumeration xsi:type="xs:string">Приход</enumeration>\r\n'
+    '\t\t<enumeration xsi:type="xs:string">Расход</enumeration>\r\n'
+    '\t</valueType>\r\n'
+    '\t<property name="КорневойЭлемент" type="xs:string" localName="root"/>\r\n'
+    '</package>\r\n'
+).encode('utf-8')
 
 
 def _core(name):
@@ -90,9 +122,11 @@ def make_dump(base):
     _write(os.path.join(base, 'Configuration.con.bsl'), 'Перем Тест;')
     _write(os.path.join(base, 'help.html'), '<html></html>')
     _json(os.path.join(base, 'Configuration.4.json'), {'info': True})  # инфо-файл, не объект
-    # таблица ссылочных uuid корневого потока .10: {REF_CAT: Справочник1}
+    # таблица ссылочных uuid корневого потока .10: {REF_CAT: Справочник1};
+    # REF_ORPHAN именует объект, которого в конфигурации нет
     _json(os.path.join(base, 'Configuration.10.json'),
-          [['2', 'a', 'b', [['1', [REF_CAT, '"Справочник1"']]], '0']])
+          [['2', 'a', 'b', [['1', [REF_CAT, '"Справочник1"']],
+                            ['1', [REF_ORPHAN, '"УдаленныйСправочник"']]], '0']])
 
     cat_dir = os.path.join(base, 'Catalog', 'Справочник1')
     _json(os.path.join(cat_dir, 'Catalog.json'), {
@@ -100,6 +134,8 @@ def make_dump(base):
         'header': [
             # простая ссылка через таблицу .10
             ['2', _core('СсылкаАтрибут'), ['"Pattern"', ['"#"', REF_CAT]]],
+            # имя есть в таблице .10, но объекта с таким именем в базе нет
+            ['2', _core('ОсиротевшаяСсылка'), ['"Pattern"', ['"#"', REF_ORPHAN]]],
             # ссылка на определяемый тип (раскрывается состав)
             ['2', _core('ТипАтрибут'), ['"Pattern"', ['"#"', REF_DT]]],
             # составной тип: собственный uuid объекта вложен в дескриптор
@@ -133,6 +169,29 @@ def make_dump(base):
                      ['"Pattern"', ['"#"', REF_CAT]]]], '0'],
              ['8', ['27', ['2', _core('ТоварыКоличество'),
                      ['"Pattern"', ['"N"', '15', '3', '1']]]], '0']],
+            # вторая табличная часть с одноимёнными полями: имя уникально
+            # в пределах секции, а не объекта
+            ['1', ['11', 'aaaaaaaa-0000-0000-0000-000000000012',
+                   ['0', ['3', ['1', '0', 'aaaaaaaa-0000-0000-0000-000000000013'],
+                    '"Оплата"', ['1', '"ru"', '"Оплата"'], '""', '0', '0',
+                    '00000000-0000-0000-0000-000000000000', '0']]],
+             '0', ['0'], ['1', '"ru"', '"Оплата"']],
+            '1',
+            [VT_FIELDS_KEY, '2',
+             ['8', ['27', ['2', _core('НомерЗаказа'),
+                     ['"Pattern"', ['"S"', '11', '1']]]], '0'],
+             ['8', ['27', ['2', _core('ТоварыКоличество'),
+                     ['"Pattern"', ['"N"', '15', '3', '1']]]], '0'],
+             ['8', ['27', ['2', _core('Контрагент'),
+                     ['"Pattern"', ['"#"', REF_CAT]]]], '0']],
+            # табличная часть без блока полей: секция есть, полей не извлечено
+            ['1', ['11', 'aaaaaaaa-0000-0000-0000-000000000014',
+                   ['0', ['3', ['1', '0', 'aaaaaaaa-0000-0000-0000-000000000015'],
+                    '"Доставка"', ['1', '"ru"', '"Доставка"'], '""', '0', '0',
+                    '00000000-0000-0000-0000-000000000000', '0']]],
+             '0', ['0'], ['1', '"ru"', '"Доставка"']],
+            '1',
+            [VT_FIELDS_KEY, '0'],
         ],
     })
     _json(os.path.join(doc_dir, 'Document.id.json'), {'uuid': DOC_UUID})
@@ -210,6 +269,22 @@ def make_dump(base):
     _json(os.path.join(cm_dir, 'CommonModule.id.json'), {'uuid': CM_UUID})
     _write(os.path.join(cm_dir, 'CommonModule.obj.bsl'), COMMON_MODULE_BSL)
 
+    # пакет XDTO: целевое пространство имён в записи header[0][1][2], а состав
+    # типов и свойств — в XDTOPackage.bin (открытый XML с BOM и пространством
+    # имён по умолчанию, как в реальном дампе)
+    xdto_dir = os.path.join(base, 'XDTOPackage', 'ПакетТест')
+    _json(os.path.join(xdto_dir, 'XDTOPackage.json'), {
+        'name': 'ПакетТест', 'comment': '', 'obj_version': '803',
+        'header': [['1',
+                    ['1',
+                     ['0', ['0', '0', 'в отдельном файле'], '"ПакетТест"',
+                      ['1', '"ru"', '"Тестовый пакет"'], '""'],
+                     '"http://v8.1c.ru/test/package/1.0"'],
+                    '0']],
+    })
+    _json(os.path.join(xdto_dir, 'XDTOPackage.id.json'), {'uuid': XDTO_UUID})
+    _write(os.path.join(xdto_dir, 'XDTOPackage.bin'), XDTO_PACKAGE_XML)
+
     form_dir = os.path.join(cat_dir, 'Form', 'ФормаЭлемента')
     _json(os.path.join(form_dir, 'CatalogForm.json'), {
         'name': 'ФормаЭлемента', 'comment': '', 'obj_version': '803', 'header': {},
@@ -224,10 +299,12 @@ def test_write_db(tmp_path):
     db_path = str(tmp_path / 'out.sqlite')
 
     stats = write_db(dump, db_path, source_file='test.cf')
-    # files: 4 прочих файла дампа + 4 файла модулей .bsl (карта объект→файл)
-    assert stats == {'objects': 10, 'modules': 4, 'methods': 3, 'files': 8, 'files_content': 3,
-                     'skd': 0, 'attributes': 11, 'refs': 8, 'enum_values': 2,
-                     'predefined': 1, 'common_targets': 1, 'tabular': 1}
+    # files: 5 прочих файлов дампа (включая XDTOPackage.bin) + 4 файла модулей
+    # .bsl (карта объект→файл)
+    assert stats == {'objects': 11, 'modules': 4, 'methods': 3, 'files': 9, 'files_content': 3,
+                     'skd': 0, 'attributes': 15, 'refs': 10, 'enum_values': 2,
+                     'predefined': 1, 'common_targets': 1, 'tabular': 3,
+                     'xdto_types': 3, 'xdto_properties': 5}
 
     conn = sqlite3.connect(db_path)
     q = conn.execute
@@ -244,6 +321,10 @@ def test_write_db(tmp_path):
         'SELECT a.name, a.type_str FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
         " WHERE o.path='Catalog/Справочник1' ORDER BY a.ord")}
     assert attrs['СсылкаАтрибут'] == 'Ссылка: Catalog/Справочник1'
+    # цель известна по имени из таблицы .10, но объекта в базе нет: это не
+    # абстрактный тип, а отсутствующая цель (так выглядит ссылка из расширения)
+    assert attrs['ОсиротевшаяСсылка'] == \
+        'Ссылка: УдаленныйСправочник (объект не найден в базе)'
     assert attrs['ТипАтрибут'] == \
         'ОпределяемыйТип: DefinedType/ТипТест (Ссылка: Catalog/Справочник1)'
     assert attrs['СоставнойАтрибут'] == 'Ссылка: Catalog/Справочник1 | Ссылка'
@@ -255,11 +336,13 @@ def test_write_db(tmp_path):
         ' LEFT JOIN meta_object o ON o.id=r.object_id')}
     assert refs == {
         ('СсылкаАтрибут', REF_CAT, 'Catalog/Справочник1'),
+        ('ОсиротевшаяСсылка', REF_ORPHAN, None),
         ('ТипАтрибут', REF_DT, 'DefinedType/ТипТест'),
         ('ТипАтрибут', REF_CAT, 'Catalog/Справочник1'),
         ('СоставнойАтрибут', CAT_UUID, 'Catalog/Справочник1'),
         ('СоставнойАтрибут', '3ea29ea5-0000-0000-0000-000000000000', None),
         ('ТоварыНоменклатура', REF_CAT, 'Catalog/Справочник1'),
+        ('Контрагент', REF_CAT, 'Catalog/Справочник1'),
         ('Измерение1', REF_CAT, 'Catalog/Справочник1'),
         ('ИзмерениеНакопления', REF_CAT, 'Catalog/Справочник1'),
     }
@@ -281,16 +364,65 @@ def test_write_db(tmp_path):
                             'Document/ЗаказПокупателя',
                             'InformationRegister/РегистрСведений1',
                             'AccumulationRegister/РегистрНакопления1',
-                            'CommonModule/ОбщийМодуль1'}
+                            'CommonModule/ОбщийМодуль1', 'XDTOPackage/ПакетТест'}
 
-    # табличная часть и её поля
+    # табличные части и их поля
     assert [r[0] for r in q(
         'SELECT t.name FROM meta_tabular t JOIN meta_object o ON o.id=t.object_id'
-        " WHERE o.path='Document/ЗаказПокупателя'")] == ['Товары']
+        " WHERE o.path='Document/ЗаказПокупателя' ORDER BY t.ord")] == \
+        ['Товары', 'Оплата', 'Доставка']
     assert [r[0] for r in q(
         'SELECT a.name FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
         " WHERE o.path='Document/ЗаказПокупателя' AND a.tabular='Товары' "
         'ORDER BY a.ord')] == ['ТоварыНоменклатура', 'ТоварыКоличество']
+
+    # одноимённые поля разных ТЧ и реквизит объекта с именем поля ТЧ — все на
+    # месте: дедуп имён действует внутри секции, а не по всему объекту
+    assert [r[0] for r in q(
+        'SELECT a.name FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
+        " WHERE o.path='Document/ЗаказПокупателя' AND a.tabular='Оплата' "
+        'ORDER BY a.ord')] == ['НомерЗаказа', 'ТоварыКоличество', 'Контрагент']
+    assert q('SELECT COUNT(*) FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
+             " WHERE o.path='Document/ЗаказПокупателя' AND a.name='НомерЗаказа'"
+             ).fetchone()[0] == 2
+    # секция без блока полей: запись в meta_tabular есть, полей не извлечено
+    assert q('SELECT COUNT(*) FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
+             " WHERE o.path='Document/ЗаказПокупателя' AND a.tabular='Доставка'"
+             ).fetchone()[0] == 0
+
+    # содержимое пакета XDTO: импорты, типы, свойства и вложенный анонимный тип
+    xdto = " JOIN meta_object o ON o.id=t.object_id WHERE o.path='XDTOPackage/ПакетТест'"
+    assert [r[0] for r in q(
+        'SELECT i.namespace FROM xdto_import i JOIN meta_object o ON o.id=i.object_id'
+        " WHERE o.path='XDTOPackage/ПакетТест' ORDER BY i.ord")] == \
+        ['http://v8.1c.ru/test/base/1.0']
+    assert [r for r in q(
+        'SELECT t.name, t.kind, t.base, t.base_ns, t.facets, t.enum_values'
+        ' FROM xdto_type t' + xdto + ' ORDER BY t.id')] == [
+        ('Товар', 'objectType', 'd2p1:БазовыйТовар',
+         'http://v8.1c.ru/test/base/1.0', None, None),
+        (None, 'typeDef', None, None, 'type=ObjectType', None),
+        ('ВидОперации', 'valueType', 'xs:string',
+         'http://www.w3.org/2001/XMLSchema', 'maxLength=20',
+         'Приход | Расход')]
+    assert [r for r in q(
+        'SELECT p.name, p.type, p.type_ns, p.lower_bound, p.upper_bound,'
+        ' p.nillable, p.form, p.nested_type_id IS NOT NULL, p.extra'
+        ' FROM xdto_property p JOIN xdto_type t ON t.id=p.type_id' + xdto
+        + ' ORDER BY p.type_id, p.ord')] == [
+        ('Наименование', 'xs:string', 'http://www.w3.org/2001/XMLSchema',
+         1, None, 0, 'Attribute', 0, None),
+        ('Количество', 'xs:decimal', 'http://www.w3.org/2001/XMLSchema',
+         0, None, 1, None, 0, None),
+        ('Позиции', None, None, 0, -1, 1, None, 1, None),
+        ('Номер', 'xs:integer', 'http://www.w3.org/2001/XMLSchema',
+         0, None, 1, 'Element', 0, None)]
+    # свойство, объявленное в самом пакете (вне типов), и его localName
+    assert [r for r in q(
+        'SELECT p.name, p.type, p.extra FROM xdto_property p'
+        ' JOIN meta_object o ON o.id=p.object_id'
+        " WHERE p.type_id IS NULL AND o.path='XDTOPackage/ПакетТест'")] == \
+        [('КорневойЭлемент', 'xs:string', 'localName=root')]
 
     # значения перечислений, предопределённые, привязки общих реквизитов
     assert [r[0] for r in q(

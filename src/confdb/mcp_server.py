@@ -178,7 +178,10 @@ def _paginate_lines(text, offset, limit, default_page, header=''):
 def ru_type_str(text):
     """'Ссылка: Catalog/Валюты' -> 'Ссылка: Справочник.Валюты'.
 
-    Голая 'Ссылка' без целевого объекта помечается '(цель не определена)'.
+    Голая 'Ссылка' — обобщённый тип платформы (ЛюбаяСсылка, Характеристика):
+    его uuid не соответствует ни одному объекту конфигурации, поэтому подпись
+    говорит о неконкретизированном типе, а не о ненайденной цели. Отдельный
+    случай «цель известна по имени, но объекта в базе нет» writer помечает сам.
     """
     if not text:
         return text
@@ -187,7 +190,7 @@ def ru_type_str(text):
     annotated = []
     for part in parts:
         if part == 'Ссылка':
-            annotated.append('Ссылка (цель не определена)')
+            annotated.append('Ссылка (тип не конкретизирован)')
         else:
             annotated.append(part)
     return ' | '.join(annotated)
@@ -231,11 +234,12 @@ REGISTERS: object_card of a РегистрСведений/РегистрНак�
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
-- meta_attribute(object_id, ord, name, type_str, tabular). Object fields; tabular NULL = header attribute, else the tabular section the field belongs to. type_str examples: 'Строка(50)', 'Число', 'Ссылка: Справочник.Валюты', 'ОпределяемыйТип: … (Ссылка: …)', composites joined with ' | '; 'Ссылка' alone = abstract/any reference.
+- meta_attribute(object_id, ord, name, type_str, tabular). Object fields; tabular NULL = header attribute, else the tabular section the field belongs to. type_str examples: 'Строка(50)', 'Число', 'Ссылка: Справочник.Валюты', 'ОпределяемыйТип: … (Ссылка: …)', composites joined with ' | '. Read the unresolved forms as follows: 'Ссылка' alone = a generic platform type (any reference), NOT an extraction failure; 'Ссылка: Имя (объект не найден в базе)' = the target name is known but no such object exists in THIS base — check the other open bases; type_str NULL = the metadata header carries no type description for this field, i.e. not extracted.
 - meta_tabular(object_id, ord, name) — tabular sections in declaration order.
 - module(object_id, code_name, context, body). code_name: 'obj' (object module), 'mgr' (manager module), form/common modules etc.; context = execution context for common modules (Сервер/Клиент/…); body = module text WITHOUT method bodies (signatures, comments, #Если regions) — a table of contents.
 - method(id, module_id, ord, kind, name, signature, is_export, directives, description, line_start, line_end, body). Procedures/functions of the 1C code; directives like '&НаСервере'/'&НаКлиенте'; description = comment block above the method.
-- attribute_ref(attribute_id, ord, uuid, object_id) — which metadata objects a field's type references (one row per member; NULL object = abstract). Use for joins and impact analysis ('who references X').
+- attribute_ref(attribute_id, ord, uuid, object_id) — which metadata objects a field's type references (one row per member; NULL object = a generic platform type, whose uuid matches no object of this configuration). Use for joins and impact analysis ('who references X').
+- xdto_type(object_id, ord, name, kind, base, base_ns, facets, enum_values) — the types an XDTO package declares: kind is objectType, valueType (a simple/enumeration type) or typeDef (an anonymous type nested in a property); base/base_ns name the base type and the namespace it comes from; facets holds the remaining XML attributes as 'name=value; …' (maxLength, totalDigits, localName…); enum_values lists the allowed values of an enumeration type. xdto_property(type_id, object_id, ord, name, type, type_ns, lower_bound, upper_bound, nillable, form, extra, nested_type_id) — properties: lower_bound=1 = obligatory, upper_bound=-1 = a list, form = Attribute|Element, nested_type_id → an anonymous nested type, extra = the remaining attributes; type_id NULL = a property declared by the package itself, outside any type. xdto_import(object_id, ord, namespace) — the namespaces the package imports. Prefer xdto_of/find_xdto over querying these directly.
 - skd_query(object_id, ord, query) — report queries in the 1C query language (Russian keywords ВЫБРАТЬ/ИЗ/ГДЕ/СОЕДИНЕНИЕ/ОБЪЕДИНИТЬ).
 - enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, name, code, display) — predefined elements; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source, file.
 
@@ -492,6 +496,8 @@ class McpServer:
                (f'; комментарий: {row[3]}' if row[3] else '')]
         # свойства регистра (периодичность, режим записи)
         out.extend(_register_card_info(row[0], row[4]))
+        # целевое пространство имён пакета XDTO
+        out.extend(header_props.xdto_props(row[0], row[4]))
         attrs = q('SELECT name, type_str FROM meta_attribute '
                   'WHERE object_id=? AND tabular IS NULL ORDER BY ord',
                   (oid,)).fetchall()
@@ -503,7 +509,7 @@ class McpServer:
             groups = {}
             for name, tstr in attrs:
                 groups.setdefault(kinds.get(name, 'Прочие поля'), []).append(
-                    f'{name}: {ru_type_str(tstr) or "?"}')
+                    f'{name}: {ru_type_str(tstr) or "тип не извлечён"}')
             for kind in header_props.REGISTER_KINDS + ('Прочие поля',):
                 if kind in groups:
                     out.append(f'{kind}: ' + '; '.join(groups[kind]))
@@ -511,7 +517,7 @@ class McpServer:
                 out.append('Реквизиты: нет')
         else:
             out.append('Реквизиты: ' + ('; '.join(
-                f'{n}: {ru_type_str(t) or "?"}' for n, t in attrs)
+                f'{n}: {ru_type_str(t) or "тип не извлечён"}' for n, t in attrs)
                 if attrs else 'нет'))
         tabs = q('SELECT t.name, a.name, a.type_str FROM meta_tabular t '
                  'LEFT JOIN meta_attribute a ON a.object_id=t.object_id '
@@ -519,10 +525,15 @@ class McpServer:
                  'ORDER BY t.ord, a.ord', (oid,)).fetchall()
         sections = {}
         for sec, fname, ftype in tabs:
-            sections.setdefault(sec, []).append(
-                f'{fname}: {ru_type_str(ftype) or "?"}')
+            # у секции без извлечённых полей LEFT JOIN даёт одну строку с NULL:
+            # это не поле с именем None, а отсутствующий состав
+            sections.setdefault(sec, [])
+            if fname is not None:
+                sections[sec].append(
+                    f'{fname}: {ru_type_str(ftype) or "тип не извлечён"}')
         for sec, fields in sections.items():
-            out.append(f'Табличная часть {sec}: ' + '; '.join(fields))
+            out.append(f'Табличная часть {sec}: '
+                       + ('; '.join(fields) if fields else 'полей не извлечено'))
         mods = q('SELECT code_name, context FROM module WHERE object_id=?',
                  (oid,)).fetchall()
         if mods:
@@ -553,6 +564,15 @@ class McpServer:
                  (oid,)).fetchone()[0]
         if nskd:
             out.append(f'Запросов СКД: {nskd} (см. skd_of)')
+        if row[0] == 'XDTOPackage':
+            # состав пакета в паспорт не печатается: типов бывает сотни
+            ntypes, nprops = q(
+                'SELECT (SELECT COUNT(*) FROM xdto_type WHERE object_id=?),'
+                ' (SELECT COUNT(*) FROM xdto_property WHERE object_id=?)',
+                (oid, oid)).fetchone()
+            if ntypes or nprops:
+                # пакет может не содержать типов, но объявлять свойства сам
+                out.append(f'Типов XDTO: {ntypes}, свойств: {nprops} (см. xdto_of)')
         fwd = [r[0] for r in q(
             'SELECT DISTINCT t.path FROM attribute_ref r '
             'JOIN meta_attribute a ON a.id=r.attribute_id '
@@ -1148,6 +1168,122 @@ class McpServer:
             out.append(f'[{rid}] {ru_path(path)} … {snippet} …')
         return '\n'.join(out)
 
+    def xdto_of(self, path, type=None, db=None):
+        """Состав пакета XDTO: пространство имён, импорты, типы и их свойства.
+
+        :param type: имя типа — показать только его (вместе с вложенными)
+        """
+        path = self.resolve_path(path, db)
+        q = self.conn(db).execute
+        row = q('SELECT id, type, header_json FROM meta_object WHERE path=?',
+                (path,)).fetchone()
+        if not row:
+            return f'объект не найден: {path}'
+        oid = row[0]
+        out = [f'{ru_path(path)} — {row[1]}']
+        out.extend(header_props.xdto_props(row[1], row[2]))
+        imports = [r[0] for r in q(
+            'SELECT namespace FROM xdto_import WHERE object_id=? ORDER BY ord',
+            (oid,))]
+        if imports:
+            out.append('Импортирует пространства имён: ' + ', '.join(imports))
+        types = q('SELECT id, ord, name, kind, base, base_ns, facets,'
+                  ' enum_values FROM xdto_type WHERE object_id=? '
+                  'ORDER BY ord, id', (oid,)).fetchall()
+        by_id = {t[0]: t for t in types}
+        props = {}
+        for r in q('SELECT type_id, ord, name, type, lower_bound, upper_bound, '
+                   'form, nested_type_id, extra FROM xdto_property '
+                   'WHERE object_id=? ORDER BY ord', (oid,)):
+            props.setdefault(r[0], []).append(r[1:])
+        out.append(f'Типов в пакете: {len(types)}')
+        shown = types
+        if type is not None:
+            wanted = str(type).lower()
+            shown = [t for t in types if (t[2] or '').lower() == wanted]
+            if not shown:
+                out.append(f'тип не найден в пакете: {type}')
+        for item in shown:
+            out.extend(self._xdto_type_lines(item, props, by_id, ''))
+        # свойства, объявленные в самом пакете, вне типов (type_id IS NULL)
+        if props.get(None):
+            out.append('Свойства пакета (вне типов):')
+            out.extend(self._xdto_prop_lines(props[None], props, by_id, '  '))
+        text = '\n'.join(out)
+        if len(text) > 20000:
+            # обрезанный состав пакета не должен выглядеть полным
+            text = text[:20000] + ('\n… состав пакета обрезан: уточните тип '
+                                   'параметром type= или спросите find_xdto')
+        return text
+
+    @staticmethod
+    def _xdto_type_lines(item, props, by_id, indent):
+        """Строки типа XDTO: заголовок, ограничения, значения, свойства."""
+        _tid, _ord, name, kind, base, base_ns, facets, values = item
+        head = f'{indent}Тип {name or "(без имени)"} ({kind})'
+        if base:
+            head += f', базовый {base}' + (f' [{base_ns}]' if base_ns else '')
+        out = [head]
+        if facets:
+            out.append(f'{indent}  ограничения: {facets}')
+        if values:
+            out.append(f'{indent}  значения: {values}')
+        out.extend(McpServer._xdto_prop_lines(props.get(_tid, []), props,
+                                              by_id, indent))
+        return out
+
+    @staticmethod
+    def _xdto_prop_lines(rows, props, by_id, indent):
+        """Строки свойств; вложенный анонимный тип — большим отступом."""
+        out = []
+        for _ord, pname, ptype, lower, upper, form, nested, extra in rows:
+            bits = [ptype or ('вложенный тип' if nested is not None
+                              else 'тип не указан')]
+            if lower:
+                bits.append('обязательное')
+            if upper == -1:
+                bits.append('список')
+            if form:
+                bits.append('атрибут' if form == 'Attribute' else 'элемент')
+            line = f'{indent}  {pname or "(без имени)"}: ' + ', '.join(bits)
+            if extra:
+                line += f' [{extra}]'
+            out.append(line)
+            if nested is not None and nested in by_id:
+                out.extend(McpServer._xdto_type_lines(by_id[nested], props,
+                                                      by_id, indent + '    '))
+        return out
+
+    def find_xdto(self, mask, limit=20, db=None):
+        """Типы и свойства пакетов XDTO, чьё имя содержит mask."""
+        q = self.conn(db).execute
+        like = f'%{mask}%'
+        limit = max(1, int(limit))
+        out = []
+        for path, name, base in q(
+                'SELECT o.path, t.name, t.base FROM xdto_type t '
+                'JOIN meta_object o ON o.id=t.object_id '
+                'WHERE t.name LIKE ? ORDER BY o.path, t.ord LIMIT ?',
+                (like, limit)):
+            out.append(f'{ru_path(path)} — тип {name}'
+                       + (f' (базовый {base})' if base else ''))
+        if len(out) < limit:
+            for path, tname, pname, ptype in q(
+                    'SELECT o.path, t.name, p.name, p.type FROM xdto_property p '
+                    'JOIN xdto_type t ON t.id=p.type_id '
+                    'JOIN meta_object o ON o.id=p.object_id '
+                    'WHERE p.name LIKE ? ORDER BY o.path LIMIT ?',
+                    (like, limit - len(out))):
+                out.append(f'{ru_path(path)} — {tname}.{pname}'
+                           + (f': {ptype}' if ptype else ''))
+        else:
+            # лимит выбран именами типов: ответ не должен выглядеть полным
+            out.append(f'… показаны только имена типов (limit {limit}): '
+                       'свойства не выводились, уточните маску')
+        if not out:
+            return f'в пакетах XDTO ничего не найдено по «{mask}»'
+        return '\n'.join(out)
+
     def check_query(self, text, db=None):
         from .query_lang import check_query_full
         errs, unverified = check_query_full(text, self.ctx(db))
@@ -1476,6 +1612,20 @@ TOOLS = [
          "'РегистрНакопления.Запасы'). Returns snippets around the match.",
          _schema({'mask': _STR, 'limit': _INT, 'db': _DB}, ('mask',)),
          McpServer.find_skd),
+    Tool('xdto_of',
+         'Contents of an XDTO package: target namespace, imported namespaces, '
+         'object types with their properties (type, obligatory, list, '
+         'attribute/element form) and nested anonymous types. This is the '
+         'contract of web/HTTP services and of message-based exchange. '
+         'Optional type= shows a single type.',
+         _schema({'path': _STR, 'type': _STR, 'db': _DB}, ('path',)),
+         McpServer.xdto_of),
+    Tool('find_xdto',
+         'Search type and property NAMES inside every XDTO package of the base '
+         '(e.g. the field of a message an exchange contract defines). Each hit '
+         'names its package and type.',
+         _schema({'mask': _STR, 'limit': _INT, 'db': _DB}, ('mask',)),
+         McpServer.find_xdto),
     Tool('check_query',
          'Validate a 1C query: syntax (Russian keywords) + existence of '
          'tables/fields/reference chains against this configuration. ALWAYS '

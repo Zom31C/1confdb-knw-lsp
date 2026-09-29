@@ -50,7 +50,8 @@ def test_tools_list(tmp_path_factory):
                      'refs_of', 'module_outline', 'get_method',
                      'find_method_context', 'method_dependencies',
                      'method_result_schema', 'find_methods',
-                     'skd_of', 'find_skd', 'check_query', 'schema', 'sql',
+                     'skd_of', 'find_skd', 'xdto_of', 'find_xdto',
+                     'check_query', 'schema', 'sql',
                      'compare_object', 'extension_diff', 'configuration_info',
                      'db_list', 'db_open', 'db_use', 'db_close'}
     # синтаксис модулей проверяет BSL Language Server (инструменты bsl_*),
@@ -219,6 +220,81 @@ def test_object_card_children_and_plain_attributes(tmp_path_factory):
     # у справочника групп регистра нет: реквизиты одним списком, как раньше
     assert 'Измерения:' not in card
     assert card.count('Реквизиты:') == 1
+
+
+def test_object_card_tabular_sections(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='Документ.ЗаказПокупателя')['content'][0]['text']
+    assert ('Табличная часть Товары: ТоварыНоменклатура: '
+            'Ссылка: Справочник.Справочник1') in card
+    # одноимённое поле другой ТЧ — своя запись, а не отброшенный дубликат
+    assert 'Табличная часть Оплата: НомерЗаказа: Строка(11)' in card
+    # у секции без извлечённых полей состав называется отсутствующим,
+    # а не печатается полем с именем None
+    assert 'Табличная часть Доставка: полей не извлечено' in card
+    assert 'None' not in card
+
+
+def test_object_card_names_why_a_type_is_unresolved(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='Справочник.Справочник1')['content'][0]['text']
+    # обобщённый тип платформы: цели у него нет, это не пробел извлечения
+    assert 'Ссылка (тип не конкретизирован)' in card
+    assert 'цель не определена' not in card
+    # цель известна по имени из таблицы .10, но объекта в этой базе нет
+    assert ('ОсиротевшаяСсылка: Ссылка: УдаленныйСправочник '
+            '(объект не найден в базе)') in card
+
+
+def test_object_card_xdto_namespace(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='Пакет XDTO.ПакетТест')['content'][0]['text']
+    assert 'Пространство имён: http://v8.1c.ru/test/package/1.0' in card
+    # состав пакета в паспорте — счётчиком: типов бывает сотни
+    assert 'Типов XDTO: 3, свойств: 5 (см. xdto_of)' in card
+
+
+def test_xdto_of(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    text = _call(server, 'xdto_of',
+                 path='Пакет XDTO.ПакетТест')['content'][0]['text']
+    assert 'Импортирует пространства имён: http://v8.1c.ru/test/base/1.0' in text
+    assert ('Тип Товар (objectType), базовый d2p1:БазовыйТовар '
+            '[http://v8.1c.ru/test/base/1.0]') in text
+    assert '  Наименование: xs:string, обязательное, атрибут' in text
+    # свойство-список с анонимным вложенным типом: его состав — большим отступом
+    assert '  Позиции: вложенный тип, список' in text
+    assert '    Тип (без имени) (typeDef)' in text
+    assert '      Номер: xs:integer, элемент' in text
+    # простой тип: ограничения и допустимые значения перечисления
+    assert ('Тип ВидОперации (valueType), базовый xs:string '
+            '[http://www.w3.org/2001/XMLSchema]') in text
+    assert '  ограничения: maxLength=20' in text
+    assert '  значения: Приход | Расход' in text
+    # свойство, объявленное в пакете вне типов
+    assert 'Свойства пакета (вне типов):' in text
+    assert '    КорневойЭлемент: xs:string [localName=root]' in text
+
+    one = _call(server, 'xdto_of', path='Пакет XDTO.ПакетТест',
+                type='Товар')['content'][0]['text']
+    assert 'Тип Товар (objectType)' in one
+    assert 'Количество' in one
+    missing = _call(server, 'xdto_of', path='Пакет XDTO.ПакетТест',
+                    type='НетТакого')['content'][0]['text']
+    assert 'тип не найден в пакете: НетТакого' in missing
+
+
+def test_find_xdto(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    hits = _call(server, 'find_xdto', mask='Количеств')['content'][0]['text']
+    assert 'Пакет XDTO.ПакетТест — Товар.Количество: xs:decimal' in hits
+    by_type = _call(server, 'find_xdto', mask='Товар')['content'][0]['text']
+    assert 'Пакет XDTO.ПакетТест — тип Товар (базовый d2p1:БазовыйТовар)' in by_type
+    assert 'в пакетах XDTO ничего не найдено по «НетТакогоСвойства»' in \
+        _call(server, 'find_xdto', mask='НетТакогоСвойства')['content'][0]['text']
 
 
 def test_path_type_is_case_insensitive(tmp_path_factory):
