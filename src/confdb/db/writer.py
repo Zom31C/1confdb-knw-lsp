@@ -69,8 +69,8 @@ TYPE_RU = {
     'TaskForm': 'Форма задачи',
     'ChartOfAccounts': 'План счетов',
     'ChartOfAccountsForm': 'Форма плана счетов',
-    'ChartOfCharacteristicTypes': 'План видов характеристик',
-    'ChartOfCharacteristicTypesForm': 'Форма плана видов характеристик',
+    'ChartOfCharacteristicType': 'План видов характеристик',
+    'ChartOfCharacteristicTypeForm': 'Форма плана видов характеристик',
     'ChartOfCalculationTypes': 'План видов расчёта',
     'ChartOfCalculationTypesForm': 'Форма плана видов расчёта',
     'ExchangePlan': 'План обмена',
@@ -374,8 +374,14 @@ def _is_section_bag(parent, idx):
             and isinstance(parent[idx - 2], list))
 
 
-def _extract_tabular(header):
-    """Табличные части объекта: список имён в порядке объявления."""
+def _section_bags(header):
+    """Блоки полей табличных частей: (имя секции, объявленное число полей).
+
+    Второй элемент блока — счётчик записей: [VT_FIELDS_KEY, '2', поле, поле].
+    Он равен числу извлечённых полей (проверено на всех 1609 блоках базы УНФ
+    и на 3 блоках тестовой конфигурации v8unpack), поэтому по нему отличают
+    «в конфигурации полей не объявлено» от «поля не извлечены».
+    """
     result = []
 
     def walk(node):
@@ -388,12 +394,49 @@ def _extract_tabular(header):
         for i, child in enumerate(node):
             if _is_section_bag(node, i):
                 name = _section_name(node[i - 2])
-                if name and name not in result:
-                    result.append(name)
+                if name:
+                    result.append((name, _bag_count(child)))
             walk(child)
 
     walk(header.get('header'))
     return result
+
+
+def _bag_count(bag):
+    """Объявленное число полей блока; None — счётчик не распознан."""
+    try:
+        count = int(bag[1])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def _extract_tabular(header):
+    """Табличные части объекта: список имён в порядке объявления."""
+    result = []
+    for name, _count in _section_bags(header):
+        if name not in result:
+            result.append(name)
+    return result
+
+
+def tabular_field_counts(header_json):
+    """{имя табличной части: объявленное число полей} из meta_object.header_json.
+
+    Счётчик берётся из блока полей заголовка, поэтому доступен и в готовой
+    базе, без переизвлечения конфигурации. Секции нет в словаре — блок полей
+    не распознан; значение None — счётчик не число.
+    """
+    try:
+        header = json.loads(header_json)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(header, dict):
+        return {}
+    counts = {}
+    for name, count in _section_bags(header):
+        counts.setdefault(name, count)
+    return counts
 
 
 def _extract_enum_values(header):
@@ -526,6 +569,7 @@ CREATE TABLE method (
 );
 CREATE INDEX ix_method_module ON method(module_id, ord);
 CREATE INDEX ix_method_name ON method(name);
+CREATE VIRTUAL TABLE method_fts USING fts5(body, tokenize=trigram);
 CREATE TABLE skd_query (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
@@ -842,6 +886,8 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         # но журнал оставляем rollback (не MEMORY) — прерванная запись должна
         # откатываться к согласованному состоянию, а не оставлять «полупустой» файл
         conn.execute('PRAGMA synchronous=OFF')
+        # увеличиваем кэш страниц с 2 МБ до 256 МБ — меньше чтений с диска при вставке
+        conn.execute('PRAGMA cache_size=-262144')
         conn.executescript(SCHEMA)
         conn.execute('BEGIN')
         cur = conn.execute(
@@ -1138,6 +1184,10 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
               ' VALUES (?, ?, ?, ?, ?, ?)')
         flush(skd_params,
               'INSERT INTO skd_query (object_id, ord, query) VALUES (?, ?, ?)')
+        conn.commit()
+        # Заполняем FTS5 индекс телами методов после commit.
+        # Явно указываем rowid = method.id, чтобы они совпадали
+        conn.execute('INSERT INTO method_fts(rowid, body) SELECT id, body FROM method')
         conn.commit()
     except Exception:
         conn.rollback()
