@@ -31,9 +31,17 @@ def build_parser():
     p.add_argument('--skip-errors', action='store_true',
                    help='не прерываться на ошибке декодирования объекта: '
                         'пропустить его и продолжить (дамп и база будут неполными)')
+    p.add_argument('--no-fts', action='store_true',
+                   help='не строить FTS-индекс по телам методов (половина времени '
+                        'записи БД); поиск по телам останется рабочим, но медленным, '
+                        'индекс собирается позже — "confdb fts <база>"')
 
     c = subparsers.add_parser('check', help='проверить запросы СКД в готовой базе')
     c.add_argument('db', help='путь к базе SQLite')
+
+    f = subparsers.add_parser(
+        'fts', help='построить FTS-индекс по телам методов в готовой базе')
+    f.add_argument('db', help='путь к базе SQLite')
 
     q = subparsers.add_parser(
         'check-queries',
@@ -105,12 +113,34 @@ def run_check(db_path):
     return 1 if fails else 0
 
 
+def run_fts(db_path):
+    """Построение FTS-индекса по телам методов в готовой базе (после --no-fts)."""
+    import sqlite3
+    import time
+
+    from .db.writer import build_fts_index
+    if not os.path.isfile(db_path):
+        print(f'Файл базы не найден: {db_path}', file=sys.stderr)
+        return 2
+    begin = time.time()
+    try:
+        methods = build_fts_index(db_path)
+    except (sqlite3.Error, OSError, ValueError) as err:
+        print(f'Ошибка: {err}', file=sys.stderr)
+        return 1
+    print(f'FTS-индекс построен: {methods} методов за {time.time() - begin:.1f} с')
+    return 0
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.cmd == 'check':
         return run_check(args.db)
+
+    if args.cmd == 'fts':
+        return run_fts(args.db)
 
     if args.cmd == 'check-queries':
         from .query_check import check_db
@@ -182,6 +212,7 @@ def main(argv=None):
             keep_temp=args.keep_temp,
             options=options,
             workers=args.workers,
+            build_fts=not args.no_fts,
         )
     except FileNotFoundError as err:
         print(f'Файл не найден: {err}', file=sys.stderr)

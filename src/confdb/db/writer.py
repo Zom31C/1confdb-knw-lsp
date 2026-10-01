@@ -299,7 +299,7 @@ class _TypeResolver:
 VT_FIELDS_KEY = '888744e1-b616-11d4-9436-004095e12fc7'
 
 
-def _extract_attributes(header, resolver=None):
+def _extract_attributes(header, resolver=None, bags=None):
     """Извлекает реквизиты и поля табличных частей: список
     (name, type_str, links, tabular) в порядке объявления.
 
@@ -311,6 +311,11 @@ def _extract_attributes(header, resolver=None):
     Дедуп — только внутри одной секции: имя уникально в пределах табличной
     части, а не объекта, поэтому одноимённые поля разных ТЧ и реквизит объекта
     с именем поля ТЧ — разные записи.
+
+    :param bags: список, в который за тот же обход складываются блоки полей
+        табличных частей как (имя, объявленное число полей) — результат
+        совпадает с _section_bags(header), но заголовок обходится один раз
+        (на конфигурации УНФ это 6 млн рекурсивных вызовов на проход).
     """
     result = []
     seen = set()
@@ -332,7 +337,10 @@ def _extract_attributes(header, resolver=None):
                 result.append((name, None, [], section))
         for i, child in enumerate(node):
             if _is_section_bag(node, i):
-                walk(child, _section_name(node[i - 2]) or section)
+                sec_name = _section_name(node[i - 2])
+                if bags is not None and sec_name:
+                    bags.append((sec_name, _bag_count(child)))
+                walk(child, sec_name or section)
             else:
                 walk(child, section)
 
@@ -411,13 +419,18 @@ def _bag_count(bag):
     return count if count >= 0 else None
 
 
-def _extract_tabular(header):
-    """Табличные части объекта: список имён в порядке объявления."""
+def _tabular_names(bags):
+    """Имена табличных частей из блоков полей: без повторов, в порядке объявления."""
     result = []
-    for name, _count in _section_bags(header):
+    for name, _count in bags:
         if name not in result:
             result.append(name)
     return result
+
+
+def _extract_tabular(header):
+    """Табличные части объекта: список имён в порядке объявления."""
+    return _tabular_names(_section_bags(header))
 
 
 def tabular_field_counts(header_json):
@@ -569,7 +582,6 @@ CREATE TABLE method (
 );
 CREATE INDEX ix_method_module ON method(module_id, ord);
 CREATE INDEX ix_method_name ON method(name);
-CREATE VIRTUAL TABLE method_fts USING fts5(body, tokenize=trigram);
 CREATE TABLE skd_query (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
@@ -687,11 +699,54 @@ CREATE INDEX ix_file_object ON file(object_id);
 TEXT_KINDS = ('bsl', 'html', 'htm', 'txt', 'json', 'xml', 'css', 'js')
 
 
-def _find_objects(dump_dir):
+def _scan_tree(root):
+    """Один обход дампа: список (dirpath, [(имя файла, размер)]) в порядке os.walk.
+
+    Заменяет три полных обхода записи (поиск объектов, предпроход модулей BSL,
+    основной цикл) и os.path.getsize по каждому файлу — размер отдаёт os.scandir.
+    Порядок совпадает с прежним os.walk + sorted(filenames): каталоги в порядке
+    scandir, файлы по имени (от него зависят id строк в базе).
+    """
+    result = []
+
+    def rec(dirpath):
+        files = []
+        dirs = []
+        with os.scandir(helper.long_path(dirpath)) as it:
+            for entry in it:
+                if entry.is_dir():
+                    if not entry.is_symlink():
+                        dirs.append(entry.name)
+                else:
+                    files.append((entry.name, entry.stat().st_size))
+        files.sort()
+        result.append((dirpath, files))
+        for name in dirs:
+            rec(os.path.join(dirpath, name))
+
+    rec(root)
+    return result
+
+
+def _rel_paths(tree, dump_dir):
+    """{dirpath: путь от корня дампа через '/'}; корень — пустая строка."""
+    rel_by_dir = {}
+    for dirpath, _files in tree:
+        if dirpath == dump_dir:
+            rel_by_dir[dirpath] = ''
+            continue
+        parent_rel = rel_by_dir[os.path.dirname(dirpath)]
+        name = os.path.basename(dirpath)
+        rel_by_dir[dirpath] = parent_rel + '/' + name if parent_rel else name
+    return rel_by_dir
+
+
+def _find_objects(tree, dump_dir):
     """Возвращает {абсолютный путь каталога: имя класса}; корень — по особой логике."""
     objects = {}
     root_candidates = []
-    for dirpath, dirnames, filenames in os.walk(dump_dir):
+    for dirpath, files in tree:
+        filenames = [f[0] for f in files]
         stems_with_id = set()
         plain_json_stems = set()
         for fn in filenames:
@@ -718,8 +773,23 @@ def _find_objects(dump_dir):
 
 
 def _read_json(path):
-    with open(helper.long_path(path), 'r', encoding='utf-8') as f:
-        return json.load(f)
+    # байты + loads быстрее json.load через TextIOWrapper: заголовков в дампе
+    # десятки тысяч (УНФ — 23 513 объекта, 322 МБ JSON)
+    with open(helper.long_path(path), 'rb') as f:
+        return json.loads(f.read())
+
+
+RE_ID_UUID = re.compile(rb'"uuid"\s*:\s*"([^"]*)"')
+
+
+def _read_id_uuid(path):
+    """uuid из <Класс>.id.json: файл — одна пара ключ-значение, разбор JSON лишний."""
+    with open(helper.long_path(path), 'rb') as f:
+        raw = f.read()
+    found = RE_ID_UUID.search(raw)
+    if found:
+        return found.group(1).decode('utf-8')
+    return _read_json(path).get('uuid')
 
 
 def _read_text(path):
@@ -854,7 +924,44 @@ def _parse_bsl_worker(path):
     return parse_methods(_read_text(path))
 
 
-def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=1):
+# Индекс именно по телам МЕТОДОВ: module.body — это модуль минус код методов
+# (bsl_parser.parse_methods), поэтому индекс по телам модулей не покрыл бы
+# содержимое методов и молча обнулил бы выдачу find_methods.
+FTS_TABLE = 'method_fts'
+
+
+def _fill_fts(conn):
+    """Создаёт и заполняет FTS5-индекс по телам методов; rowid = method.id."""
+    conn.execute(f'DROP TABLE IF EXISTS {FTS_TABLE}')
+    conn.execute(f'CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5(body, tokenize=trigram)')
+    conn.execute(f'INSERT INTO {FTS_TABLE}(rowid, body) SELECT id, body FROM method')
+    conn.commit()
+
+
+def build_fts_index(db_path):
+    """Строит (перестраивает) FTS-индекс готовой базы; возвращает число методов.
+
+    Отдельная команда для извлечения с --no-fts: на УНФ индекс — половина
+    времени записи (44 с), и его можно собрать позже, не переизвлекая
+    конфигурацию.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('SELECT id FROM method LIMIT 1')
+    except sqlite3.Error:
+        conn.close()
+        raise ValueError(f'это не база знаний confdb (нет таблицы method): {db_path}')
+    try:
+        conn.execute('PRAGMA synchronous=OFF')
+        conn.execute('PRAGMA cache_size=-262144')
+        _fill_fts(conn)
+        return conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
+    finally:
+        conn.close()
+
+
+def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=1,
+             build_fts=True):
     """Пишет дамп каталога stage 3 в SQLite. Возвращает статистику.
 
     :param dump_dir: каталог результата декодера (стадия 3)
@@ -862,6 +969,9 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     :param source_file: путь к исходному .cf/.cfe/.epf (для таблицы source)
     :param store_blobs: хранить бинарные файлы (image/bin) как BLOB
     :param workers: число процессов для разбора модулей BSL (1 — последовательно)
+    :param build_fts: строить FTS5-индекс по телам методов. На УНФ это половина
+        времени записи; без индекса база рабочая (поиск по телам идёт через
+        body_has), индекс собирается позже — `confdb fts <db>`
     """
     dump_dir = os.path.abspath(dump_dir)
     if not os.path.isdir(dump_dir):
@@ -873,7 +983,11 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     if os.path.exists(db_path):
         os.remove(db_path)
 
-    objects = _find_objects(dump_dir)
+    # снимок обхода один на все проходы записи (поиск объектов, предпроход BSL,
+    # основной цикл): дамп УНФ — 26 107 каталогов и 73 537 файлов
+    tree = _scan_tree(dump_dir)
+    rel_by_dir = _rel_paths(tree, dump_dir)
+    objects = _find_objects(tree, dump_dir)
     if dump_dir not in objects:
         raise ValueError(f'В {dump_dir} не найден корневой объект (Configuration.json и т.п.)')
 
@@ -888,6 +1002,8 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         conn.execute('PRAGMA synchronous=OFF')
         # увеличиваем кэш страниц с 2 МБ до 256 МБ — меньше чтений с диска при вставке
         conn.execute('PRAGMA cache_size=-262144')
+        # страница 16 КБ до создания таблиц: меньше узлов B-дерева на тех же данных
+        conn.execute('PRAGMA page_size=16384')
         conn.executescript(SCHEMA)
         conn.execute('BEGIN')
         cur = conn.execute(
@@ -897,23 +1013,23 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         source_id = cur.lastrowid
 
         # первый проход: собираем сведения об объектах и порядок братьев (ord)
+        files_of = dict(tree)
         infos = {}
         for dirpath in sorted(objects, key=lambda d: d.count(os.sep)):
             stem = objects[dirpath]
-            rel = os.path.relpath(dirpath, dump_dir)
-            rel = '' if rel == '.' else rel.replace(os.sep, '/')
+            rel = rel_by_dir[dirpath]
             header = _read_json(os.path.join(dirpath, f'{stem}.json'))
-            id_file = os.path.join(dirpath, f'{stem}.id.json')
-            if os.path.isfile(id_file):
-                uuid = _read_json(id_file).get('uuid')
+            id_name = f'{stem}.id.json'
+            # состав каталога уже есть в снимке обхода — os.path.isfile не нужен
+            if any(fn == id_name for fn, _size in files_of[dirpath]):
+                uuid = _read_id_uuid(os.path.join(dirpath, id_name))
             else:
                 uuid = header.get('uuid')
             parent_rel = None
             parent_dir = os.path.dirname(dirpath)
             while parent_dir and parent_dir.startswith(dump_dir):
-                candidate = os.path.relpath(parent_dir, dump_dir)
-                candidate = '' if candidate == '.' else candidate.replace(os.sep, '/')
-                if candidate in infos:
+                candidate = rel_by_dir.get(parent_dir)
+                if candidate is not None and candidate in infos:
                     parent_rel = candidate
                     break
                 parent_dir = os.path.dirname(parent_dir)
@@ -974,7 +1090,11 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         attr_params = []
         ref_params = []
         for rel, info in infos.items():
-            attrs = _extract_attributes(info['header'], resolver)
+            bags = []
+            attrs = _extract_attributes(info['header'], resolver, bags)
+            # табличные части — из того же обхода заголовка (отдельный
+            # _section_bags обошёл бы дерево ещё раз)
+            info['tabular'] = _tabular_names(bags)
             for ord_no, (name, type_str, links, tabular) in enumerate(attrs):
                 attr_params.append((dir_to_id[rel], ord_no, name, type_str, tabular))
                 attr_id = len(attr_params)
@@ -999,7 +1119,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         predef_params = []
         for rel, info in infos.items():
             obj_id = dir_to_id[rel]
-            for ord_no, name in enumerate(_extract_tabular(info['header'])):
+            for ord_no, name in enumerate(info['tabular']):
                 tab_params.append((obj_id, ord_no, name))
             if info['stem'] == 'Enum':
                 for ord_no, name in enumerate(_extract_enum_values(info['header'])):
@@ -1059,17 +1179,15 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                 module_re_tpl[stem] = res
             return res
 
-        rel_by_dir = {i['dirpath']: r for r, i in infos.items()}
-
         # предпроход: список модулей в порядке обхода — для параллельного разбора
         bsl_tasks = []  # (path, object_id, code_name, context)
-        for dirpath, dirnames, filenames in os.walk(dump_dir):
-            rel = rel_by_dir.get(dirpath)
-            object_id = dir_to_id.get(rel) if rel is not None else None
+        for dirpath, files in tree:
+            rel = rel_by_dir[dirpath]
+            object_id = dir_to_id.get(rel)
             if not object_id:
                 continue
             stem = objects.get(dirpath)
-            for fn in sorted(filenames):
+            for fn, _size in files:
                 m = module_re(stem).match(fn)
                 if m and m.group('ext') == 'bsl':
                     context = None
@@ -1102,13 +1220,14 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                 conn.executemany(sql, buf)
                 buf.clear()
 
-        for dirpath, dirnames, filenames in os.walk(dump_dir):
-            rel = rel_by_dir.get(dirpath)
-            object_id = dir_to_id.get(rel) if rel is not None else None
+        for dirpath, files in tree:
+            rel = rel_by_dir[dirpath]
+            object_id = dir_to_id.get(rel)
             stem = objects.get(dirpath)
-            for fn in sorted(filenames):
+            prefix = rel + '/' if rel else ''
+            for fn, size in files:
                 full = os.path.join(dirpath, fn)
-                rel_file = os.path.relpath(full, dump_dir).replace(os.sep, '/')
+                rel_file = prefix + fn
                 if object_id and fn == obj_header_file.get(dirpath):
                     continue
                 if object_id and fn == f'{stem}.id.json':
@@ -1135,7 +1254,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                         # файл модуля тоже отражаем в file (без data — тело в module):
                         # это полная карта «объект → файл дампа» для внешних инструментов
                         file_params.append((source_id, object_id, rel_file, 'bsl',
-                                            os.path.getsize(full), None))
+                                            size, None))
                         stats['files'] += 1
                         if len(method_params) >= 50000:
                             flush(module_params,
@@ -1146,7 +1265,6 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                                   ' is_export, directives, description, line_start, line_end, body)'
                                   ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
                         continue
-                size = os.path.getsize(full)
                 data = None
                 if ext in TEXT_KINDS:
                     data = _read_text(full).encode('utf-8')
@@ -1185,10 +1303,10 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         flush(skd_params,
               'INSERT INTO skd_query (object_id, ord, query) VALUES (?, ?, ?)')
         conn.commit()
-        # Заполняем FTS5 индекс телами методов после commit.
-        # Явно указываем rowid = method.id, чтобы они совпадали
-        conn.execute('INSERT INTO method_fts(rowid, body) SELECT id, body FROM method')
-        conn.commit()
+        # FTS5-индекс — после commit основным данным: на УНФ это половина
+        # времени записи, и без него база остаётся рабочей (поиск через body_has)
+        if build_fts:
+            _fill_fts(conn)
     except Exception:
         conn.rollback()
         raise

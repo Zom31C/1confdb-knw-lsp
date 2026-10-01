@@ -15,6 +15,9 @@ def test_parser_full():
     assert args.dump == 'out'
     assert args.keep_temp and args.store_blobs
     assert args.prefix == 'Префикс_'
+    assert not args.skip_errors
+    args = build_parser().parse_args(['extract', 'config.cf', '--skip-errors'])
+    assert args.skip_errors
 
 
 def test_main_requires_target():
@@ -29,15 +32,59 @@ def test_main_missing_file(tmp_path):
 
 
 def test_mcp_db_optional():
-    # без пути база ищется автоматически (last_db из конфига, затем обход);
-    # nargs='*' даёт пустой список, а не None
+    # без пути база ищется автоматически (last_db из конфига, затем обход)
     args = build_parser().parse_args(['1confdb-knw'])
     assert args.db == []
     args = build_parser().parse_args(['1confdb-knw', 'out.db', '--port', '8765'])
     assert args.db == ['out.db'] and args.port == 8765
+    # несколько баз сразу: основная конфигурация + расширения/обработки
+    args = build_parser().parse_args(['1confdb-knw', 'main.db', 'ext.db'])
+    assert args.db == ['main.db', 'ext.db']
 
 
 def test_main_mcp_missing_db(tmp_path):
     with pytest.raises(SystemExit) as exc:
         main(['1confdb-knw', str(tmp_path / 'нет.db')])
     assert exc.value.code == 2
+
+
+def test_parser_no_fts_and_fts_command():
+    args = build_parser().parse_args(['extract', 'config.cf', '--db', 'o.db', '--no-fts'])
+    assert args.no_fts
+    assert not build_parser().parse_args(['extract', 'config.cf', '--db', 'o.db']).no_fts
+    args = build_parser().parse_args(['fts', 'out.db'])
+    assert args.cmd == 'fts' and args.db == 'out.db'
+
+
+def test_main_fts_missing_db(tmp_path):
+    assert main(['fts', str(tmp_path / 'нет.db')]) == 2
+
+
+def test_main_fts_rejects_foreign_db(tmp_path):
+    import sqlite3
+
+    other = str(tmp_path / 'other.sqlite')
+    conn = sqlite3.connect(other)
+    conn.execute('CREATE TABLE t (x)')
+    conn.commit()
+    conn.close()
+    assert main(['fts', other]) == 1
+
+
+def test_fts_command_builds_index(tmp_path):
+    """confdb fts достраивает индекс в базе, собранной с --no-fts."""
+    import sqlite3
+
+    from confdb.db.writer import write_db
+
+    from test_writer import make_dump
+    dump = str(tmp_path / 'dump')
+    make_dump(dump)
+    db = str(tmp_path / 'out.sqlite')
+    write_db(dump, db, source_file='t.cf', build_fts=False)
+
+    assert main(['fts', db]) == 0
+    conn = sqlite3.connect(db)
+    assert conn.execute('SELECT COUNT(*) FROM method_fts').fetchone()[0] == \
+        conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
+    conn.close()

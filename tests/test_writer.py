@@ -3,7 +3,7 @@ import json
 import os
 import sqlite3
 
-from confdb.db.writer import VT_FIELDS_KEY, write_db
+from confdb.db.writer import VT_FIELDS_KEY, tabular_field_counts, write_db
 from confdb.header_props import (AR_DIMENSIONS, AR_RESOURCES, IR_ATTRIBUTES,
                                  IR_DIMENSIONS, IR_FORMS, IR_RESOURCES)
 
@@ -18,9 +18,12 @@ IR_UUID = '0e0e0e0e-0000-0000-0000-000000000008'
 AR_UUID = '0f0f0f0f-0000-0000-0000-000000000009'
 CM_UUID = '0a0a0a0a-0000-0000-0000-00000000000a'
 XDTO_UUID = '0b0b0b0b-0000-0000-0000-00000000000b'
+ES_UUID = '0c0c0c0c-0000-0000-0000-00000000000c'
+EP_UUID = '0d0d0d0d-0000-0000-0000-00000000000d'
 REF_CAT = '11111111-1111-1111-1111-111111111111'  # ссылочный uuid справочника в .10
 REF_DT = '22222222-2222-2222-2222-222222222222'   # собственный ссылочный uuid DT
 REF_ORPHAN = '44444444-4444-4444-4444-444444444444'  # имя в .10 есть, объекта в базе нет
+REF_UNKNOWN = '99999999-9999-9999-9999-999999999999'  # источник подписки без объекта
 
 # модуль общего назначения с экспортной функцией (запрос многострочным
 # литералом с '|') и закрытой процедурой, создающей таблицу значений
@@ -177,14 +180,14 @@ def make_dump(base):
                     '00000000-0000-0000-0000-000000000000', '0']]],
              '0', ['0'], ['1', '"ru"', '"Оплата"']],
             '1',
-            [VT_FIELDS_KEY, '2',
+            [VT_FIELDS_KEY, '3',
              ['8', ['27', ['2', _core('НомерЗаказа'),
                      ['"Pattern"', ['"S"', '11', '1']]]], '0'],
              ['8', ['27', ['2', _core('ТоварыКоличество'),
                      ['"Pattern"', ['"N"', '15', '3', '1']]]], '0'],
              ['8', ['27', ['2', _core('Контрагент'),
                      ['"Pattern"', ['"#"', REF_CAT]]]], '0']],
-            # табличная часть без блока полей: секция есть, полей не извлечено
+            # табличная часть без полей: блок полей объявляет ноль записей
             ['1', ['11', 'aaaaaaaa-0000-0000-0000-000000000014',
                    ['0', ['3', ['1', '0', 'aaaaaaaa-0000-0000-0000-000000000015'],
                     '"Доставка"', ['1', '"ru"', '"Доставка"'], '""', '0', '0',
@@ -269,6 +272,32 @@ def make_dump(base):
     _json(os.path.join(cm_dir, 'CommonModule.id.json'), {'uuid': CM_UUID})
     _write(os.path.join(cm_dir, 'CommonModule.obj.bsl'), COMMON_MODULE_BSL)
 
+    # подписка на событие: header[0][1] = ['1', CORE, ИСТОЧНИКИ, СОБЫТИЕ,
+    # UUID_ОБРАБОТЧИКА, ИМЯ_МЕТОДА]. Источники — «источниковые» uuid объектов
+    # (у определяемого типа это REF_DT из его header[0][1][1]), а обработчик —
+    # обычный meta_object.uuid общего модуля; REF_UNKNOWN в базе не встречается
+    es_dir = os.path.join(base, 'EventSubscription', 'ПодпискаТест')
+    _json(os.path.join(es_dir, 'EventSubscription.json'), {
+        'name': 'ПодпискаТест', 'comment': '', 'obj_version': '803',
+        'header': [['1',
+                    ['1', _core('ПодпискаТест'),
+                     ['"Pattern"', ['"#"', REF_DT], ['"#"', REF_UNKNOWN]],
+                     '"BeforeWrite_ПередЗаписью"', CM_UUID, '"Экспортная"'],
+                    '0']],
+    })
+    _json(os.path.join(es_dir, 'EventSubscription.id.json'), {'uuid': ES_UUID})
+
+    # план обмена: состав лежит в потоке .1 (ключ 'info') — плоский список пар
+    # (uuid объекта, флаг), у реальных планов обёрнутый в один список; uuid
+    # здесь обычные meta_object.uuid, в отличие от источников подписки
+    ep_dir = os.path.join(base, 'ExchangePlan', 'ПланОбмена1')
+    _json(os.path.join(ep_dir, 'ExchangePlan.json'), {
+        'name': 'ПланОбмена1', 'comment': '', 'obj_version': '803',
+        'header': [['1', ['0', _core('ПланОбмена1')]]],
+        'info': [['2', '2', CAT_UUID, '0', DT_UUID, '1']],
+    })
+    _json(os.path.join(ep_dir, 'ExchangePlan.id.json'), {'uuid': EP_UUID})
+
     # пакет XDTO: целевое пространство имён в записи header[0][1][2], а состав
     # типов и свойств — в XDTOPackage.bin (открытый XML с BOM и пространством
     # имён по умолчанию, как в реальном дампе)
@@ -299,9 +328,7 @@ def test_write_db(tmp_path):
     db_path = str(tmp_path / 'out.sqlite')
 
     stats = write_db(dump, db_path, source_file='test.cf')
-    # files: 5 прочих файлов дампа (включая XDTOPackage.bin) + 4 файла модулей
-    # .bsl (карта объект→файл)
-    assert stats == {'objects': 11, 'modules': 4, 'methods': 3, 'files': 9, 'files_content': 3,
+    assert stats == {'objects': 13, 'modules': 4, 'methods': 3, 'files': 9, 'files_content': 3,
                      'skd': 0, 'attributes': 15, 'refs': 10, 'enum_values': 2,
                      'predefined': 1, 'common_targets': 1, 'tabular': 3,
                      'xdto_types': 3, 'xdto_properties': 5}
@@ -364,7 +391,9 @@ def test_write_db(tmp_path):
                             'Document/ЗаказПокупателя',
                             'InformationRegister/РегистрСведений1',
                             'AccumulationRegister/РегистрНакопления1',
-                            'CommonModule/ОбщийМодуль1', 'XDTOPackage/ПакетТест'}
+                            'CommonModule/ОбщийМодуль1', 'XDTOPackage/ПакетТест',
+                            'EventSubscription/ПодпискаТест',
+                            'ExchangePlan/ПланОбмена1'}
 
     # табличные части и их поля
     assert [r[0] for r in q(
@@ -385,10 +414,20 @@ def test_write_db(tmp_path):
     assert q('SELECT COUNT(*) FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
              " WHERE o.path='Document/ЗаказПокупателя' AND a.name='НомерЗаказа'"
              ).fetchone()[0] == 2
-    # секция без блока полей: запись в meta_tabular есть, полей не извлечено
+    # секция, у которой конфигурация не объявила ни одного поля: запись
+    # в meta_tabular есть, полей нет
     assert q('SELECT COUNT(*) FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
              " WHERE o.path='Document/ЗаказПокупателя' AND a.tabular='Доставка'"
              ).fetchone()[0] == 0
+
+    # объявленное число полей секции читается из header_json готовой базы:
+    # по нему пустая секция конфигурации отличается от пробела извлечения
+    doc_header = q('SELECT header_json FROM meta_object'
+                   " WHERE path='Document/ЗаказПокупателя'").fetchone()[0]
+    assert tabular_field_counts(doc_header) == {
+        'Товары': 2, 'Оплата': 3, 'Доставка': 0}
+    assert tabular_field_counts('не json') == {}
+    assert tabular_field_counts(None) == {}
 
     # содержимое пакета XDTO: импорты, типы, свойства и вложенный анонимный тип
     xdto = " JOIN meta_object o ON o.id=t.object_id WHERE o.path='XDTOPackage/ПакетТест'"
@@ -500,3 +539,92 @@ def test_extract_skd_queries(tmp_path):
     (tmp_path / 'Template.bin').write_bytes(raw)
     assert _extract_skd_queries(str(tmp_path / 'Template.bin')) == ['ВЫБРАТЬ 1 КАК А']
     assert _extract_skd_queries(str(tmp_path / 'нет.bin')) is None
+
+
+def test_scan_tree_matches_os_walk(tmp_path):
+    """Снимок обхода заменяет os.walk: порядок и размеры должны совпадать.
+
+    От порядка каталогов и файлов зависят id строк в базе (module.id, file.id),
+    поэтому _scan_tree обязан давать ровно то, что давал os.walk + sorted().
+    """
+    from confdb.db.writer import _rel_paths, _scan_tree
+    dump = os.path.abspath(str(tmp_path / 'dump'))
+    make_dump(dump)
+    tree = _scan_tree(dump)
+    expected = []
+    for dirpath, dirnames, filenames in os.walk(dump):
+        expected.append((dirpath, sorted(
+            (fn, os.path.getsize(os.path.join(dirpath, fn))) for fn in filenames)))
+    assert tree == expected
+
+    rel = _rel_paths(tree, dump)
+    assert rel[dump] == ''
+    for dirpath, _files in tree:
+        want = os.path.relpath(dirpath, dump).replace(os.sep, '/')
+        assert rel[dirpath] == ('' if want == '.' else want)
+
+
+def test_attribute_walk_collects_same_section_bags(tmp_path):
+    """Блоки полей из обхода _extract_attributes == _section_bags(header).
+
+    Запись собирает табличные части за тот же обход заголовка, что и реквизиты;
+    отдельный обход (_section_bags) на УНФ стоил бы ещё 6 млн рекурсивных вызовов.
+    """
+    from confdb.db.writer import _extract_attributes, _section_bags
+    dump = str(tmp_path / 'dump')
+    make_dump(dump)
+    db_path = str(tmp_path / 'out.sqlite')
+    write_db(dump, db_path)
+    conn = sqlite3.connect(db_path)
+    headers = [json.loads(r[0]) for r in conn.execute('SELECT header_json FROM meta_object')]
+    conn.close()
+    bags_total = 0
+    for header in headers:
+        bags = []
+        _extract_attributes(header, None, bags)
+        assert bags == _section_bags(header)
+        bags_total += len(bags)
+    assert bags_total >= 3  # в фикстуре три табличные части: иначе тест пустой
+
+
+def test_write_db_without_fts_and_late_build(tmp_path):
+    """build_fts=False не создаёт индекс; build_fts_index строит его позже."""
+    from confdb.db.writer import FTS_TABLE, build_fts_index
+    dump = str(tmp_path / 'dump')
+    make_dump(dump)
+    db_path = str(tmp_path / 'out.sqlite')
+    write_db(dump, db_path, build_fts=False)
+
+    conn = sqlite3.connect(db_path)
+    assert not conn.execute('SELECT 1 FROM sqlite_master WHERE name=?',
+                            (FTS_TABLE,)).fetchone()
+    methods = conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
+    conn.close()
+
+    assert build_fts_index(db_path) == methods
+    conn = sqlite3.connect(db_path)
+    # rowid индекса = method.id, MATCH находит подстроку тела метода
+    assert conn.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0] == methods
+    assert conn.execute(f'SELECT rowid FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?',
+                        ('"Справочник.Справочник1"',)).fetchall()
+    conn.close()
+
+    # пересборка поверх существующего индекса не дублирует строки
+    assert build_fts_index(db_path) == methods
+    conn = sqlite3.connect(db_path)
+    assert conn.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0] == methods
+    conn.close()
+
+
+def test_build_fts_index_rejects_foreign_db(tmp_path):
+    from confdb.db.writer import build_fts_index
+    other = str(tmp_path / 'other.sqlite')
+    conn = sqlite3.connect(other)
+    conn.execute('CREATE TABLE t (x)')
+    conn.commit()
+    conn.close()
+    try:
+        build_fts_index(other)
+        raise AssertionError('ожидалась ошибка: это не база знаний confdb')
+    except ValueError:
+        pass

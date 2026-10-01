@@ -484,6 +484,58 @@ def test_find_methods_body_search_ignores_case(tmp_path_factory):
         assert 'ОбщийМодуль1' in out, needle
 
 
+def _server_no_fts(tmp_path_factory):
+    """Сервер над базой, собранной без FTS-индекса (extract --no-fts)."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf', build_fts=False)
+    return McpServer(db), db
+
+
+def test_find_methods_without_fts_falls_back_to_body_has(tmp_path_factory):
+    """Без индекса поиск по телам работает (медленно), а не молча возвращает ноль."""
+    server, _db = _server_no_fts(tmp_path_factory)
+    assert server.dbs[server.active]['fts'] is None
+    out = _call(server, 'find_methods',
+                text='Справочник.Справочник1')['content'][0]['text']
+    assert 'ОбщийМодуль1' in out
+
+
+def test_find_methods_same_result_after_late_fts_build(tmp_path_factory):
+    """Индекс, собранный позже (confdb fts), даёт ту же выдачу, что body_has."""
+    from confdb.db.writer import FTS_TABLE, build_fts_index
+    server, db = _server_no_fts(tmp_path_factory)
+    plain = _call(server, 'find_methods',
+                  text='Справочник.Справочник1')['content'][0]['text']
+    server.close_db()
+
+    build_fts_index(db)
+    server = McpServer(db)
+    assert server.dbs[server.active]['fts'] == FTS_TABLE
+    indexed = _call(server, 'find_methods',
+                    text='Справочник.Справочник1')['content'][0]['text']
+    # порядок строк без ORDER BY зависит от плана запроса — сравниваем состав
+    assert sorted(indexed.splitlines()) == sorted(plain.splitlines())
+
+
+def test_empty_fts_index_is_not_used(tmp_path_factory):
+    """Пустой индекс (сборку прервали) — не повод молча вернуть ноль."""
+    from confdb.db.writer import FTS_TABLE
+    server, db = _server_no_fts(tmp_path_factory)
+    server.close_db()
+    conn = sqlite3.connect(db)
+    conn.execute(f'CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5(body, tokenize=trigram)')
+    conn.commit()
+    conn.close()
+
+    server = McpServer(db)
+    assert server.dbs[server.active]['fts'] is None
+    out = _call(server, 'find_methods',
+                text='Справочник.Справочник1')['content'][0]['text']
+    assert 'ОбщийМодуль1' in out
+
+
 def test_find_methods_path_is_a_real_filter(tmp_path_factory):
     """path ограничивает поиск объектом.
 

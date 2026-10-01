@@ -45,7 +45,7 @@ from urllib.parse import parse_qs, quote as urllib_quote, urlparse
 from . import compare
 from . import header_props
 from .config import load_config, save_config
-from .db.writer import TYPE_RU
+from .db.writer import FTS_TABLE, TYPE_RU
 
 PROTOCOL_VERSION = '2024-11-05'
 
@@ -328,9 +328,18 @@ class McpServer:
             conn.close()
             raise ValueError(
                 f'это не база знаний confdb (нет таблицы meta_object): {path}')
+        # FTS5-индекс по телам методов. Пустой не считается: сборку могли прервать
+        # (или база собрана с --no-fts), и тогда поиск по телам должен уйти на
+        # body_has, а не молча вернуть ноль
+        fts = None
+        try:
+            if conn.execute(f'SELECT rowid FROM {FTS_TABLE} LIMIT 1').fetchone():
+                fts = FTS_TABLE
+        except sqlite3.Error:
+            pass  # индекса нет — будет fallback на body_has
         if alias is None:
             alias = self._make_alias(path)
-        self.dbs[alias] = {'path': path, 'conn': conn, 'ctx': None}
+        self.dbs[alias] = {'path': path, 'conn': conn, 'ctx': None, 'fts': fts}
         if activate or self.active is None:
             self.active = alias
         return alias
@@ -1103,12 +1112,20 @@ class McpServer:
                 'OR mt.description LIKE ? '
                 "OR lower_ru(REPLACE(mt.name, ' ', '')) LIKE ?)")
         params = [like, like, like, like_ns]
+        conn = self.conn(db)
+        fts = self.dbs[self._alias(db)].get('fts')
         if text:
-            # body_has — своя SQL-функция, регистронезависимая в обе стороны:
-            # LIKE сворачивает регистр только для ASCII, а пара LIKE через OR
-            # ловила бы лишь тот регистр, в котором игла передана
-            cond += ' AND body_has(mt.body, ?)'
-            params.append(text.lower())
+            if fts and len(text) >= 3:
+                # FTS5 trigram индекс — быстрый поиск подстроки
+                # Оборачиваем в кавычки для экранирования специальных символов
+                cond += f' AND mt.id IN (SELECT rowid FROM {fts} WHERE {fts} MATCH ?)'
+                params.append(f'"{text}"')
+            else:
+                # body_has — своя SQL-функция, регистронезависимая в обе стороны:
+                # LIKE сворачивает регистр только для ASCII, а пара LIKE через OR
+                # ловила бы лишь тот регистр, в котором игла передана
+                cond += ' AND body_has(mt.body, ?)'
+                params.append(text.lower())
         sql = ('SELECT o.path, m.code_name, mt.kind, mt.name, mt.signature, '
                'mt.directives, mt.description'
                + (', mt.body, mt.line_start' if text else '')
@@ -1120,7 +1137,7 @@ class McpServer:
             params.append(path)
         sql += ' LIMIT ?'
         params.append(limit)
-        rows = self.conn(db).execute(sql, params).fetchall()
+        rows = conn.execute(sql, params).fetchall()
         if not rows:
             return f'в телах методов ничего не найдено: {text}' if text \
                 else 'ничего не найдено'

@@ -16,7 +16,7 @@ from .v8 import decoder as v8_decoder
 
 
 def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=False, options=None,
-            workers=1):
+            workers=1, build_fts=True):
     """Распаковывает файл 1С и (опционально) загружает результат в SQLite.
 
     :param src_file: путь к .cf/.cfe/.epf
@@ -26,6 +26,8 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
     :param keep_temp: не удалять рабочий каталог стадий 0-1
     :param options: словарь опций декодера (prefix, auto_include и т.п.)
     :param workers: число процессов стадии 3 (1 — последовательно)
+    :param build_fts: строить FTS5-индекс по телам методов (половина времени
+        записи БД; без него база рабочая, индекс собирается позже — `confdb fts`)
     :return: словарь со статистикой
     """
     src_file = os.path.abspath(src_file)
@@ -65,7 +67,7 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
             print(f'Пишем базу данных {db_path}')
             stats['db_rows'] = write_db(stage3, db_path, source_file=src_file,
                                         store_blobs=options.get('store_blobs', False),
-                                        workers=workers)
+                                        workers=workers, build_fts=build_fts)
 
         stats['dump_dir'] = dump_dir if dump_dir else None
     finally:
