@@ -483,20 +483,67 @@ def _extract_enum_values(header):
     return result
 
 
-def _extract_predefined(bin_path):
-    """Предопределённые элементы из 'Предустановленные данные.bin'.
+def _predef_columns(schema):
+    """{colId: (тип, uuid-имя)} из узла схемы ['<n>', desc…].
 
-    Запись значения: ['2', <id>, <n>, ..слоты.., ['S', имя], ['S', код],
-    ['S', наименование], ..] — берём первые три строковых слота.
+    desc = [colId, nameUuid, ['"Pattern"', <тип>…], '""', '0']; у колонки с пустым
+    Pattern типа нет — её занимает вложенная таблица.
     """
-    if not os.path.isfile(bin_path):
-        return []
-    try:
-        data = helper.brace_file_read(os.path.dirname(bin_path),
-                                      os.path.basename(bin_path))
-    except (OSError, ValueError, IndexError):
-        return []
-    result = []
+    columns = {}
+    for desc in schema[1:] if isinstance(schema, list) else []:
+        if not isinstance(desc, list) or len(desc) < 3:
+            continue
+        pattern = desc[2]
+        ptype = None
+        if (isinstance(pattern, list) and len(pattern) > 1
+                and isinstance(pattern[1], list) and pattern[1]):
+            ptype = _unquote(pattern[1][0])
+        columns[str(desc[0])] = (ptype, _unquote(desc[1]))
+    return columns
+
+
+def _predef_rows(table):
+    """Узел таблицы -> ({позиция: colId}, строки).
+
+    ['2', nCols, <nCols пар (позиция, colId)>, ['1', nRows, <строки>…], …]:
+    порядок значений в строке задают пары, а не номера колонок.
+    """
+    ncols = int(table[1])
+    pos_to_col = {int(table[2 + 2 * i]): str(table[3 + 2 * i]) for i in range(ncols)}
+    block = table[2 + 2 * ncols]
+    return pos_to_col, block[2:2 + int(block[1])]
+
+
+def _predef_cell(slots, pos_to_col, col_id):
+    for pos, cid in pos_to_col.items():
+        if cid == col_id and pos < len(slots):
+            return slots[pos]
+    return None
+
+
+def _predef_uuid(value):
+    """['"#"', <тип>, ['1', <uuid>]] -> uuid."""
+    if isinstance(value, list) and len(value) > 2 and _unquote(value[0]) == '#':
+        leaf = value[2]
+        if isinstance(leaf, list) and len(leaf) > 1:
+            return _unquote(leaf[1])
+    return None
+
+
+def _predef_str(value):
+    """['"S"', '"текст"'] и ['"B"', '1'] -> значение без кавычек."""
+    if isinstance(value, list) and len(value) > 1 and isinstance(value[1], str):
+        return _unquote(value[1])
+    return ''
+
+
+def _predef_property_names(header):
+    """{uuid свойства: имя} из дескрипторов ['3', ['1', '0', uuid], '"Имя"', …].
+
+    В заголовке плана счетов так объявлены колонки табличной части «Виды субконто»:
+    по uuid колонки находится её имя — «Суммовой», «Валютный», «Количественный».
+    """
+    names = {}
 
     def walk(node):
         if isinstance(node, dict):
@@ -505,17 +552,125 @@ def _extract_predefined(bin_path):
             return
         if not isinstance(node, list):
             return
-        if len(node) >= 9 and node[0] == '2' and str(node[1]).isdigit():
-            strs = [_unquote(x[1]) for x in node
-                    if isinstance(x, list) and len(x) >= 2
-                    and str(x[0]).strip('"') == 'S' and isinstance(x[1], str)]
-            if len(strs) >= 3 and strs[0]:
-                result.append((strs[0], strs[1], strs[2]))
+        if (len(node) >= 3 and str(node[0]) == '3' and isinstance(node[1], list)
+                and len(node[1]) >= 3 and isinstance(node[2], str)):
+            uuid = _unquote(node[1][2])
+            name = _unquote(node[2])
+            if name and len(uuid) == 36 and uuid.count('-') == 4 and uuid not in names:
+                names[uuid] = name
         for child in node:
             walk(child)
 
-    walk(data)
-    return result
+    walk(header.get('header') if isinstance(header, dict) else None)
+    return names
+
+
+def _extract_predefined(bin_path, header=None):
+    """Предопределённые элементы из 'Предустановленные данные.bin'.
+
+    Возвращает (элементы, субконто):
+      элементы — (ord, parent_ord, uuid, name, code, display), где ord — номер в
+        обходе в глубину, а parent_ord None у корневого узла («Счета», «Элементы»),
+        который элементом не является;
+      субконто — (ord счёта, ord вида, uuid вида, 'флаг;флаг') из вложенной таблицы
+        колонки с пустым Pattern.
+
+    Номера колонок у разных типов объектов разные (план счетов с 0, ПВХ с 1), поэтому
+    колонки ищутся по типу: первая '#' — uuid элемента, первые три 'S' — имя, код,
+    наименование (у справочника без кода строковых колонок две — имя и наименование).
+    Вторая '#' неоднозначна (у справочника — родитель, у ПВХ — тип значения) и не
+    используется. Формат — страница знаний predefined-structure.
+    """
+    if not os.path.isfile(bin_path):
+        return [], []
+    try:
+        data = helper.brace_file_read(os.path.dirname(bin_path),
+                                      os.path.basename(bin_path))
+        wrapper = data[0][1]
+        columns = _predef_columns(wrapper[1])
+        pos_to_col, top_rows = _predef_rows(wrapper[2])
+    except (OSError, ValueError, IndexError, TypeError, KeyError):
+        return [], []
+
+    col_to_pos = {c: p for p, c in pos_to_col.items()}
+    ordered = sorted(columns, key=lambda c: col_to_pos.get(c, len(columns)))
+    uuid_col = next((c for c in ordered if columns[c][0] == '#'), None)
+    text_cols = [c for c in ordered if columns[c][0] == 'S']
+    nested_col = next((c for c in ordered if columns[c][0] is None), None)
+    if not text_cols:
+        return [], []
+    # у справочника без кода строковых колонок две: имя и наименование
+    if len(text_cols) >= 3:
+        text_cols = text_cols[:3]
+    elif len(text_cols) == 2:
+        text_cols = [text_cols[0], None, text_cols[1]]
+    else:
+        text_cols = [text_cols[0], None, None]
+    flag_names = _predef_property_names(header) if header else {}
+    elements = []
+    subcontos = []
+
+    def collect_subconto(value, owner_ord):
+        """Вложенная таблица ['#', <тип>, [<схема>, <таблица>, …]] — виды субконто."""
+        if not isinstance(value, list) or len(value) < 3 or not isinstance(value[2], list):
+            return
+        payload = value[2]
+        if len(payload) < 3:
+            return
+        try:
+            scols = _predef_columns(payload[1])
+            spos, srows = _predef_rows(payload[2])
+        except (ValueError, IndexError, TypeError):
+            return
+        s_to_pos = {c: p for p, c in spos.items()}
+        sordered = sorted(scols, key=lambda c: s_to_pos.get(c, len(scols)))
+        suuid = next((c for c in sordered if scols[c][0] == '#'), None)
+        # безымянный флаг пропускаем: его смысл не установлен
+        sflags = [c for c in sordered if scols[c][0] == 'B' and scols[c][1] in flag_names]
+        done = 0
+        for row in srows:
+            if not isinstance(row, list) or len(row) < 4 or str(row[0]) != '2':
+                continue
+            try:
+                slots = row[3:3 + int(row[2])]
+            except (TypeError, ValueError):
+                continue
+            flags = ';'.join(flag_names[scols[c][1]] for c in sflags
+                             if _predef_str(_predef_cell(slots, spos, c)) == '1')
+            subcontos.append((owner_ord, done,
+                              _predef_uuid(_predef_cell(slots, spos, suuid)) if suuid else None,
+                              flags or None))
+            done += 1
+
+    def walk(node, parent_ord):
+        if not isinstance(node, list) or len(node) < 4 or str(node[0]) != '2':
+            return
+        try:
+            ncols = int(node[2])
+        except (TypeError, ValueError):
+            return
+        slots = node[3:3 + ncols]
+        ord_no = len(elements)
+        texts = [_predef_str(_predef_cell(slots, pos_to_col, c)) for c in text_cols]
+        elements.append((ord_no, parent_ord,
+                         _predef_uuid(_predef_cell(slots, pos_to_col, uuid_col))
+                         if uuid_col else None,
+                         texts[0], texts[1], texts[2]))
+        if nested_col is not None:
+            collect_subconto(_predef_cell(slots, pos_to_col, nested_col), ord_no)
+        for child in node[3 + ncols:]:
+            if not isinstance(child, list) or not child or str(child[0]) != '1':
+                continue
+            try:
+                grand = child[2:2 + int(child[1])]
+            except (TypeError, ValueError):
+                continue
+            for sub in grand:
+                walk(sub, ord_no)
+
+    for row in top_rows:
+        walk(row, None)
+    return elements, subcontos
 
 
 def _extract_common_targets(header, uuid_to_id, own_id):
@@ -665,11 +820,23 @@ CREATE TABLE predefined (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
     ord INTEGER NOT NULL,
+    parent_ord INTEGER,
+    uuid TEXT,
     name TEXT NOT NULL,
     code TEXT,
     display TEXT
 );
-CREATE INDEX ix_predefined_object ON predefined(object_id, ord);
+CREATE UNIQUE INDEX ix_predefined_object ON predefined(object_id, ord);
+CREATE INDEX ix_predefined_uuid ON predefined(uuid);
+CREATE TABLE predefined_subconto (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    predefined_id INTEGER NOT NULL REFERENCES predefined(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    uuid TEXT,
+    kind_id INTEGER REFERENCES predefined(id) ON DELETE SET NULL,
+    flags TEXT
+);
+CREATE INDEX ix_predef_subconto ON predefined_subconto(predefined_id, ord);
 CREATE TABLE common_target (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     common_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
@@ -994,6 +1161,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     conn = sqlite3.connect(db_path)
     stats = {'objects': 0, 'modules': 0, 'methods': 0, 'files': 0, 'files_content': 0,
              'skd': 0, 'attributes': 0, 'refs': 0, 'enum_values': 0, 'predefined': 0,
+             'subconto': 0,
              'common_targets': 0, 'tabular': 0, 'xdto_types': 0, 'xdto_properties': 0}
     try:
         # база пересоздаётся с нуля при каждом запуске: отключаем fsync для скорости,
@@ -1117,6 +1285,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         enum_params = []
         common_params = []
         predef_params = []
+        subconto_params = []
         for rel, info in infos.items():
             obj_id = dir_to_id[rel]
             for ord_no, name in enumerate(info['tabular']):
@@ -1127,9 +1296,13 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
             elif info['stem'] == 'CommonAttribute':
                 for target in _extract_common_targets(info['header'], uuid_to_id, obj_id):
                     common_params.append((obj_id, target))
-            for ord_no, (name, code, display) in enumerate(_extract_predefined(
-                    os.path.join(info['dirpath'], 'Предустановленные данные.bin'))):
-                predef_params.append((obj_id, ord_no, name, code, display))
+            elements, subcontos = _extract_predefined(
+                os.path.join(info['dirpath'], 'Предустановленные данные.bin'),
+                info['header'])
+            for element in elements:
+                predef_params.append((obj_id,) + element)
+            for subconto in subcontos:
+                subconto_params.append((obj_id,) + subconto)
         conn.executemany(
             'INSERT INTO meta_tabular (object_id, ord, name) VALUES (?, ?, ?)',
             tab_params)
@@ -1140,12 +1313,26 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
             'INSERT INTO common_target (common_id, target_id) VALUES (?, ?)',
             common_params)
         conn.executemany(
-            'INSERT INTO predefined (object_id, ord, name, code, display)'
-            ' VALUES (?, ?, ?, ?, ?)', predef_params)
+            'INSERT INTO predefined (object_id, ord, parent_ord, uuid, name, code, display)'
+            ' VALUES (?, ?, ?, ?, ?, ?, ?)', predef_params)
         stats['tabular'] += len(tab_params)
         stats['enum_values'] += len(enum_params)
         stats['common_targets'] += len(common_params)
         stats['predefined'] += len(predef_params)
+        if subconto_params:
+            # id предопределённых известны только после вставки, а вид субконто — это
+            # другой предопределённый элемент (ПВХ), поэтому ссылки разрешаются вторым проходом
+            ids = {(o, n): i for i, o, n in conn.execute(
+                'SELECT id, object_id, ord FROM predefined')}
+            kinds = {u: i for i, u in conn.execute(
+                'SELECT id, uuid FROM predefined WHERE uuid IS NOT NULL')}
+            sub_rows = [(ids[(o, n)], s, u, kinds.get(u), f)
+                        for o, n, s, u, f in subconto_params if (o, n) in ids]
+            conn.executemany(
+                'INSERT INTO predefined_subconto'
+                ' (predefined_id, ord, uuid, kind_id, flags) VALUES (?, ?, ?, ?, ?)',
+                sub_rows)
+            stats['subconto'] += len(sub_rows)
 
         # состав подсистем: ссылки из заголовка подсистемы в порядке объявления
         sub_params = []

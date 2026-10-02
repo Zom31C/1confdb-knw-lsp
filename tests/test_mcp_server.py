@@ -14,7 +14,7 @@ import confdb.mcp_server as mcp_server  # noqa: E402
 from confdb.db.writer import write_db  # noqa: E402
 from confdb.mcp_server import McpServer, resolve_db, start_http_server  # noqa: E402
 
-from test_writer import make_dump  # noqa: E402
+from test_writer import make_chart_dump, make_dump  # noqa: E402
 
 
 def _one_db(tmp_path_factory):
@@ -116,14 +116,14 @@ def test_object_card_enum_and_predefined(tmp_path_factory):
     text = _call(server, 'object_card',
                  path='Catalog/Справочник1')['content'][0]['text']
     assert 'Значения перечисления' in text and 'Значение1' in text
-    # предопределённые элементы справочника
+    # предопределённые элементы справочника: дерево с кодом и наименованием
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE meta_object SET type='Catalog' WHERE id=?", (oid,))
-        conn.execute("INSERT INTO predefined (object_id, ord, name, code) "
-                     "VALUES (?, 1, 'Основной', '001')", (oid,))
+        conn.execute("INSERT INTO predefined (object_id, ord, parent_ord, name, code) "
+                     "VALUES (?, 2, 0, 'Основной', '001')", (oid,))
     text = _call(server, 'object_card',
                  path='Catalog/Справочник1')['content'][0]['text']
-    assert 'Предопределённые элементы' in text and 'Основной [001]' in text
+    assert 'Предопределённые элементы (2):' in text and '001 Основной' in text
 
 
 def test_find_objects_and_card(tmp_path_factory):
@@ -1229,6 +1229,33 @@ def test_http_oauth_flow(tmp_path_factory):
         httpd.shutdown()
         httpd.server_close()
 
+
+
+def test_object_card_predefined_accounts(tmp_path_factory):
+    # предопределённые счета плана печатаются деревом, с видами субконто и их
+    # флагами; корневой узел «Счета» в отчёт не попадает, но входит в дерево
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    make_chart_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf')
+    server = McpServer(db)
+    card = _call(server, 'object_card',
+                 path='ПланСчетов.ПланСчетов1')['content'][0]['text']
+    assert 'Предопределённые счета (3):' in card
+    assert '\n  01 ОсновныеСредства — Основные средства\n' in card
+    assert '\n    01.01 ОСвОрганизации — Основные средства в организации\n' in card
+    assert ('      субконто: Основные средства [Суммовой;Валютный;Количественный]'
+            in card)
+    assert ('  41 Товары\n'
+            '    субконто: Номенклатура [Суммовой;Валютный;Количественный];'
+            ' Основные средства') in card
+
+    # у справочника тот же блок называется «элементы» и идёт деревом
+    card_cat = _call(server, 'object_card',
+                     path='Справочник.Справочник1')['content'][0]['text']
+    assert 'Предопределённые элементы (1):' in card_cat
+    assert '  001 ПредЗначение — Предопределенное значение' in card_cat
 
 
 def test_object_card_sees_unextracted_tabular_fields(tmp_path_factory):

@@ -25,6 +25,28 @@ REF_DT = '22222222-2222-2222-2222-222222222222'   # собственный сс�
 REF_ORPHAN = '44444444-4444-4444-4444-444444444444'  # имя в .10 есть, объекта в базе нет
 REF_UNKNOWN = '99999999-9999-9999-9999-999999999999'  # источник подписки без объекта
 
+# платформенные uuid типа «уникальный идентификатор» и таблицы видов субконто —
+# те же, что в реальных .cf (БП_РФ, УНФ)
+PREDEF_TYPE = 'ae135932-4f94-44df-92c1-c91f15a92848'
+SUBCONTO_TABLE_TYPE = 'acf6192e-81ca-46ef-93a6-5a6968b78663'
+FLAG_SUM_UUID = 'bc4c2981-98f7-4f8f-a232-1024d34b754b'   # «Суммовой»
+FLAG_CUR_UUID = '2c278dca-06f0-4dbd-8379-e73f74822973'   # «Валютный»
+FLAG_QTY_UUID = '25661fe8-4c82-4116-a412-2b3443ac4ca2'   # «Количественный»
+ZERO_UUID = '00000000-0000-0000-0000-000000000000'
+PRE_ELEM_UUID = '4a4a4a4a-0000-0000-0000-0000000000a1'
+CHART_UUID = '1a1a1a1a-0000-0000-0000-0000000000b1'
+CHX_UUID = '1b1b1b1b-0000-0000-0000-0000000000c1'
+ACC_OS_UUID = '2a2a2a2a-0000-0000-0000-000000000001'
+ACC_OS_ORG_UUID = '2a2a2a2a-0000-0000-0000-000000000002'
+ACC_GOODS_UUID = '2a2a2a2a-0000-0000-0000-000000000003'
+KIND_OS_UUID = '3a3a3a3a-0000-0000-0000-000000000001'
+KIND_GOODS_UUID = '3a3a3a3a-0000-0000-0000-000000000002'
+CHART_PATH = 'ChartOfAccounts/ПланСчетов1'
+CHX_PATH = 'ChartOfCharacteristicType/ВидыСубконто'
+NOCODE_UUID = '1c1c1c1c-0000-0000-0000-0000000000d1'
+DRIVER_UUID = '5a5a5a5a-0000-0000-0000-0000000000e1'
+NOCODE_PATH = 'Catalog/ДрайверыОборудования'
+
 # модуль общего назначения с экспортной функцией (запрос многострочным
 # литералом с '|') и закрытой процедурой, создающей таблицу значений
 COMMON_MODULE_BSL = (
@@ -109,6 +131,183 @@ def _write(path, data):
 
 def _json(path, data):
     _write(path, json.dumps(data, ensure_ascii=False))
+
+
+def _brace(node):
+    """Текст brace-файла: скаляры в строку, вложенный список — с новой строки.
+
+    Парсер (v8/json_container_decoder.py) построчный: токен не может переходить
+    через '\\n', поэтому разметка повторяет вывод реального декодера. Кавычки у
+    токенов — часть формата: '"S"' и '"текст"' пишутся буквально, uuid и числа без них.
+    """
+    if not isinstance(node, list):
+        return str(node)
+    body = ','.join('\n' + _brace(x) if isinstance(x, list) else _brace(x)
+                    for x in node)
+    if node and isinstance(node[-1], list):
+        body += '\n'
+    return '{' + body + '}'
+
+
+def _pcol(col_id, ptype, name_uuid=None):
+    """Дескриптор колонки: [colId, nameUuid, ['"Pattern"', <тип>…], '""', '0'].
+
+    ptype — содержимое Pattern: [['"#"', UUID]], [['"S"', '4', '1']], [['"B"']]
+    или [] — колонка с пустым Pattern, её занимает вложенная таблица.
+    """
+    return [str(col_id), f'"{name_uuid}"' if name_uuid else '""',
+            ['"Pattern"'] + list(ptype), '""', '0']
+
+
+def _puuid(uuid):
+    return ['"#"', PREDEF_TYPE, ['1', uuid]]
+
+
+def _pstr(text):
+    return ['"S"', f'"{text}"']
+
+
+def _pbool(flag):
+    return ['"B"', str(int(flag))]
+
+
+def _pnum(value):
+    return ['"N"', str(value)]
+
+
+def _prow(row_id, values, children=()):
+    """Строка: ['2', id, n, <значения>, hasChildren, (['1', count, <дети>])]."""
+    node = ['2', str(row_id), str(len(values))] + list(values)
+    if children:
+        return node + ['1', ['1', str(len(children))] + list(children)]
+    return node + ['0']
+
+
+def _ptable(cols, roots, pairs=None):
+    """Узел таблицы: ['2', n, <пары (позиция, colId)>, ['1', count, <строки>], …].
+
+    Порядок значений в строке задают пары, а не номера колонок; pairs=None — позиции
+    идут подряд.
+    """
+    if pairs is None:
+        pairs = [(i, str(c[0])) for i, c in enumerate(cols)]
+    flat = [str(x) for pair in pairs for x in pair]
+    return ['2', str(len(pairs))] + flat + \
+        [['1', str(len(roots))] + list(roots)] + ['-1', '128']
+
+
+def _pfile(cols, roots, pairs=None, tag='2'):
+    """'Предустановленные данные.bin' целиком: {<tag>,{1,<схема>,<таблица>}}.
+
+    tag у реальных файлов разный ('0' у справочника, '2' у плана счетов) и на разбор
+    не влияет — извлечение читает только схему и таблицу.
+    """
+    return _brace([tag, ['1', [str(len(cols))] + list(cols),
+                         _ptable(cols, roots, pairs)]])
+
+
+def _psubconto(cols, rows):
+    """Значение колонки с пустым Pattern — вложенная таблица видов субконто."""
+    pairs = [(i, str(c[0])) for i, c in enumerate(cols)]
+    flat = [str(x) for pair in pairs for x in pair]
+    table = ['2', str(len(pairs))] + flat + \
+        [['1', str(len(rows))] + list(rows)] + ['4', '-1']
+    return ['"#"', SUBCONTO_TABLE_TYPE,
+            ['9', [str(len(cols))] + list(cols), table]]
+
+
+SUBCONTO_COLS = [_pcol(0, [['"#"', PREDEF_TYPE]]), _pcol(1, [['"B"']]),
+                 _pcol(2, [['"B"']], FLAG_SUM_UUID),
+                 _pcol(3, [['"B"']], FLAG_CUR_UUID),
+                 _pcol(4, [['"B"']], FLAG_QTY_UUID)]
+
+
+def _subconto(*kinds):
+    """Вложенная таблица видов субконто: (uuid вида, суммовой, валютный, кол.)."""
+    return _psubconto(SUBCONTO_COLS, [
+        _prow(i, [_puuid(uuid), _pbool(0), _pbool(s), _pbool(c), _pbool(q)])
+        for i, (uuid, s, c, q) in enumerate(kinds)])
+
+
+def _flag_desc(uuid, name):
+    """Дескриптор колонки ТЧ в заголовке: ['3', ['1', '0', uuid], '"Имя"', …]."""
+    return ['3', ['1', '0', uuid], f'"{name}"', ['1', '"ru"', f'"{name}"'],
+            '""', '0', '0', ZERO_UUID, '0']
+
+
+def make_chart_dump(base):
+    """План счетов с субконто и ПВХ видов субконто — как в реальном дампе стадии 3.
+
+    Номера колонок ПВХ начинаются с 1, а не с 0: значимые колонки извлекаются по типу.
+    """
+    chart_cols = [_pcol(0, [['"#"', PREDEF_TYPE]]), _pcol(1, [['"S"']]),
+                  _pcol(2, [['"S"', '8', '1']]), _pcol(3, [['"S"', '120', '1']]),
+                  _pcol(4, [['"N"']]), _pcol(5, [['"B"']]), _pcol(6, [])]
+
+    def account(row_id, uuid, name, code, display, sub, children=()):
+        return _prow(row_id, [_puuid(uuid), _pstr(name), _pstr(code),
+                              _pstr(display), _pnum(0), _pbool(0), sub], children)
+
+    chart_dir = os.path.join(base, 'ChartOfAccounts', 'ПланСчетов1')
+    _json(os.path.join(chart_dir, 'ChartOfAccounts.json'), {
+        'name': 'ПланСчетов1', 'comment': '', 'obj_version': '803',
+        'header': [['1', ['0', '1', _flag_desc(FLAG_SUM_UUID, 'Суммовой'),
+                          _flag_desc(FLAG_CUR_UUID, 'Валютный'),
+                          _flag_desc(FLAG_QTY_UUID, 'Количественный')]]],
+    })
+    _json(os.path.join(chart_dir, 'ChartOfAccounts.id.json'), {'uuid': CHART_UUID})
+    _write(os.path.join(chart_dir, 'Предустановленные данные.bin'),
+           _pfile(chart_cols, [
+               account(0, ZERO_UUID, 'Счета', '', '', ['"U"'], [
+                   account(1, ACC_OS_UUID, 'ОсновныеСредства', '01',
+                           'Основные средства',
+                           _subconto((KIND_OS_UUID, 1, 0, 1)), [
+                       account(2, ACC_OS_ORG_UUID, 'ОСвОрганизации', '01.01',
+                               'Основные средства в организации',
+                               _subconto((KIND_OS_UUID, 1, 1, 1)))]),
+                   account(3, ACC_GOODS_UUID, 'Товары', '41', 'Товары',
+                           _subconto((KIND_GOODS_UUID, 1, 1, 1),
+                                     (KIND_OS_UUID, 0, 0, 0)))])]))
+
+    chx_cols = [_pcol(1, [['"#"', PREDEF_TYPE]]), _pcol(2, [['"B"']]),
+                _pcol(3, [['"S"']]), _pcol(4, [['"S"', '5', '1']]),
+                _pcol(5, [['"S"', '50', '1']])]
+    chx_dir = os.path.join(base, 'ChartOfCharacteristicType', 'ВидыСубконто')
+    _json(os.path.join(chx_dir, 'ChartOfCharacteristicType.json'), {
+        'name': 'ВидыСубконто', 'comment': '', 'obj_version': '803',
+        'header': [['1', ['0', '1']]],
+    })
+    _json(os.path.join(chx_dir, 'ChartOfCharacteristicType.id.json'), {'uuid': CHX_UUID})
+    _write(os.path.join(chx_dir, 'Предустановленные данные.bin'),
+           _pfile(chx_cols, [
+               _prow(0, [_puuid(ZERO_UUID), _pbool(1), _pstr('Характеристики'),
+                         _pstr('     '), _pstr('')], [
+                   _prow(1, [_puuid(KIND_OS_UUID), _pbool(0),
+                             _pstr('ОсновныеСредства'), _pstr('00001'),
+                             _pstr('Основные средства')]),
+                   _prow(2, [_puuid(KIND_GOODS_UUID), _pbool(0),
+                             _pstr('Номенклатура'), _pstr('00002'),
+                             _pstr('Номенклатура')])])],
+               pairs=[(0, '1'), (1, '2'), (2, '3'), (3, '4'), (4, '5')]))
+
+    # справочник без кода: строковых колонок две (имя и наименование) — так устроены
+    # Catalog/ДрайверыОборудования и Catalog/ВидыИспользованияРабочегоВремени в УНФ и БП
+    nocode_cols = [_pcol(0, [['"#"', PREDEF_TYPE]]), _pcol(1, [['"B"']]),
+                   _pcol(2, [['"#"', PREDEF_TYPE]]), _pcol(3, [['"S"']]),
+                   _pcol(4, [['"N"']]), _pcol(5, [['"S"', '100', '1']])]
+    nocode_dir = os.path.join(base, 'Catalog', 'ДрайверыОборудования')
+    _json(os.path.join(nocode_dir, 'Catalog.json'), {
+        'name': 'ДрайверыОборудования', 'comment': '', 'obj_version': '803',
+        'header': [['1', ['0', '1']]],
+    })
+    _json(os.path.join(nocode_dir, 'Catalog.id.json'), {'uuid': NOCODE_UUID})
+    _write(os.path.join(nocode_dir, 'Предустановленные данные.bin'),
+           _pfile(nocode_cols, [
+               _prow(0, [_puuid(ZERO_UUID), _pbool(1), _puuid(ZERO_UUID),
+                         _pstr('Элементы'), _pnum(0), _pstr('')], [
+                   _prow(1, [_puuid(DRIVER_UUID), _pbool(0), _puuid(ZERO_UUID),
+                             _pstr('ДрайверСканера'), _pnum(0),
+                             _pstr('Драйвер сканера')])])], tag='0'))
 
 
 def make_dump(base):
@@ -214,14 +413,18 @@ def make_dump(base):
     })
     _json(os.path.join(common_dir, 'CommonAttribute.id.json'), {'uuid': COMMON_UUID})
 
+    # предопределённые справочника: корневой узел «Элементы» (не элемент) и один
+    # элемент под ним; колонки 0 и 2 — ссылочные uuid, 3/4/5 — имя, код, наименование
+    cat_cols = [_pcol(0, [['"#"', PREDEF_TYPE]]), _pcol(1, [['"B"']]),
+                _pcol(2, [['"#"', PREDEF_TYPE]]), _pcol(3, [['"S"']]),
+                _pcol(4, [['"S"', '9', '1']]), _pcol(5, [['"S"', '150', '1']])]
     _write(os.path.join(cat_dir, 'Предустановленные данные.bin'),
-           '{0,\n{1,\n{6,\n{0,"",\n{"Pattern",\n{"S"}\n},"",0}\n},\n'
-           '{2,1,7,\n{"#",00000000-0000-0000-0000-000000000001,\n'
-           '{1,00000000-0000-0000-0000-000000000000}\n},\n{"B",0},\n'
-           '{"#",00000000-0000-0000-0000-000000000001,\n'
-           '{1,00000000-0000-0000-0000-000000000000}\n},\n'
-           '{"S","ПредЗначение"},\n{"S","001"},\n{"S","Предопределенное значение"},\n'
-           '{"N",0},0}\n}\n')
+           _pfile(cat_cols, [
+               _prow(0, [_puuid(ZERO_UUID), _pbool(1), _puuid(ZERO_UUID),
+                         _pstr('Элементы'), _pstr(''), _pstr('')], [
+                   _prow(1, [_puuid(PRE_ELEM_UUID), _pbool(0), _puuid(ZERO_UUID),
+                             _pstr('ПредЗначение'), _pstr('001'),
+                             _pstr('Предопределенное значение')])])], tag='0'))
 
     dt_dir = os.path.join(base, 'DefinedType', 'ТипТест')
     # запись header[0][1] определяемого типа: собственный ссылочный uuid + состав
@@ -330,7 +533,7 @@ def test_write_db(tmp_path):
     stats = write_db(dump, db_path, source_file='test.cf')
     assert stats == {'objects': 13, 'modules': 4, 'methods': 3, 'files': 9, 'files_content': 3,
                      'skd': 0, 'attributes': 15, 'refs': 10, 'enum_values': 2,
-                     'predefined': 1, 'common_targets': 1, 'tabular': 3,
+                     'predefined': 2, 'subconto': 0, 'common_targets': 1, 'tabular': 3,
                      'xdto_types': 3, 'xdto_properties': 5}
 
     conn = sqlite3.connect(db_path)
@@ -469,6 +672,11 @@ def test_write_db(tmp_path):
         " WHERE o.path='Enum/ТестПеречисление' ORDER BY e.ord")] == ['Значение1', 'Значение2']
     assert q("SELECT name, code, display FROM predefined WHERE name='ПредЗначение'"
              ).fetchone() == ('ПредЗначение', '001', 'Предопределенное значение')
+    # корневой узел «Элементы» элементом не является, но хранится: parent_ord NULL,
+    # а элемент ссылается на него и несёт свой uuid
+    assert [r for r in q(
+        'SELECT ord, parent_ord, uuid, name FROM predefined ORDER BY ord')] == [
+        (0, None, ZERO_UUID, 'Элементы'), (1, 0, PRE_ELEM_UUID, 'ПредЗначение')]
     assert [r[0] for r in q(
         'SELECT t.path FROM common_target ct JOIN meta_object t ON t.id=ct.target_id'
         ' JOIN meta_object c ON c.id=ct.common_id WHERE c.name=\'ОбщийТест\'')] == \
@@ -628,3 +836,61 @@ def test_build_fts_index_rejects_foreign_db(tmp_path):
         raise AssertionError('ожидалась ошибка: это не база знаний confdb')
     except ValueError:
         pass
+
+
+def test_predefined_chart_of_accounts_subconto(tmp_path):
+    """Счета плана: иерархия, uuid и виды субконто, разрешённые в элементы ПВХ."""
+    dump = str(tmp_path / 'dump')
+    make_dump(dump)
+    make_chart_dump(dump)
+    db_path = str(tmp_path / 'out.sqlite')
+    stats = write_db(dump, db_path, source_file='test.cf')
+    assert stats['subconto'] == 4
+
+    conn = sqlite3.connect(db_path)
+    q = conn.execute
+    # иерархия: ord — обход в глубину, parent_ord — ord родителя, у корня NULL
+    assert [r for r in q(
+        'SELECT p.ord, p.parent_ord, p.uuid, p.name, p.code, p.display'
+        ' FROM predefined p JOIN meta_object o ON o.id=p.object_id'
+        ' WHERE o.path=? ORDER BY p.ord', (CHART_PATH,))] == [
+        (0, None, ZERO_UUID, 'Счета', '', ''),
+        (1, 0, ACC_OS_UUID, 'ОсновныеСредства', '01', 'Основные средства'),
+        (2, 1, ACC_OS_ORG_UUID, 'ОСвОрганизации', '01.01',
+         'Основные средства в организации'),
+        (3, 0, ACC_GOODS_UUID, 'Товары', '41', 'Товары')]
+
+    # вид субконто — предопределённый элемент ПВХ: kind_id указывает на него, а флаги
+    # названы по-русски так, как их объявляет заголовок плана счетов
+    assert [r for r in q(
+        'SELECT a.code, s.ord, k.name, s.flags FROM predefined_subconto s'
+        ' JOIN predefined a ON a.id=s.predefined_id'
+        ' LEFT JOIN predefined k ON k.id=s.kind_id'
+        ' WHERE a.object_id=(SELECT id FROM meta_object WHERE path=?)'
+        ' ORDER BY a.ord, s.ord', (CHART_PATH,))] == [
+        ('01', 0, 'ОсновныеСредства', 'Суммовой;Количественный'),
+        ('01.01', 0, 'ОсновныеСредства', 'Суммовой;Валютный;Количественный'),
+        ('41', 0, 'Номенклатура', 'Суммовой;Валютный;Количественный'),
+        ('41', 1, 'ОсновныеСредства', None)]
+    # uuid вида сохранён и тогда, когда разрешение не нужно
+    assert q('SELECT s.uuid FROM predefined_subconto s'
+             ' JOIN predefined a ON a.id=s.predefined_id'
+             " WHERE a.code='01'").fetchone()[0] == KIND_OS_UUID
+
+    # у ПВХ номера колонок начинаются с 1 — имя/код/наименование всё равно на месте
+    assert [r for r in q(
+        'SELECT p.ord, p.parent_ord, p.name, p.code, p.display FROM predefined p'
+        ' JOIN meta_object o ON o.id=p.object_id WHERE o.path=? ORDER BY p.ord',
+        (CHX_PATH,))] == [
+        (0, None, 'Характеристики', '     ', ''),
+        (1, 0, 'ОсновныеСредства', '00001', 'Основные средства'),
+        (2, 0, 'Номенклатура', '00002', 'Номенклатура')]
+
+    # у справочника без кода строковых колонок две: код пуст, наименование на месте
+    assert [r for r in q(
+        'SELECT p.ord, p.parent_ord, p.uuid, p.name, p.code, p.display FROM predefined p'
+        ' JOIN meta_object o ON o.id=p.object_id WHERE o.path=? ORDER BY p.ord',
+        (NOCODE_PATH,))] == [
+        (0, None, ZERO_UUID, 'Элементы', '', ''),
+        (1, 0, DRIVER_UUID, 'ДрайверСканера', '', 'Драйвер сканера')]
+    conn.close()

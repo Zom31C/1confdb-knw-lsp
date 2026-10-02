@@ -213,6 +213,51 @@ def _exchange_plan_lines(uuids, known):
     return [f'Состав плана обмена ({total}): ' + (text or 'пуст')]
 
 
+def _predefined_lines(q, oid, rows, obj_type, limit=60):
+    """Дерево предопределённых элементов с видами субконто счёта.
+
+    rows — (ord, parent_ord, name, code, display) в порядке обхода в глубину.
+    Корневой узел («Счета», «Элементы») элементом не является: в паспорт он не
+    печатается, но остаётся в таблице строкой с parent_ord IS NULL.
+    """
+    subconto = {}
+    for owner, kind, flags in q(
+            "SELECT p.ord, COALESCE(NULLIF(k.display, ''), k.name, s.uuid), s.flags"
+            ' FROM predefined_subconto s'
+            ' JOIN predefined p ON p.id = s.predefined_id'
+            ' LEFT JOIN predefined k ON k.id = s.kind_id'
+            ' WHERE p.object_id = ? ORDER BY s.predefined_id, s.ord', (oid,)):
+        subconto.setdefault(owner, []).append(kind + (f' [{flags}]' if flags else ''))
+    children = {}
+    for ord_no, parent, name, code, display in rows:
+        children.setdefault(parent, []).append((ord_no, name, code, display))
+    total = sum(1 for row in rows if row[1] is not None)
+    noun = 'счета' if obj_type == 'ChartOfAccounts' else 'элементы'
+    lines = [f'Предопределённые {noun} ({total}):']
+    shown = 0
+
+    def walk(parent, depth):
+        nonlocal shown
+        for ord_no, name, code, display in children.get(parent, []):
+            if shown >= limit:
+                return
+            code = (code or '').strip()
+            label = name if not display or display == name else f'{name} — {display}'
+            lines.append('  ' * (depth + 1) + (f'{code} {label}' if code else label))
+            kinds = subconto.get(ord_no)
+            if kinds:
+                lines.append('  ' * (depth + 2) + 'субконто: ' + '; '.join(kinds))
+            shown += 1
+            walk(ord_no, depth + 1)
+
+    for row in rows:
+        if row[1] is None:
+            walk(row[0], 0)
+    if total > shown:
+        lines.append(f'  … и ещё {total - shown} (таблица predefined)')
+    return lines
+
+
 def ru_text(text):
     """Внутренние слэш-пути 'Catalog/Х' -> 'Справочник.Х' в произвольном тексте.
 
@@ -350,7 +395,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 - attribute_ref(attribute_id, ord, uuid, object_id) — which metadata objects a field's type references (one row per member; NULL object = a generic platform type, whose uuid matches no object of this configuration). Use for joins and impact analysis ('who references X').
 - xdto_type(object_id, ord, name, kind, base, base_ns, facets, enum_values) — the types an XDTO package declares: kind is objectType, valueType (a simple/enumeration type) or typeDef (an anonymous type nested in a property); base/base_ns name the base type and the namespace it comes from; facets holds the remaining XML attributes as 'name=value; …' (maxLength, totalDigits, localName…); enum_values lists the allowed values of an enumeration type. xdto_property(type_id, object_id, ord, name, type, type_ns, lower_bound, upper_bound, nillable, form, extra, nested_type_id) — properties: lower_bound=1 = obligatory, upper_bound=-1 = a list, form = Attribute|Element, nested_type_id → an anonymous nested type, extra = the remaining attributes; type_id NULL = a property declared by the package itself, outside any type. xdto_import(object_id, ord, namespace) — the namespaces the package imports. Prefer xdto_of/find_xdto over querying these directly.
 - skd_query(object_id, ord, query) — report queries in the 1C query language (Russian keywords ВЫБРАТЬ/ИЗ/ГДЕ/СОЕДИНЕНИЕ/ОБЪЕДИНИТЬ).
-- enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, name, code, display) — predefined elements; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source, file.
+- enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, parent_ord, uuid, name, code, display) — predefined elements (catalog items, chart-of-accounts accounts, characteristic-chart values) in depth-first order: parent_ord is the ord of the parent, and NULL only for the root node ('Счета'/'Элементы'), which is not an element; uuid identifies the element and is what a subconto kind points at; predefined_subconto(predefined_id, ord, uuid, kind_id, flags) — the subconto kinds of a predefined account: kind_id → the predefined element of the characteristic chart that names the kind, flags = 'Суммовой;Валютный;Количественный'; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source, file.
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
@@ -688,6 +733,10 @@ class McpServer:
                 out.append(f'Табличная часть {sec}: полей не объявлено')
             else:
                 out.append(f'Табличная часть {sec}: полей не извлечено')
+        predef = q('SELECT ord, parent_ord, name, code, display FROM predefined '
+                   'WHERE object_id=? ORDER BY ord', (oid,)).fetchall()
+        if predef:
+            out.extend(_predefined_lines(q, oid, predef, row[0]))
         subs = self.event_index(db)['by_source'].get(path)
         if subs:
             # платформа вызывает эти обработчики сама: в коде объекта
@@ -708,16 +757,6 @@ class McpServer:
                 extra = f' (всего {cnt})' if cnt > len(vals) else ''
                 out.append('Значения перечисления' + extra + ': ' +
                            ', '.join(vals))
-        elif row[0] == 'Catalog':
-            pre = q('SELECT name, code FROM predefined WHERE object_id=? '
-                    'ORDER BY ord LIMIT 60', (oid,)).fetchall()
-            cnt = q('SELECT COUNT(*) FROM predefined WHERE object_id=?',
-                    (oid,)).fetchone()[0]
-            if pre:
-                extra = f' (всего {cnt})' if cnt > len(pre) else ''
-                out.append('Предопределённые элементы' + extra + ': ' +
-                           ', '.join(n + (f' [{c}]' if c else '')
-                                     for n, c in pre))
         out.extend(self._children_lines(q, oid))
         nskd = q('SELECT COUNT(*) FROM skd_query WHERE object_id=?',
                  (oid,)).fetchone()[0]
