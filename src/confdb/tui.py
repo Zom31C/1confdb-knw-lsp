@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
 from . import __version__
 from .config import bench_workers
@@ -187,6 +188,7 @@ class Tui:
         self.keep_temp = bool(opts.get('keep_temp'))
         self.store_blobs = bool(opts.get('store_blobs'))
         self.skip_errors = bool(opts.get('skip_errors'))
+        self.build_fts = bool(opts.get('build_fts', True))
         self.workers = int(opts.get('workers') or bench_workers() or 1)
         self.groups = load_groups(config)
 
@@ -204,6 +206,7 @@ class Tui:
                 'src': self.src, 'db': self.db, 'dump': self.dump, 'temp': self.temp,
                 'prefix': self.prefix, 'keep_temp': self.keep_temp,
                 'store_blobs': self.store_blobs, 'skip_errors': self.skip_errors,
+                'build_fts': self.build_fts,
                 'workers': self.workers,
             },
         })
@@ -405,6 +408,7 @@ class Tui:
                 keep_temp=self.keep_temp,
                 options=options,
                 workers=self.workers,
+                build_fts=self.build_fts,
             )
         except Exception as err:
             print(f'Ошибка извлечения: {err}')
@@ -418,8 +422,25 @@ class Tui:
         self._save()
         print(f'Готово за {stats["elapsed"]}. '
               f'Объектов/модулей/файлов: {stats.get("db_rows", "дамп без БД")}')
+        if stats.get('db') and not self.build_fts and _yes_no(
+                'Индекс не строился. Построить FTS-индекс по телам методов сейчас?', False):
+            self._build_fts(stats['db'])
         if self.last_db and _yes_no('Открыть запросы к полученной базе?', True):
             self._query_menu(self.last_db)
+        input('Нажмите Enter…')
+
+    def _build_fts(self, db_path):
+        """Достраивает FTS-индекс в готовой базе (то же, что `confdb fts <база>`)."""
+        from .db.writer import build_fts_index
+        print(f'Строим FTS-индекс в {db_path}…')
+        begin = time.time()
+        try:
+            methods = build_fts_index(db_path)
+        except Exception as err:
+            print(f'Ошибка построения индекса: {err}')
+            input('Нажмите Enter…')
+            return
+        print(f'Готово: {methods} методов за {time.time() - begin:.1f} с')
         input('Нажмите Enter…')
 
     # ---------- опции ----------
@@ -435,7 +456,9 @@ class Tui:
             print(f' 5. Хранить бинарники (BLOB):  {"да" if self.store_blobs else "нет"}')
             print(f' 6. Пропускать ошибки объектов (--skip-errors): '
                   f'{"да" if self.skip_errors else "нет"}')
-            print(' 7. Бенчмарк: подобрать число процессов под железо')
+            print(f' 7. Строить FTS-индекс по телам методов: '
+                  f'{"да" if self.build_fts else "нет (можно достроить позже)"}')
+            print(' 8. Бенчмарк: подобрать число процессов под железо')
             print(' 0. Назад')
             choice = input('Выбор: ').strip()
             if choice == '0':
@@ -461,6 +484,12 @@ class Tui:
                     'Пропускать объекты с ошибками декодирования (дамп/база будут неполными)?',
                     self.skip_errors)
             elif choice == '7':
+                self.build_fts = _yes_no(
+                    'Строить FTS-индекс по телам методов при записи базы? '
+                    '(половина времени записи; без него поиск по телам идёт полным '
+                    'проходом, индекс достраивается после извлечения)',
+                    self.build_fts)
+            elif choice == '8':
                 self._run_bench()
             else:
                 print('Неизвестный пункт меню.')
