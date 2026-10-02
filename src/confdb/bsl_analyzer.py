@@ -84,6 +84,14 @@ RE_STRUCTURE = re.compile(r'Нов(?:ый|ая)\s+Структура\s*\(\s*"([^
 RE_NEW_TABLE = re.compile(r'Нов(?:ый|ая)\s+(?:Фиксированная)?ТаблицаЗначений',
                           re.IGNORECASE)
 RE_QUERY_RESULT = re.compile(r'Выполнить\s*\(\s*\)\s*\.\s*Выгрузить', re.IGNORECASE)
+# Динамические вызовы: Вычислить("ИмяМетода") или Выполнить("Код")
+# Ищем имя функции и позицию, чтобы потом найти строковый литерал-аргумент
+RE_DYNAMIC_CALL = re.compile(
+    r'(?<![\w.])(Вычислить|Выполнить)\s*\(', re.IGNORECASE)
+# Строковый литерал, похожий на идентификатор: буквы/цифры/подчёркивания/точки
+# Например: "МойМетод", "ОбщийМодуль.Функция", "Справочники.Номенклатура"
+RE_IDENTIFIER_LITERAL = re.compile(
+    r'^[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*(?:\.[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё_0-9]*)*$')
 
 # Слова языка, которые регулярное выражение вызова принимает за имя метода.
 # Синтаксис текста модулей здесь НЕ проверяется: его разбирает BSL Language
@@ -416,21 +424,22 @@ def analyze(text, ctx=None, params=(), caller_context=None, self_name=None):
     :param caller_context: 'client' | 'server' | None — контекст вызывающего кода
     :param self_name: имя разбираемого метода (его объявление — не вызов)
     """
-    masked, _ = scan(text)
+    masked, literals = scan(text)
     lines = LineIndex(text)
     known = local_names(masked, params)
     if self_name:
         known.add(str(self_name).lower())
     known |= {m.group(1).lower() for m in RE_DECL.finditer(masked)}
     report = {
-        'modules': [],      # (модуль, метод, строка, состояние)
-        'metadata': [],     # (менеджер, имя, строка, путь или None)
-        'queries': [],      # (строка, текст, полный, ошибки, непроверенные)
-        'tables': [],       # таблицы запросов
-        'fields': [],       # поля запросов
-        'unknown': [],      # (левая часть, метод, строка)
-        'plain_calls': [],  # одиночные вызовы (локальные/глобальные)
+        'modules': [],        # (модуль, метод, строка, состояние)
+        'metadata': [],       # (менеджер, имя, строка, путь или None)
+        'queries': [],        # (строка, текст, полный, ошибки, непроверенные)
+        'tables': [],         # таблицы запросов
+        'fields': [],         # поля запросов
+        'unknown': [],        # (левая часть, метод, строка)
+        'plain_calls': [],    # одиночные вызовы (локальные/глобальные)
         'context_warnings': [],
+        'dynamic_calls': [],  # (строка, функция, литерал, разрешение)
     }
 
     # цепочка 'Справочники.Объект.Метод(' — вызов метода менеджера, а не
@@ -490,7 +499,72 @@ def analyze(text, ctx=None, params=(), caller_context=None, self_name=None):
             tables, fields = query_refs(query)
             report['tables'].extend(t for t in tables if t not in report['tables'])
             report['fields'].extend(f for f in fields if f not in report['fields'])
+
+    # Динамические вызовы: Вычислить("Имя") и Выполнить("Код")
+    # Ищем вызовы в masked и сопоставляем с литералами по позиции
+    seen_dynamic = set()
+    for m in RE_DYNAMIC_CALL.finditer(masked):
+        func_name = m.group(1)
+        after_paren = m.end()
+        # Ищем литерал, начинающийся сразу после '(' (с возможным пробелом)
+        for lit_start, lit_end, lit_value in literals:
+            # Пропускаем пробелы между '(' и началом литерала
+            gap = masked[after_paren:lit_start]
+            if gap.strip():
+                continue  # между '(' и литералом есть не-пробелы
+            if lit_start < after_paren:
+                continue  # литерал начинается до скобки
+            # Нашли ближайший литерал после '('
+            if not RE_IDENTIFIER_LITERAL.match(lit_value):
+                break  # литерал не похож на идентификатор — пропускаем
+            key = (func_name.lower(), lit_value)
+            if key in seen_dynamic:
+                break
+            seen_dynamic.add(key)
+            line = lines(m.start())
+            resolution = _resolve_dynamic_literal(ctx, lit_value)
+            report['dynamic_calls'].append(
+                (line, func_name, lit_value, resolution))
+            break
+
     return report
+
+
+def _resolve_dynamic_literal(ctx, literal):
+    """Попытка разрешить строковый литерал как имя метода/модуля/объекта.
+
+    Возвращает человекочитаемую строку с результатом разрешения или
+    'не разрешено', если ничего подходящего не найдено.
+    """
+    if ctx is None:
+        return 'не проверено (контекст базы недоступен)'
+    parts = literal.split('.')
+    if len(parts) == 2:
+        left, right = parts
+        # 'Справочники.Номенклатура' — обращение к объекту через менеджер
+        if left.lower() in BSL_MANAGERS:
+            path = ctx.resolve_manager(left, right)
+            if path:
+                return f'объект метаданных: {path}'
+            return 'объект не найден в базе'
+        # 'ОбщийМодуль.Метод' — вызов метода общего модуля
+        module = ctx.common_module(left)
+        if module is not None:
+            method = ctx.common_method(module['name'], right)
+            if method is None:
+                return f'метод не найден в модуле {module["path"]}'
+            if not method[0]:
+                return f'метод {module["path"]} не Экспорт'
+            return f'метод общего модуля: {module["path"]}.{right} — ok'
+        return 'не разрешено'
+    if len(parts) == 1:
+        name = parts[0]
+        # Имя общего модуля
+        module = ctx.common_module(name)
+        if module is not None:
+            return f'общий модуль: {module["path"]}'
+        return 'не разрешено'
+    return 'не разрешено'
 
 
 def _check_common_method(ctx, module, method_name, caller_context, report):

@@ -1,6 +1,9 @@
-"""Тесты типа загруженного файла и формулировок режима совместимости."""
+"""Тесты типа загруженного файла, режима совместимости и подписок на события."""
+import json
+
 from confdb.header_props import (compatibility_line, compatibility_short,
-                                 kind_of, source_ext, version_noun)
+                                 event_name, event_subscription, kind_of,
+                                 self_ref_uuid, source_ext, version_noun)
 
 
 def test_source_ext():
@@ -60,3 +63,46 @@ def test_compatibility_of_processor_and_report_is_absent():
     for root in ('ExternalDataProcessor', 'ExternalReport'):
         assert compatibility_line(root, None) == 'не задаётся'
         assert compatibility_short(root, None) is None
+
+
+def test_event_subscription_props():
+    handler = 'bc07f408-470d-4021-9545-f072accda37a'
+    src1, src2 = ('aaaaaaaa-0000-0000-0000-000000000001',
+                  'bbbbbbbb-0000-0000-0000-000000000002')
+    header = json.dumps({'header': [['1', [
+        '1', ['3', ['1', '0', 'в отдельном файле'], '"ПодпискаТест"'],
+        ['"Pattern"', ['"#"', src1], ['"#"', src2]],
+        '"BeforeWrite_ПередЗаписью"', handler, '"ПриЗаписиДокумента"'],
+        '0']]}, ensure_ascii=False)
+    assert event_subscription('EventSubscription', header) == {
+        'event': 'ПередЗаписью',
+        'handler_uuid': handler, 'handler_method': 'ПриЗаписиДокумента',
+        'sources': [src1, src2]}
+    # не подписка и не заголовок вовсе — пустой словарь, а не исключение
+    assert event_subscription('Catalog', header) == {}
+    assert event_subscription('EventSubscription', 'не json') == {}
+    assert event_subscription('EventSubscription', None) == {}
+    assert event_subscription('EventSubscription',
+                              json.dumps({'header': [['1', ['1']]]})) == {}
+
+
+def test_event_name():
+    # наружу — только русское имя события, как в конфигураторе
+    assert event_name('"BeforeWrite_ПередЗаписью"') == 'ПередЗаписью'
+    assert event_name('"Filling_ОбработкаЗаполнения"') == 'ОбработкаЗаполнения'
+    # строка без английской части возвращается как есть
+    assert event_name('"ПередЗаписью"') == 'ПередЗаписью'
+    assert event_name(None) is None
+
+
+def test_self_ref_uuid_positions():
+    ref = 'aaaaaaaa-0000-0000-0000-000000000001'
+    # справочник/документ/регистр: свой «источниковый» uuid в header[0][1][1]
+    assert self_ref_uuid(json.dumps({'header': [['1', ['56', ref, 'x']]]})) == ref
+    # константа: позиция [1] занята записью типа, uuid сдвинут в [4]
+    constant = {'header': [['1', ['16', ['27', 'тип'], 'u2', 'u3', ref]]]}
+    assert self_ref_uuid(json.dumps(constant)) == ref
+    # у общего модуля и прочих такого uuid нет: None, а не выдуманное значение
+    assert self_ref_uuid(json.dumps({'header': [['1', ['81', '0', '1']]]})) is None
+    assert self_ref_uuid('не json') is None
+    assert self_ref_uuid(None) is None

@@ -45,7 +45,7 @@ from urllib.parse import parse_qs, quote as urllib_quote, urlparse
 from . import compare
 from . import header_props
 from .config import load_config, save_config
-from .db.writer import FTS_TABLE, TYPE_RU
+from .db.writer import FTS_TABLE, TYPE_RU, tabular_field_counts
 
 PROTOCOL_VERSION = '2024-11-05'
 
@@ -102,6 +102,115 @@ _PERIODICITY = header_props.PERIODICITY
 def _register_card_info(obj_type, header_json):
     """Свойства регистра из header_json: периодичность, режим записи."""
     return header_props.register_props(obj_type, header_json)
+
+
+def _build_event_index(conn):
+    """Подписки на события одной базы: by_path, by_source, by_handler.
+
+    Ключ by_handler — (путь общего модуля, имя метода в нижнем регистре): по
+    нему get_method отвечает, что метод вызывается ещё и подпиской, которую
+    лексический анализ кода не видит.
+    """
+    q = conn.execute
+    index = {'by_path': {}, 'by_source': {}, 'by_handler': {}}
+    if not q("SELECT 1 FROM meta_object WHERE type='EventSubscription'"
+             ' LIMIT 1').fetchone():
+        return index
+    refs, by_uuid = {}, {}
+    for path, uuid, header in q('SELECT path, uuid, header_json FROM meta_object'):
+        if uuid:
+            by_uuid.setdefault(uuid, path)
+        ref = header_props.self_ref_uuid(header)
+        if ref:
+            refs.setdefault(ref, path)
+    for path, header in q("SELECT path, header_json FROM meta_object"
+                          " WHERE type='EventSubscription' ORDER BY ord, path"):
+        props = header_props.event_subscription('EventSubscription', header)
+        if not props:
+            continue
+        sources = [refs[u] for u in props['sources'] if u in refs]
+        entry = dict(props, path=path, sources=sources,
+                     handler=by_uuid.get(props['handler_uuid'] or ''),
+                     unresolved=len(props['sources']) - len(sources))
+        index['by_path'][path] = entry
+        for src in sources:
+            index['by_source'].setdefault(src, []).append(entry)
+        if entry['handler'] and entry['handler_method']:
+            key = (entry['handler'], entry['handler_method'].lower())
+            index['by_handler'].setdefault(key, []).append(entry)
+    return index
+
+
+def _handler_name(entry):
+    """«Общий модуль.Имя.Метод» — обработчик подписки, или почему его нет."""
+    if entry['handler'] and entry['handler_method']:
+        return f'{ru_path(entry["handler"])}.{entry["handler_method"]}'
+    if entry['handler']:
+        return f'{ru_path(entry["handler"])} (имя метода не извлечено)'
+    return 'общий модуль не найден в базе'
+
+
+def _subscription_lines(entry, method_found=True):
+    """Строки подписки для паспорта: событие, обработчик, источники."""
+    handler = _handler_name(entry)
+    if entry['handler'] and entry['handler_method'] and not method_found:
+        # подписка объявлена, а метода в модуле нет: правило не работает,
+        # и это важнее, чем его отсутствие в списке вызовов
+        handler += ' (метод не найден в модуле)'
+    total = len(entry['sources']) + entry['unresolved']
+    shown = entry['sources'][:8]
+    text = ', '.join(ru_path(s) for s in shown)
+    if len(entry['sources']) > len(shown):
+        text += f', … ещё {len(entry["sources"]) - len(shown)}'
+    if entry['unresolved']:
+        text = ((text + '; ') if text else '') + \
+            f'{entry["unresolved"]} из {total} не распознано'
+    return [f'Событие: {entry["event"]}', f'Обработчик: {handler}',
+            f'Источники ({total}): ' + (text or 'не указаны')]
+
+
+def _source_subscriptions_line(entries):
+    """Строка «Подписки на события» в паспорте объекта-источника."""
+    parts = [f'{e["event"]} → {_handler_name(e)}' for e in entries[:6]]
+    if len(entries) > 6:
+        parts.append(f'… ещё {len(entries) - 6}')
+    return 'Подписки на события: ' + '; '.join(parts)
+
+
+def _method_subscriptions_line(entries, limit=6):
+    """Строка «вызывается подписками на события» в ответе get_method."""
+    parts = [f'{e["event"]} — {ru_path(e["path"])} '
+             f'(источников: {len(e["sources"]) + e["unresolved"]})'
+             for e in entries[:limit]]
+    if len(entries) > limit:
+        parts.append(f'… ещё {len(entries) - limit}')
+    return 'вызывается подписками на события: ' + '; '.join(parts)
+
+
+def _exchange_plan_lines(uuids, known):
+    """Строка состава плана обмена: какие объекты он синхронизирует."""
+    total = len(uuids)
+    groups = {}
+    missing = 0
+    for u in uuids:
+        hit = known.get(u)
+        if hit is None:
+            missing += 1
+        else:
+            groups.setdefault(hit[1], []).append(hit[0])
+    ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    if total <= 12:
+        text = ', '.join(ru_path(p) for _, paths in ordered for p in paths)
+    else:
+        # состав бывает на тысячи объектов (у плана ОбновлениеИнформационнойБазы
+        # УНФ их 1889): перечень имён утопил бы паспорт, поэтому крупные планы
+        # показываются разбивкой по типам
+        text = ', '.join(f'{TYPE_RU.get(t, t)} {len(paths)}'
+                         for t, paths in ordered)
+    if missing:
+        text = ((text + '; ') if text else '') + \
+            f'{missing} из {total} не найдено в базе'
+    return [f'Состав плана обмена ({total}): ' + (text or 'пуст')]
 
 
 def ru_text(text):
@@ -245,7 +354,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
-RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections and references; 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns.
+RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns.
 
 SYNTAX CHECKING: this variant DOES check 1C code syntax — the BSL Language Server reports diagnostics through the bsl_* tools (bsl_analyze_file and the rest listed below), so run it over a module before handing code to the user. Those tools are present only when the language-server workspace is up: if they are missing from the tool list, the jar/workspace is not running. The confdb tools themselves never check syntax.
 
@@ -495,6 +604,20 @@ class McpServer:
             return 'ничего не найдено'
         return '\n'.join(f'{ru_path(p)} — {ru} ({t})' for p, t, ru, _ in rows)
 
+    def _subscription_card(self, q, path, db=None):
+        """Строки подписки на событие; [] — заголовок не распознан."""
+        entry = self.event_index(db)['by_path'].get(path)
+        if not entry:
+            return []
+        found = 0
+        if entry['handler'] and entry['handler_method']:
+            found = q('SELECT COUNT(*) FROM method mt '
+                      'JOIN module m ON m.id=mt.module_id '
+                      'JOIN meta_object o ON o.id=m.object_id '
+                      'WHERE o.path=? AND LOWER(mt.name)=LOWER(?)',
+                      (entry['handler'], entry['handler_method'])).fetchone()[0]
+        return _subscription_lines(entry, bool(found))
+
     def object_card(self, path, db=None):
         path = self.resolve_path(path, db)
         q = self.conn(db).execute
@@ -503,12 +626,23 @@ class McpServer:
         if not row:
             return f'объект не найден: {path}'
         oid = q('SELECT id FROM meta_object WHERE path=?', (path,)).fetchone()[0]
-        out = [f'{ru_path(path)} — {row[1]} ({row[0]}), имя {row[2]}' +
+        # тип — русским именем, как в конфигураторе: английский stem остаётся
+        # в колонке type и в списках find_objects, но не в паспорте. TYPE_RU
+        # важнее сохранённого type_ru — в базах, собранных до исправления ключа
+        # ChartOfCharacteristicType, в type_ru лежит английский stem
+        kind = TYPE_RU.get(row[0]) or row[1] or row[0]
+        out = [f'{ru_path(path)} — {kind}, имя {row[2]}' +
                (f'; комментарий: {row[3]}' if row[3] else '')]
         # свойства регистра (периодичность, режим записи)
         out.extend(_register_card_info(row[0], row[4]))
         # целевое пространство имён пакета XDTO
         out.extend(header_props.xdto_props(row[0], row[4]))
+        if row[0] == 'EventSubscription':
+            out.extend(self._subscription_card(q, path, db))
+        if row[0] == 'ExchangePlan':
+            uuids = header_props.exchange_plan_content(row[0], row[4])
+            if uuids:
+                out.extend(_exchange_plan_lines(uuids, self.uuid_map(db)))
         attrs = q('SELECT name, type_str FROM meta_attribute '
                   'WHERE object_id=? AND tabular IS NULL ORDER BY ord',
                   (oid,)).fetchall()
@@ -542,9 +676,23 @@ class McpServer:
             if fname is not None:
                 sections[sec].append(
                     f'{fname}: {ru_type_str(ftype) or "тип не извлечён"}')
+        # сколько полей объявляет сама конфигурация — без этого пустую секцию
+        # не отличить от пробела извлечения
+        declared = tabular_field_counts(row[4])
         for sec, fields in sections.items():
-            out.append(f'Табличная часть {sec}: '
-                       + ('; '.join(fields) if fields else 'полей не извлечено'))
+            if fields:
+                out.append(f'Табличная часть {sec}: ' + '; '.join(fields))
+            elif declared.get(sec) == 0:
+                # в конфигурации у секции не объявлено ни одного поля: это факт,
+                # а не пробел извлечения
+                out.append(f'Табличная часть {sec}: полей не объявлено')
+            else:
+                out.append(f'Табличная часть {sec}: полей не извлечено')
+        subs = self.event_index(db)['by_source'].get(path)
+        if subs:
+            # платформа вызывает эти обработчики сама: в коде объекта
+            # таких вызовов нет, и без этой строки их не найти
+            out.append(_source_subscriptions_line(subs))
         mods = q('SELECT code_name, context FROM module WHERE object_id=?',
                  (oid,)).fetchall()
         if mods:
@@ -867,6 +1015,35 @@ class McpServer:
             info['bsl'] = BslContext(info['conn'])
         return info['bsl']
 
+    def event_index(self, db=None):
+        """Подписки на события базы (кэш): по пути, по источнику, по обработчику.
+
+        Источник подписки хранится в заголовке «источниковым» uuid объекта
+        (header_props.self_ref_uuid), а обработчик — обычным meta_object.uuid
+        общего модуля, поэтому карта uuid -> путь строится обходом
+        meta_object.header_json. На УНФ это 1.1 с на 23513 объектов: обход
+        делается один раз на базу и только если подписки в ней вообще есть.
+        """
+        alias = self._alias(db)
+        info = self.dbs[alias]
+        if info.get('events') is None:
+            info['events'] = _build_event_index(info['conn'])
+        return info['events']
+
+    def uuid_map(self, db=None):
+        """{meta_object.uuid: (путь, тип)} одной базы (кэш).
+
+        Состав плана обмена перечисляет объекты их обычными uuid — их ещё надо
+        превратить в пути; на УНФ это 23513 строк одним запросом.
+        """
+        alias = self._alias(db)
+        info = self.dbs[alias]
+        if info.get('uuids') is None:
+            info['uuids'] = {u: (p, t) for p, t, u in info['conn'].execute(
+                'SELECT path, type, uuid FROM meta_object'
+                ' WHERE uuid IS NOT NULL')}
+        return info['uuids']
+
     def other_aliases(self, db=None):
         """Алиасы остальных открытых баз, кроме указанной/активной.
 
@@ -913,6 +1090,12 @@ class McpServer:
             parts.append('директивы: ' + row[3])
         if row[4]:
             parts.append('описание:\n' + row[4])
+        subs = self.event_index(db)['by_handler'].get(
+            (self.resolve_path(path, db), str(name).lower()))
+        if subs:
+            # обработчик подписки вызывает платформа: в коде конфигурации
+            # вызова нет, и лексический анализ его не показывает
+            parts.append(_method_subscriptions_line(subs))
         body = row[5] or ''
         total = body.count('\n') + 1
         parts.append(_paginate_lines(body, int(offset or 0), int(limit or 0),
@@ -1061,6 +1244,11 @@ class McpServer:
             out.append('\nВызовы без точки (методы этого модуля или глобальные '
                        'методы платформы — не проверялись): '
                        + ', '.join(report['plain_calls'][:25]))
+        if report['dynamic_calls']:
+            out.append('\nДинамические вызовы (строковые литералы как имена):')
+            for line, func, literal, resolution in report['dynamic_calls']:
+                out.append(f'  строка {start + line - 1}: '
+                           f'{func}("{literal}") — {resolution}')
         return '\n'.join(out)
 
     def method_result_schema(self, path, code_name, name, db=None):
@@ -1113,9 +1301,11 @@ class McpServer:
                 "OR lower_ru(REPLACE(mt.name, ' ', '')) LIKE ?)")
         params = [like, like, like, like_ns]
         conn = self.conn(db)
-        fts = self.dbs[self._alias(db)].get('fts')
+        db_info = self.dbs[self._alias(db)]
+        fts = db_info.get('fts')
+        use_fts = bool(fts) and text and len(text) >= 3
         if text:
-            if fts and len(text) >= 3:
+            if use_fts:
                 # FTS5 trigram индекс — быстрый поиск подстроки
                 # Оборачиваем в кавычки для экранирования специальных символов
                 cond += f' AND mt.id IN (SELECT rowid FROM {fts} WHERE {fts} MATCH ?)'
@@ -1529,9 +1719,12 @@ TOOLS = [
          McpServer.find_objects),
     Tool('object_card',
          "Full 'passport' of one object in a single call: type, header "
-         'attributes with types, tabular sections with their fields, modules, '
-         'SKD query count, forward/reverse references. Use right after '
-         'find_objects.',
+         'attributes with types, tabular sections with their fields, the event '
+         'subscriptions the platform fires on this object, modules, '
+         'SKD query count, forward/reverse references. For an '
+         'EventSubscription: its event, handler module.method and source '
+         'objects; for an ExchangePlan: the objects it synchronizes. '
+         'Use right after find_objects.',
          _schema({'path': _STR, 'db': _DB}, ('path',)),
          McpServer.object_card),
     Tool('object_tree',
@@ -1562,8 +1755,10 @@ TOOLS = [
          McpServer.module_outline),
     Tool('get_method',
          'Full source of one procedure/function: signature, directives '
-         '(&НаСервере…), description comment and body. Use after '
-         'find_methods/module_outline. Path forms are also accepted: '
+         '(&НаСервере…), description comment and body. If the method is an '
+         'event-subscription handler, the answer names the subscriptions that '
+         'call it — the platform calls those, so no call site exists in code. '
+         'Use after find_methods/module_outline. Path forms are also accepted: '
          'Документ.Х.mgr, Документ.Х.obj.bsl, Document/Х/Document.mgr.bsl. '
          'Long methods are paginated: the '
          'response shows which lines are given and how to fetch the rest '

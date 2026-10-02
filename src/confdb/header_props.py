@@ -349,3 +349,124 @@ def _config_props_node(data):
     if not isinstance(node, list) or len(node) <= CFG_NAME_PREFIX:
         return None
     return node
+
+
+# Подписка на событие: header[0][1] = ['1', CORE, ИСТОЧНИКИ, СОБЫТИЕ,
+# UUID_ОБРАБОТЧИКА, ИМЯ_МЕТОДА]. Состав и позиции одинаковы у всех 406 подписок
+# УНФ; событие — строка '"BeforeWrite_ПередЗаписью"', обработчик — uuid общего
+# модуля и имя процедуры в нём.
+ES_SOURCES = 2
+ES_EVENT = 3
+ES_HANDLER = 4
+ES_METHOD = 5
+ES_LEN = 6
+
+# «Источниковый» uuid объекта — тот, которым на него ссылаются подписки на
+# события. Это НЕ meta_object.uuid (из .id.json) и НЕ ключ таблицы .10: ни там,
+# ни там этих uuid нет. У справочника/документа/регистра/перечисления он лежит
+# в header[0][1][1], у константы — в header[0][1][4] (позиция [1] занята
+# записью типа ['27', …]).
+SELF_REF_POSITIONS = (1, 4)
+
+
+def is_uuid(value):
+    """Похоже ли значение на uuid: 36 знаков, четыре дефиса."""
+    return (isinstance(value, str) and len(value) == 36
+            and value.count('-') == 4)
+
+
+def self_ref_uuid(header_json):
+    """«Источниковый» uuid объекта или None — в заголовке его нет.
+
+    По нему подписка на событие ссылается на свой источник, поэтому карта
+    uuid -> путь строится обходом meta_object.header_json готовой базы.
+    """
+    data = _load(header_json)
+    if not isinstance(data, dict):
+        return None
+    try:
+        inner = data['header'][0][1]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(inner, list):
+        return None
+    for pos in SELF_REF_POSITIONS:
+        if len(inner) > pos and is_uuid(inner[pos]):
+            return inner[pos]
+    return None
+
+
+def event_name(raw):
+    """'"BeforeWrite_ПередЗаписью"' -> 'ПередЗаписью' — как в конфигураторе.
+
+    Платформа хранит строку события двумя частями через '_'; наружу идёт только
+    русская: английская — внутреннее имя платформы, в конфигураторе его нет.
+    """
+    text = unquote(raw or '')
+    if not text:
+        return None
+    _en, sep, ru = text.partition('_')
+    return ru if sep and ru else text
+
+
+def event_subscription(obj_type, header_json):
+    """Свойства подписки на событие; {} — не подписка или другой формат.
+
+    Ключи: event, handler_uuid, handler_method, sources (список «источниковых»
+    uuid в порядке объявления). Пути объектов по uuid определяет вызывающий
+    код: в самом заголовке их нет.
+    """
+    if obj_type != 'EventSubscription':
+        return {}
+    data = _load(header_json)
+    if not isinstance(data, dict):
+        return {}
+    try:
+        inner = data['header'][0][1]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    if not isinstance(inner, list) or len(inner) < ES_LEN:
+        return {}
+    sources = inner[ES_SOURCES]
+    if (not isinstance(sources, list) or not sources
+            or unquote(sources[0]) != 'Pattern'):
+        return {}
+    event = event_name(inner[ES_EVENT])
+    if not event:
+        return {}
+    handler = inner[ES_HANDLER]
+    method = unquote(inner[ES_METHOD])
+    return {
+        'event': event,
+        'handler_uuid': handler if is_uuid(handler) else None,
+        'handler_method': method or None,
+        'sources': [item[1] for item in sources[1:]
+                    if isinstance(item, list) and len(item) > 1
+                    and is_uuid(item[1])],
+    }
+
+
+# План обмена: поток .1 декодер кладёт в data['info'] — плоский список
+# ['2', КОЛИЧЕСТВО, uuid, флаг, uuid, флаг, …], у всех 27 планов УНФ он
+# обёрнут в один дополнительный список. Это состав плана: uuid разрешаются
+# обычным meta_object.uuid (9162 из 9163 записей), счётчик равен числу пар.
+# Флаг у 109 записей из 9163 равен 1, смысл его не подтверждён — поэтому
+# наружу выдаётся только состав, без флага.
+EP_FIRST = 2
+
+
+def exchange_plan_content(obj_type, header_json):
+    """uuid объектов состава плана обмена; [] — не план или состава нет."""
+    if obj_type != 'ExchangePlan':
+        return []
+    data = _load(header_json)
+    if not isinstance(data, dict):
+        return []
+    info = data.get('info')
+    while isinstance(info, list) and len(info) == 1 and isinstance(info[0], list):
+        info = info[0]
+    if not isinstance(info, list) or len(info) <= EP_FIRST:
+        return []
+    # шаг 2: записи идут парами (uuid, флаг), последний элемент — флаг
+    return [info[i] for i in range(EP_FIRST, len(info) - 1, 2)
+            if is_uuid(info[i])]
