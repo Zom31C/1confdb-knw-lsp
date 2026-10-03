@@ -946,6 +946,19 @@ def _read_json(path):
         return json.loads(f.read())
 
 
+def _read_header(path):
+    """Заголовок объекта и его текст для meta_object.header_json.
+
+    Компактный дамп — это ровно тот текст, который дала бы повторная сериализация
+    заголовка (те же разделители и ensure_ascii=False), поэтому 114 МиБ заголовков
+    УНФ не нужно сериализовать второй раз (1.8 с). Дампу с --dump-indent текст не
+    подходит — тогда колонку пишет json.dumps, как раньше.
+    """
+    with open(helper.long_path(path), 'r', encoding='utf-8') as f:
+        text = f.read()
+    return json.loads(text), (None if '\n' in text else text)
+
+
 RE_ID_UUID = re.compile(rb'"uuid"\s*:\s*"([^"]*)"')
 
 
@@ -1128,7 +1141,7 @@ def build_fts_index(db_path):
 
 
 def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=1,
-             build_fts=True):
+             build_fts=True, headers_dir=None):
     """Пишет дамп каталога stage 3 в SQLite. Возвращает статистику.
 
     :param dump_dir: каталог результата декодера (стадия 3)
@@ -1139,6 +1152,9 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     :param build_fts: строить FTS5-индекс по телам методов. На УНФ это половина
         времени записи; без индекса база рабочая (поиск по телам идёт через
         body_has), индекс собирается позже — `confdb fts <db>`
+    :param headers_dir: каталог потока заголовков декодера (helper.sink_put).
+        Когда он задан, заголовки объектов берутся оттуда, а не из 47 тысяч
+        файлов <Класс>.json и <Класс>.id.json дампа — на УНФ это 6 с из 27
     """
     dump_dir = os.path.abspath(dump_dir)
     if not os.path.isdir(dump_dir):
@@ -1154,7 +1170,18 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     # основной цикл): дамп УНФ — 26 107 каталогов и 73 537 файлов
     tree = _scan_tree(dump_dir)
     rel_by_dir = _rel_paths(tree, dump_dir)
-    objects = _find_objects(tree, dump_dir)
+    headers = helper.sink_read(headers_dir) if headers_dir else None
+    if headers is not None:
+        # объекты известны из потока заголовков: файлов <Класс>.json в дампе нет.
+        # Обход всё равно ведёт дерево — от его порядка зависят id объектов
+        # (sorted() по глубине устойчив, поэтому порядок dict objects сохраняется)
+        objects = {}
+        for dirpath, _files in tree:
+            record = headers.get(rel_by_dir[dirpath])
+            if record:
+                objects[dirpath] = record[0]
+    else:
+        objects = _find_objects(tree, dump_dir)
     if dump_dir not in objects:
         raise ValueError(f'В {dump_dir} не найден корневой объект (Configuration.json и т.п.)')
 
@@ -1186,13 +1213,17 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         for dirpath in sorted(objects, key=lambda d: d.count(os.sep)):
             stem = objects[dirpath]
             rel = rel_by_dir[dirpath]
-            header = _read_json(os.path.join(dirpath, f'{stem}.json'))
-            id_name = f'{stem}.id.json'
-            # состав каталога уже есть в снимке обхода — os.path.isfile не нужен
-            if any(fn == id_name for fn, _size in files_of[dirpath]):
-                uuid = _read_id_uuid(os.path.join(dirpath, id_name))
+            if headers is not None:
+                stem, uuid, header_text = headers[rel]
+                header = json.loads(header_text)
             else:
-                uuid = header.get('uuid')
+                header, header_text = _read_header(os.path.join(dirpath, f'{stem}.json'))
+                id_name = f'{stem}.id.json'
+                # состав каталога уже есть в снимке обхода — os.path.isfile не нужен
+                if any(fn == id_name for fn, _size in files_of[dirpath]):
+                    uuid = _read_id_uuid(os.path.join(dirpath, id_name))
+                else:
+                    uuid = header.get('uuid')
             parent_rel = None
             parent_dir = os.path.dirname(dirpath)
             while parent_dir and parent_dir.startswith(dump_dir):
@@ -1203,7 +1234,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                 parent_dir = os.path.dirname(parent_dir)
             infos[rel] = dict(dirpath=dirpath, stem=stem, uuid=uuid,
                               name=header.get('name') or os.path.basename(dirpath),
-                              header=header, parent_rel=parent_rel)
+                              header=header, header_text=header_text, parent_rel=parent_rel)
 
         # ord: позиция uuid объекта в заголовке родителя (корня — в заголовке корня)
         uuid_index_cache = {}
@@ -1230,7 +1261,7 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
                 info['ord'], rel, info['stem'], TYPE_RU.get(info['stem'], info['stem']),
                 info['name'], info['uuid'],
                 info['header'].get('comment'), info['header'].get('obj_version'),
-                json.dumps(info['header'], ensure_ascii=False)))
+                info['header_text'] or json.dumps(info['header'], ensure_ascii=False)))
         conn.executemany(
             'INSERT INTO meta_object (source_id, parent_id, ord, path, type, type_ru, name,'
             ' uuid, comment, obj_version, header_json)'

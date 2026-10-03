@@ -6,6 +6,14 @@
 один раз в _end_value; строковые прогоны добавляются срезом (регекс _RUN_PARAM,
 str.find). Посимвольная конкатенация строки квадратична и на скобкофайлах форм
 в десятки МБ (регламентированные отчёты) тормозит на порядки.
+
+Две вещи дороже самого разбора (замер на УНФ: 54.3 млн строк, 1481 МиБ):
+  * диспетчер строк. `getattr(self, f'_decode_line_{mode.name.lower()}')` на каждой
+    строке — это f-строка, два новых строковых объекта и поиск атрибута; три
+    режима, дающие 99% строк, теперь ветки if, getattr остался только редким;
+  * посимвольный проход по строкам без кавычек (27% строк, но в них все значения
+    метаданных). Их режет str.split — `_fast_param`; автомат остался для строк
+    со строковыми значениями.
 """
 import os
 import re
@@ -24,6 +32,12 @@ class Mode(Enum):
     END_READ_STRING_VALUE = 3
     READ_B64 = 4
     READ_TEXT_FILE = 5
+
+
+# псевдонимы для сравнения по идентичности в диспетчере строк
+_READ_PARAM = Mode.READ_PARAM
+_BEGIN_STRING = Mode.BEGIN_READ_STRING_VALUE
+_BEGIN_MULTI_STRING = Mode.BEGIN_READ_MULTI_STRING_VALUE
 
 
 class JsonContainerDecoder:
@@ -65,25 +79,45 @@ class JsonContainerDecoder:
     # ---------- разбор ----------
 
     def decode_file(self, file):
-        self.mode = Mode.READ_PARAM
+        self.mode = _READ_PARAM
         self.data = []
-        self.line_number = 1
+        # счётчик строк живёт в локальной переменной: 54 млн записей в атрибут
+        # на корпусе УНФ стоят секунд, а читают его только сообщения об ошибках
+        line_number = 1
         for line in file:
             try:
-                self.decode_line(line)
-                self.line_number += 1
+                mode = self.mode
+                if mode is _READ_PARAM:
+                    self._decode_line_read_param(line)
+                elif mode is _BEGIN_MULTI_STRING:
+                    # продолжение многострочного строкового значения: 71% строк
+                    # реального файла — текст модуля формы и пустые строки между
+                    # ним, вся работа — один append
+                    if '"' in line and line.count('""') * 2 != line.count('"'):
+                        self.mode = _BEGIN_STRING
+                        self.decode_object(line)
+                    else:
+                        self._chunks.append(line)
+                elif mode is _BEGIN_STRING:
+                    self.decode_object(line)
+                else:
+                    handler = getattr(self, f'_decode_line_{mode.name.lower()}')
+                    handler(line)
+                line_number += 1
             except BigBase64 as err:
                 raise err from err
             except Exception as err:
+                self.line_number = line_number
                 raise ExtException(
                     parent=err,
                     message="Ошибка при разборе скобкофайла",
-                    detail=f'{os.path.basename(self.src_dir)}/{self.file_name} проблема до строки {self.line_number}',
+                    detail=f'{os.path.basename(self.src_dir)}/{self.file_name} проблема до строки {line_number}',
                     dump=dict(
                         mode=self.mode,
                         current_object=self.current_object,
                         path=self.path
                     ))
+        self.line_number = line_number
         if self.mode != Mode.READ_PARAM:
             raise ExtException(
                 message="Ошибка при разборе скобкофайла",
@@ -107,7 +141,8 @@ class JsonContainerDecoder:
         self.data += line
 
     def _decode_line_read_param(self, line):
-        if line[0] == '{':  # новый объект, исходим из того, что формат записи предполагает только один новый объект
+        first = line[0]
+        if first == '{':  # новый объект, исходим из того, что формат записи предполагает только один новый объект
             if self.current_object is None:
                 self.current_object = []
                 self.data.append(self.current_object)
@@ -125,11 +160,10 @@ class JsonContainerDecoder:
                 self.mode = Mode.READ_B64
                 self.decode_b64_line(line, 1)
             else:
-                self.decode_object(line[1:])
-        elif line[0] == '}':
-            self._end_current_object()
-            self.decode_object(line[1:])
-        elif line[0] == '\n' and self._value_is_64():
+                self._split_param_line(line, 1, False)
+        elif first == '}':
+            self._split_param_line(line, 1, True)
+        elif first == '\n' and self._value_is_64():
             self.mode = Mode.READ_B64
             return
         else:
@@ -149,11 +183,103 @@ class JsonContainerDecoder:
                     message='Неожиданное начало объекта',
                     detail=f'в файле :{self.src_dir}/{self.file_name}, path:{self.path})')
 
+    def _split_param_line(self, line, start, close_first):
+        """Строка режима READ_PARAM с позиции start: оптом до первого строкового значения.
+
+        :param close_first: первым действием закрыть текущий объект — ветка `}`
+
+        Значения без кавычек режет str.split (`_fast_param`), а с первой кавычки
+        строку ведёт прежний посимвольный автомат: ему принадлежат строковые и
+        многострочные значения, base64 и переходы режимов.
+        """
+        quote = line.find('"', start)
+        if quote < 0:
+            self._fast_param(line[start:], close_first)
+        elif quote == start:
+            if close_first:
+                self._end_current_object()
+            self.decode_object(line, quote)
+        else:
+            self._fast_param(line[start:quote], close_first)
+            self.decode_object(line, quote)
+
+    def _fast_param(self, body, close_first):
+        """Часть строки без кавычек: значения и закрытия объектов нарезкой str.split.
+
+        :param body: прогоны, `,` и `}` — до первого строкового значения или до
+            конца строки
+        :param close_first: первым действием закрыть текущий объект — ветка `}`
+
+        Повторяет decode_object символ за символом, но прогоны между `,` и `}`
+        режет на C-уровне. Состояние после строки то же: незакрытый пробег лежит
+        в _chunks/_value_is_none, previous_char равен '}' только сразу после
+        закрытия объекта (других сравнений с ним в парсере нет).
+        """
+        obj = self.current_object
+        path = self.path
+        if close_first:
+            # _end_current_object: незакрытое значение — в объект, затем pop
+            if self.previous_char != '}':
+                obj.append(None if self._value_is_none else self._value())
+            if path:  # могут быть лишние закрывающие скобки
+                path.pop()
+            obj = path[-1] if path else None
+            self.current_object = obj
+            pending = None
+            is_none = True
+            prev_close = True
+        else:
+            is_none = self._value_is_none
+            pending = None if is_none else self._value()
+            prev_close = self.previous_char == '}'
+
+        if body.endswith('\n'):
+            body = body[:-1]
+        segments = body.split('}')
+        last = len(segments) - 1
+        for idx, seg in enumerate(segments):
+            if seg:
+                pieces = seg.split(',')
+                for piece in pieces[:-1]:  # прогоны, завершённые запятой
+                    if piece:
+                        pending = piece if not pending else pending + piece
+                        is_none = False
+                        prev_close = False
+                    if not prev_close:
+                        obj.append(None if is_none else pending)
+                        is_none = False
+                    pending = ''
+                    prev_close = False
+                piece = pieces[-1]  # последний пробег запятой не завершён
+                if piece:
+                    pending = piece if not pending else pending + piece
+                    is_none = False
+                    prev_close = False
+            if idx != last:  # за сегментом стоит '}'
+                if not prev_close:
+                    obj.append(None if is_none else pending)
+                    is_none = False
+                if path:
+                    path.pop()
+                obj = path[-1] if path else None
+                pending = None
+                is_none = True
+                prev_close = True
+
+        self.current_object = obj
+        self._chunks = [] if pending is None else [pending]
+        self._value_is_none = is_none
+        self.previous_char = '}' if prev_close else ','
+
     def _decode_line_begin_read_string_value(self, line):
         self.decode_object(line)
 
-    def decode_object(self, line):
-        i = 0
+    def decode_object(self, line, i=0):
+        """Посимвольный разбор с позиции i: строковые значения и переходы режимов.
+
+        Значения без кавычек до этой позиции уже забрал `_fast_param`, поэтому
+        позиция передаётся снаружи, а не всегда нулевая.
+        """
         n = len(line)
         while i < n:
             char = line[i]

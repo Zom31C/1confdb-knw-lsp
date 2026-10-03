@@ -57,8 +57,19 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
             stage3 = dump_dir
         else:
             stage3 = os.path.join(temp_dir, 'decode_stage_3')
+
+        headers_dir = None
+        decode_options = options
+        if db_path:
+            # заголовки объектов уходят записи БД потоком (helper.sink_put), минуя
+            # 47 тысяч мелких файлов дампа; само дерево остаётся полным, только
+            # если его просили сохранить
+            headers_dir = os.path.join(temp_dir, 'headers')
+            decode_options = dict(options)
+            decode_options['header_sink'] = headers_dir
+            decode_options['dump_headers'] = bool(dump_dir)
         print(f'Стадия 3: декодируем метаданные в {stage3}')
-        v8_decoder.decode(stage1, stage3, options=options, workers=workers)
+        v8_decoder.decode(stage1, stage3, options=decode_options, workers=workers)
 
         if db_path:
             # импорт здесь, чтобы не тянуть sqlite при работе без БД
@@ -67,7 +78,8 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
             print(f'Пишем базу данных {db_path}')
             stats['db_rows'] = write_db(stage3, db_path, source_file=src_file,
                                         store_blobs=options.get('store_blobs', False),
-                                        workers=workers, build_fts=build_fts)
+                                        workers=workers, build_fts=build_fts,
+                                        headers_dir=headers_dir)
 
         stats['dump_dir'] = dump_dir if dump_dir else None
     finally:

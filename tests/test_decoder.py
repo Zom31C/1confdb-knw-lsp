@@ -69,3 +69,43 @@ def test_plain_text_not_brace():
     # не-скобкофайл: decode_file не рассчитан на чистый текст и завершается ошибкой
     with pytest.raises(ExtException):
         decode_text('просто текст\nвторая строка\n')
+
+
+# --- формы строк, которые ведёт _fast_param (нарезка str.split вместо автомата) ---
+
+
+def test_fast_line_of_many_values():
+    # строка без кавычек и без '}': все значения режутся одним split(',')
+    assert decode_text('{49,0,0,1,\n}\n') == [['49', '0', '0', '1', '']]
+
+
+def test_fast_values_after_close():
+    # '}' закрывает вложенный объект, остаток строки уходит в родителя
+    assert decode_text('{1,\n{2,\n},6,7,\n}\n') == [['1', ['2', ''], '6', '7', '']]
+
+
+def test_fast_several_closes_in_line():
+    assert decode_text('{a,\n{b,\n{c,\n}}}\n') == [['a', ['b', ['c', '']]]]
+
+
+def test_fast_pending_run_closed_by_brace():
+    # пробег без запятой в конце строки остаётся незакрытым и уходит в объект по '}'
+    assert decode_text('{abc\n}\n') == [['abc']]
+
+
+def test_fast_prefix_then_string_value():
+    # значения до первой кавычки режет split, строковое значение ведёт автомат
+    assert decode_text('{1,0,uuid,"строка",\n}\n') == [['1', '0', 'uuid', '"строка"', '']]
+
+
+def test_fast_prefix_with_close_then_string_value():
+    # prefix быстрого пути закрыл вложенный объект, строковое значение уходит в родителя
+    assert decode_text('{1,\n{2},"x",\n}\n') == [['1', ['2'], '"x"', '']]
+
+
+def test_fast_empty_value_between_commas():
+    assert decode_text('{1,,2}\n') == [['1', '', '2']]
+
+
+def test_fast_last_line_without_newline():
+    assert decode_text('{1,2}') == [['1', '2']]

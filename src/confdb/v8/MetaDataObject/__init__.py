@@ -83,13 +83,25 @@ class MetaDataObject(MetaObject):
 
             id_data = self.decode_ids()
             self.header['obj_version'] = self.obj_version
-            helper.json_write(id_data, dest_full_path, f'{file_name}.id.json',
-                              indent=self.get_options('dump_indent'))
-            helper.json_write(self.header, dest_full_path, f'{file_name}.json',
-                              indent=self.get_options('dump_indent'))
+            self._write_header(dest_dir, dest_full_path, dest_path, file_name, id_data)
             self.write_decode_code(dest_full_path, file_name)
         except Exception as err:
             raise ExtException(parent=err)
+
+    def _write_header(self, dest_dir, dest_full_path, dest_path, file_name, id_data):
+        """Заголовок объекта: в поток для записи БД и/или файлами в дамп.
+
+        `header_sink` в опциях — каталог потока (см. helper.sink_put): заголовок
+        и uuid уходят записи БД напрямую, а `dump_headers` (по умолчанию да)
+        решает, нужны ли в дереве дампа <Класс>.json и <Класс>.id.json.
+        """
+        sink = self.get_options('header_sink')
+        if sink:
+            helper.sink_put(sink, dest_path, file_name, id_data['uuid'], self.header)
+        if self.get_options('dump_headers', True):
+            indent = self.get_options('dump_indent')
+            helper.json_write(id_data, dest_full_path, f'{file_name}.id.json', indent=indent)
+            helper.json_write(self.header, dest_full_path, f'{file_name}.json', indent=indent)
 
     def get_internal_data(self):
         return self.uuid

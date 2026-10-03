@@ -158,6 +158,9 @@ class Decoder:
                 pool.close()
                 pool.join()
             progress.finish()
+            # поток заголовков должен попасть на диск до того, как его прочитает
+            # запись БД: в рабочих процессах его закрывает atexit, здесь — свой
+            helper.sink_close()
         if err_count.value:
             print(f'ВНИМАНИЕ: пропущено объектов с ошибками декодирования: '
                   f'{err_count.value} — дамп и база неполные.')

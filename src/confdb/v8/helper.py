@@ -2,6 +2,7 @@
 
 Порт read-части v8unpack.helper (MIT). Пул процессов заменён последовательным выполнением.
 """
+import atexit
 import json
 import os
 import shutil
@@ -78,6 +79,67 @@ def json_write(data, path, file_name, indent=None):
             file.write(json.dumps(data, ensure_ascii=False, indent=indent))
     except Exception as err:
         raise ExtException(message='Ошибка записи', detail=f'{err} в файле ({_path})')
+
+
+# --- поток заголовков: передача <Класс>.json записи БД мимо дампа ---
+#
+# Заголовок объекта и его uuid — единственное, что запись БД достаёт из 47 тысяч
+# мелких файлов дампа (УНФ: 4.7 с на <Класс>.json плюс 1.5 с на <Класс>.id.json),
+# и единственное, что она сериализует повторно в meta_object.header_json (1.8 с).
+# Когда нужна база, а дерево дампа — нет, оба файла не пишутся: их содержимое
+# уходит потоком по одному файлу на процесс, который запись читает целиком.
+_SINKS = {}
+
+
+def _sink_handle(sink_dir):
+    handle = _SINKS.get(sink_dir)
+    if handle is None:
+        makedirs(sink_dir, exist_ok=True)
+        handle = open(long_path(os.path.join(sink_dir, f'headers-{os.getpid()}.pkl')), 'wb')
+        _SINKS[sink_dir] = handle
+    return handle
+
+
+def sink_put(sink_dir, dest_path, file_name, obj_uuid, header):
+    """Пишет в поток заголовок объекта и его uuid — то, что иначе ушло бы в дамп.
+
+    :param dest_path: путь объекта от корня дампа (у корневого объекта пустой)
+    :param header: заголовок ПОСЛЕ decode_ids() — без uuid, как в <Класс>.json
+    """
+    import pickle
+    text = json.dumps(header, ensure_ascii=False)
+    rel = dest_path.replace(os.sep, '/') if dest_path else ''
+    pickle.dump((rel, file_name, obj_uuid, text), _sink_handle(sink_dir), protocol=4)
+
+
+def sink_read(sink_dir):
+    """{путь объекта от корня дампа через '/': (имя класса, uuid, текст заголовка)}."""
+    import pickle
+    result = {}
+    for file_name in sorted(os.listdir(long_path(sink_dir))):
+        if not file_name.endswith('.pkl'):
+            continue
+        with open(long_path(os.path.join(sink_dir, file_name)), 'rb') as file:
+            while True:
+                try:
+                    rel, stem, obj_uuid, text = pickle.load(file)
+                except EOFError:
+                    break
+                result[rel] = (stem, obj_uuid, text)
+    return result
+
+
+def sink_close():
+    """Закрывает файлы потока; вызывается и по завершении процесса (atexit)."""
+    for handle in _SINKS.values():
+        try:
+            handle.close()
+        except OSError:
+            pass
+    _SINKS.clear()
+
+
+atexit.register(sink_close)
 
 
 def txt_read(path, file_name, encoding='utf-8-sig'):

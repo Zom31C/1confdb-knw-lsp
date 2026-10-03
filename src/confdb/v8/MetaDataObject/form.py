@@ -207,10 +207,7 @@ class FormCore(SimpleNameFolder):
             # 'name': self.header.pop('name'),
         }
         self.header['obj_version'] = self.obj_version
-        helper.json_write(id_data, dest_full_path, f'{file_name}.id.json',
-                          indent=self.get_options('dump_indent'))
-        helper.json_write(self.header, dest_full_path, f'{file_name}.json',
-                          indent=self.get_options('dump_indent'))
+        self._write_header(dest_dir, dest_full_path, dest_path, file_name, id_data)
         self.write_decode_code(dest_full_path, file_name)
 
         helper.json_write(

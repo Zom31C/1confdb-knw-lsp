@@ -197,6 +197,19 @@ class MetaObject:
                 else:
                     helper.txt_write(self.code[code_name], dest_dir, f'{file_name}.{code_name}.bsl')
 
+    def write_root_header(self, dest_dir, file_name):
+        """Заголовок корневого объекта: в поток записи БД и/или файлом в дамп.
+
+        У корневого объекта uuid остаётся в заголовке (отдельного <Класс>.id.json
+        у него нет), поэтому в поток уходит тот же заголовок целиком.
+        """
+        sink = self.get_options('header_sink')
+        if sink:
+            helper.sink_put(sink, '', file_name, self.header.get('uuid'), self.header)
+        if self.get_options('dump_headers', True):
+            helper.json_write(self.header, dest_dir, f'{file_name}.json',
+                              indent=self.get_options('dump_indent'))
+
     def _decode_html_data(self, src_dir, dest_dir, dest_file_name, *, header_field='html', file_number=0,
                           extension='html'):
         try:
@@ -316,8 +329,7 @@ class Configuration(MetaObject):
 
         tasks = self.decode_includes(src_dir, dest_dir, '', self.header['header'])
         self.header['obj_version'] = self.obj_version
-        helper.json_write(self.header, dest_dir, f'{file_name}.json',
-                          indent=self.get_options('dump_indent'))
+        self.write_root_header(dest_dir, file_name)
         self.write_decode_code(dest_dir, file_name)
         return tasks
 
@@ -392,8 +404,7 @@ class ExternalDataProcessor(MetaObject):
         tasks = self.decode_includes(src_dir, dest_dir, '', self.header['header'])
 
         self.header['obj_version'] = self.obj_version
-        helper.json_write(self.header, dest_dir, f'{_file_name}.json',
-                          indent=self.get_options('dump_indent'))
+        self.write_root_header(dest_dir, _file_name)
         self.write_decode_code(dest_dir, 'ExternalDataProcessor')
 
         return tasks
@@ -457,8 +468,7 @@ class ConfigurationExtension(Configuration):
 
         helper.txt_write(helper.str_decode(product_version), dest_dir, 'version.bin', encoding='utf-8')
         self.header['obj_version'] = self.obj_version
-        helper.json_write(self.header, dest_dir, f'{self.get_class_name_without_version()}.json',
-                          indent=self.get_options('dump_indent'))
+        self.write_root_header(dest_dir, self.get_class_name_without_version())
         self.write_decode_code(dest_dir, self.__class__.__name__)
 
         return tasks
