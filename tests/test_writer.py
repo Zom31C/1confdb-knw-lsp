@@ -796,8 +796,9 @@ def test_attribute_walk_collects_same_section_bags(tmp_path):
 
 
 def test_write_db_without_fts_and_late_build(tmp_path):
-    """build_fts=False не создаёт индекс; build_fts_index строит его позже."""
-    from confdb.db.writer import FTS_TABLE, build_fts_index
+    """build_fts=False не создаёт индекс; build_fts_index строит его позже шардами."""
+    from confdb.db.writer import (FTS_TABLE, build_fts_index, fts_index_info,
+                                  fts_shard_paths)
     dump = str(tmp_path / 'dump')
     make_dump(dump)
     db_path = str(tmp_path / 'out.sqlite')
@@ -808,20 +809,63 @@ def test_write_db_without_fts_and_late_build(tmp_path):
                             (FTS_TABLE,)).fetchone()
     methods = conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
     conn.close()
+    assert not fts_shard_paths(db_path)
+    assert fts_index_info(db_path) is None
 
-    assert build_fts_index(db_path) == methods
+    assert build_fts_index(db_path, workers=3) == methods
+    shards = fts_shard_paths(db_path)
+    # пустых шардов не бывает: число файлов ограничено числом методов
+    assert len(shards) == min(3, methods)
+    info = fts_index_info(db_path)
+    assert info['shards'] == len(shards) and info['methods'] == methods
+    # индекс приставной: внутри базы таблицы FTS нет
     conn = sqlite3.connect(db_path)
-    # rowid индекса = method.id, MATCH находит подстроку тела метода
-    assert conn.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0] == methods
-    assert conn.execute(f'SELECT rowid FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?',
-                        ('"Справочник.Справочник1"',)).fetchall()
+    assert not conn.execute('SELECT 1 FROM sqlite_master WHERE name=?',
+                            (FTS_TABLE,)).fetchone()
     conn.close()
+    # rowid шарда = method.id: части не пересекаются, MATCH находит подстроку тела
+    total = hits = 0
+    ids = set()
+    for path in shards:
+        shard = sqlite3.connect(path)
+        rows = shard.execute(f'SELECT rowid FROM {FTS_TABLE}').fetchall()
+        total += len(rows)
+        ids.update(r[0] for r in rows)
+        hits += len(shard.execute(
+            f'SELECT rowid FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?',
+            ('"Справочник.Справочник1"',)).fetchall())
+        shard.close()
+    assert total == methods == len(ids)
+    assert hits
 
     # пересборка поверх существующего индекса не дублирует строки
-    assert build_fts_index(db_path) == methods
-    conn = sqlite3.connect(db_path)
-    assert conn.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0] == methods
-    conn.close()
+    assert build_fts_index(db_path, workers=2) == methods
+    shards = fts_shard_paths(db_path)
+    assert len(shards) == min(2, methods)
+    total = 0
+    for path in shards:
+        shard = sqlite3.connect(path)
+        total += shard.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0]
+        shard.close()
+    assert total == methods
+
+
+def test_write_db_drops_stale_fts_shards(tmp_path):
+    """Перезапись базы с --no-fts обязана снести старый приставной индекс.
+
+    Иначе сервер нашёл бы шарды от ПРЕДЫДУЩЕЙ базы и молча выдавал чужие методы.
+    """
+    from confdb.db.writer import build_fts_index, fts_index_info, fts_shard_paths
+    dump = str(tmp_path / 'dump')
+    make_dump(dump)
+    db_path = str(tmp_path / 'out.sqlite')
+    write_db(dump, db_path, build_fts=False)
+    build_fts_index(db_path, workers=2)
+    assert fts_shard_paths(db_path)
+
+    write_db(dump, db_path, build_fts=False)
+    assert not fts_shard_paths(db_path)
+    assert fts_index_info(db_path) is None
 
 
 def test_build_fts_index_rejects_foreign_db(tmp_path):

@@ -430,17 +430,18 @@ class Tui:
         input('Нажмите Enter…')
 
     def _build_fts(self, db_path):
-        """Достраивает FTS-индекс в готовой базе (то же, что `confdb fts <база>`)."""
-        from .db.writer import build_fts_index
-        print(f'Строим FTS-индекс в {db_path}…')
+        """Достраивает приставной FTS-индекс (то же, что `confdb fts <база>`)."""
+        from .db.writer import build_fts_index, fts_dir
+        print(f'Строим FTS-индекс рядом с {db_path} в {self.workers} процессов…')
         begin = time.time()
         try:
-            methods = build_fts_index(db_path)
+            methods = build_fts_index(db_path, workers=self.workers)
         except Exception as err:
             print(f'Ошибка построения индекса: {err}')
             input('Нажмите Enter…')
             return
         print(f'Готово: {methods} методов за {time.time() - begin:.1f} с')
+        print(f'Файлы индекса: {fts_dir(db_path)} — без них база тоже рабочая')
         input('Нажмите Enter…')
 
     # ---------- опции ----------
@@ -450,7 +451,7 @@ class Tui:
             _cls()
             print('--- Опции извлечения ---')
             print(f' 1. Число процессов стадии 3: {self.workers}')
-            print(f' 2. Рабочий каталог стадий 0-1: {self.temp or "<temp ОС>"}')
+            print(f' 2. Рабочий каталог стадий 0-1: {self.temp or "<на томе базы>"}')
             print(f' 3. Префикс имён для снятия:   {self.prefix or "<нет>"}')
             print(f' 4. Не удалять рабочий каталог: {"да" if self.keep_temp else "нет"}')
             print(f' 5. Хранить бинарники (BLOB):  {"да" if self.store_blobs else "нет"}')
@@ -472,7 +473,8 @@ class Tui:
                     print('Нужно целое число >= 1.')
                     input('Нажмите Enter…')
             elif choice == '2':
-                self.temp = _ask_path('Рабочий каталог (пусто — temp ОС)', self.temp)
+                self.temp = _ask_path('Рабочий каталог (пусто — на томе базы/дампа)',
+                                      self.temp)
             elif choice == '3':
                 self.prefix = _ask('Префикс (пусто — нет)', self.prefix)
             elif choice == '4':
@@ -486,8 +488,9 @@ class Tui:
             elif choice == '7':
                 self.build_fts = _yes_no(
                     'Строить FTS-индекс по телам методов при записи базы? '
-                    '(половина времени записи; без него поиск по телам идёт полным '
-                    'проходом, индекс достраивается после извлечения)',
+                    '(индекс — приставные файлы <база>.fts, по одному на процесс: '
+                    'на УНФ 7.5 с в 8 шардов против 49 с одним; без него поиск по '
+                    'телам идёт полным проходом, индекс достраивается после извлечения)',
                     self.build_fts)
             elif choice == '8':
                 self._run_bench()

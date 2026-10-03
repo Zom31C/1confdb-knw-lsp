@@ -32,9 +32,10 @@ def build_parser():
                    help='не прерываться на ошибке декодирования объекта: '
                         'пропустить его и продолжить (дамп и база будут неполными)')
     p.add_argument('--no-fts', action='store_true',
-                   help='не строить FTS-индекс по телам методов (половина времени '
-                        'записи БД); поиск по телам останется рабочим, но медленным, '
-                        'индекс собирается позже — "confdb fts <база>"')
+                   help='не строить FTS-индекс по телам методов (приставные файлы '
+                        '<база>.fts, на УНФ 7.5 с в 8 шардов); поиск по телам останется '
+                        'рабочим, но медленным, индекс собирается позже — '
+                        '"confdb fts <база>"')
     p.add_argument('--dump-indent', action='store_true',
                    help='писать JSON дампа с отступами, как v8unpack — для побайтового '
                         'сравнения дампов; по умолчанию вывод компактный, с ним стадия 3 '
@@ -46,6 +47,9 @@ def build_parser():
     f = subparsers.add_parser(
         'fts', help='построить FTS-индекс по телам методов в готовой базе')
     f.add_argument('db', help='путь к базе SQLite')
+    f.add_argument('--workers', metavar='N', type=int, default=None,
+                   help='число процессов сборки = число файлов-шардов индекса '
+                        '(по умолчанию — результат "confdb bench" или 1)')
 
     q = subparsers.add_parser(
         'check-queries',
@@ -117,22 +121,31 @@ def run_check(db_path):
     return 1 if fails else 0
 
 
-def run_fts(db_path):
-    """Построение FTS-индекса по телам методов в готовой базе (после --no-fts)."""
+def run_fts(db_path, workers=None):
+    """Построение приставного FTS-индекса по телам методов (после --no-fts)."""
     import sqlite3
     import time
 
-    from .db.writer import build_fts_index
+    from .db.writer import build_fts_index, fts_dir
     if not os.path.isfile(db_path):
         print(f'Файл базы не найден: {db_path}', file=sys.stderr)
         return 2
+    if workers is None:
+        from .config import bench_workers
+        workers = bench_workers() or 1
+    if workers < 1:
+        print('--workers должен быть >= 1', file=sys.stderr)
+        return 2
     begin = time.time()
     try:
-        methods = build_fts_index(db_path)
+        methods = build_fts_index(db_path, workers=workers)
     except (sqlite3.Error, OSError, ValueError) as err:
         print(f'Ошибка: {err}', file=sys.stderr)
         return 1
-    print(f'FTS-индекс построен: {methods} методов за {time.time() - begin:.1f} с')
+    print(f'FTS-индекс построен: {methods} методов, {workers} шардов '
+          f'за {time.time() - begin:.1f} с')
+    print(f'Файлы индекса: {fts_dir(db_path)} — их можно удалить, база остаётся '
+          f'рабочей (поиск по телам пойдёт через body_has)')
     return 0
 
 
@@ -144,7 +157,7 @@ def main(argv=None):
         return run_check(args.db)
 
     if args.cmd == 'fts':
-        return run_fts(args.db)
+        return run_fts(args.db, args.workers)
 
     if args.cmd == 'check-queries':
         from .query_check import check_db

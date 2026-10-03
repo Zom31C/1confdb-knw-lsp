@@ -45,7 +45,8 @@ from urllib.parse import parse_qs, quote as urllib_quote, urlparse
 from . import compare
 from . import header_props
 from .config import load_config, save_config
-from .db.writer import FTS_TABLE, TYPE_RU, tabular_field_counts
+from .db.writer import FTS_TABLE, TYPE_RU, fts_index_info, fts_shard_paths, \
+    tabular_field_counts
 
 PROTOCOL_VERSION = '2024-11-05'
 
@@ -482,18 +483,28 @@ class McpServer:
             conn.close()
             raise ValueError(
                 f'это не база знаний confdb (нет таблицы meta_object): {path}')
-        # FTS5-индекс по телам методов. Пустой не считается: сборку могли прервать
-        # (или база собрана с --no-fts), и тогда поиск по телам должен уйти на
-        # body_has, а не молча вернуть ноль
+        # FTS5-индекс по телам методов. Неполный не считается: сборку могли
+        # прервать (или база собрана с --no-fts), и тогда поиск по телам должен
+        # уйти на body_has, а не молча вернуть ноль. Штатная схема — приставные
+        # шарды `<база>.fts\0.db…` (writer.build_fts_index); таблица внутри базы
+        # поддерживается как прежняя схема. Число методов сверяется с манифестом:
+        # чужой/устаревший индекс хуже отсутствующего
         fts = None
-        try:
-            if conn.execute(f'SELECT rowid FROM {FTS_TABLE} LIMIT 1').fetchone():
-                fts = FTS_TABLE
-        except sqlite3.Error:
-            pass  # индекса нет — будет fallback на body_has
+        fts_shards = None
+        manifest = fts_index_info(path)
+        if manifest and int(manifest.get('methods', -1)) == conn.execute(
+                'SELECT COUNT(*) FROM method').fetchone()[0]:
+            fts_shards = fts_shard_paths(path)
+        else:
+            try:
+                if conn.execute(f'SELECT rowid FROM {FTS_TABLE} LIMIT 1').fetchone():
+                    fts = FTS_TABLE
+            except sqlite3.Error:
+                pass  # индекса нет — будет fallback на body_has
         if alias is None:
             alias = self._make_alias(path)
-        self.dbs[alias] = {'path': path, 'conn': conn, 'ctx': None, 'fts': fts}
+        self.dbs[alias] = {'path': path, 'conn': conn, 'ctx': None, 'fts': fts,
+                           'fts_shards': fts_shards, 'fts_conn': None}
         if activate or self.active is None:
             self.active = alias
         return alias
@@ -503,6 +514,8 @@ class McpServer:
         alias = self._alias(alias)
         info = self.dbs.pop(alias)
         info['conn'].close()
+        for shard in info.get('fts_conn') or ():
+            shard.close()
         if self.active == alias:
             self.active = next(iter(self.dbs), None)
         return alias
@@ -1320,6 +1333,50 @@ class McpServer:
                    'попадают. Точный состав даёт только выполнение кода.')
         return '\n'.join(out)
 
+    def _fts_shard_conns(self, info):
+        """Соединения приставных шардов индекса (read-only) — лениво и с кэшем."""
+        conns = info.get('fts_conn')
+        if conns is None:
+            conns = []
+            for path in info.get('fts_shards') or ():
+                shard = sqlite3.connect(
+                    'file:' + path.replace(os.sep, '/') + '?mode=ro', uri=True)
+                shard.execute('PRAGMA cache_size=-8192')
+                conns.append(shard)
+            info['fts_conn'] = conns
+        return conns
+
+    def _fts_filter(self, info, conn, text):
+        """Условие «тело содержит text» по FTS-индексу: (фрагмент SQL, параметры).
+
+        None — индекса нет, и вызывающий уходит на body_has. Игла оборачивается в
+        кавычки (phrase query), чтобы спецсимволы FTS5 не ломали запрос; trigram
+        ищет от трёх символов, поэтому более короткие иглы сюда не доходят.
+
+        Шарды лежат в ОТДЕЛЬНЫХ файлах, и ATTACH не подходит: лимит
+        SQLITE_MAX_ATTACHED (10 по умолчанию) считается на соединение, а в
+        мульти-базовом режиме их набирается больше. Поэтому выдачи шардов
+        объединяются во временной таблице основного соединения — TEMP-схема
+        доступна и при mode=ro, а rowid во всех шардах это method.id.
+        """
+        needle = f'"{text}"'
+        table = info.get('fts')
+        if table:
+            return (f' AND mt.id IN (SELECT rowid FROM {table} WHERE {table} MATCH ?)',
+                    [needle])
+        shards = self._fts_shard_conns(info)
+        if not shards:
+            return None
+        hits = set()
+        for shard in shards:
+            hits.update(r[0] for r in shard.execute(
+                f'SELECT rowid FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?', (needle,)))
+        conn.execute('DROP TABLE IF EXISTS temp._fts_hits')
+        conn.execute('CREATE TEMP TABLE _fts_hits (id INTEGER PRIMARY KEY)')
+        conn.executemany('INSERT INTO temp._fts_hits(id) VALUES (?)',
+                         ((hit,) for hit in sorted(hits)))
+        return ' AND mt.id IN (SELECT id FROM temp._fts_hits)', []
+
     def find_methods(self, mask='', text='', path=None, limit=20, db=None):
         """Поиск методов: mask — имя/сигнатура/описание, text — подстрока в теле.
 
@@ -1341,14 +1398,13 @@ class McpServer:
         params = [like, like, like, like_ns]
         conn = self.conn(db)
         db_info = self.dbs[self._alias(db)]
-        fts = db_info.get('fts')
-        use_fts = bool(fts) and text and len(text) >= 3
+        # trigram ищет от трёх символов, поэтому короткие иглы идут мимо индекса
+        fts_filter = self._fts_filter(db_info, conn, text) \
+            if text and len(text) >= 3 else None
         if text:
-            if use_fts:
-                # FTS5 trigram индекс — быстрый поиск подстроки
-                # Оборачиваем в кавычки для экранирования специальных символов
-                cond += f' AND mt.id IN (SELECT rowid FROM {fts} WHERE {fts} MATCH ?)'
-                params.append(f'"{text}"')
+            if fts_filter:
+                cond += fts_filter[0]
+                params.extend(fts_filter[1])
             else:
                 # body_has — своя SQL-функция, регистронезависимая в обе стороны:
                 # LIKE сворачивает регистр только для ASCII, а пара LIKE через OR

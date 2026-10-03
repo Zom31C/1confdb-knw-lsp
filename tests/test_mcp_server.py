@@ -505,19 +505,50 @@ def test_find_methods_without_fts_falls_back_to_body_has(tmp_path_factory):
 
 def test_find_methods_same_result_after_late_fts_build(tmp_path_factory):
     """Индекс, собранный позже (confdb fts), даёт ту же выдачу, что body_has."""
-    from confdb.db.writer import FTS_TABLE, build_fts_index
+    from confdb.db.writer import build_fts_index
     server, db = _server_no_fts(tmp_path_factory)
     plain = _call(server, 'find_methods',
                   text='Справочник.Справочник1')['content'][0]['text']
     server.close_db()
 
-    build_fts_index(db)
+    build_fts_index(db, workers=2)
     server = McpServer(db)
-    assert server.dbs[server.active]['fts'] == FTS_TABLE
+    # индекс приставной: таблицы внутри базы нет, сервер держит список шардов
+    assert server.dbs[server.active]['fts'] is None
+    assert server.dbs[server.active]['fts_shards']
     indexed = _call(server, 'find_methods',
                     text='Справочник.Справочник1')['content'][0]['text']
     # порядок строк без ORDER BY зависит от плана запроса — сравниваем состав
     assert sorted(indexed.splitlines()) == sorted(plain.splitlines())
+    server.close_db()
+
+
+def test_incomplete_fts_shards_are_not_used(tmp_path_factory):
+    """Неполный приставной индекс — поиск через body_has, а не частичная выдача."""
+    import os
+
+    from confdb.db.writer import build_fts_index, fts_dir, fts_shard_paths
+    server, db = _server_no_fts(tmp_path_factory)
+    server.close_db()
+    build_fts_index(db, workers=2)
+
+    # сборку прервали: манифест пишется последним
+    os.remove(os.path.join(fts_dir(db), 'index.json'))
+    server = McpServer(db)
+    assert server.dbs[server.active]['fts_shards'] is None
+    out = _call(server, 'find_methods',
+                text='Справочник.Справочник1')['content'][0]['text']
+    assert 'ОбщийМодуль1' in out
+    server.close_db()
+
+    # шард потеряли: число файлов не сходится с манифестом
+    build_fts_index(db, workers=2)
+    shards = fts_shard_paths(db)
+    assert shards
+    os.remove(shards[-1])
+    server = McpServer(db)
+    assert server.dbs[server.active]['fts_shards'] is None
+    server.close_db()
 
 
 def test_empty_fts_index_is_not_used(tmp_path_factory):

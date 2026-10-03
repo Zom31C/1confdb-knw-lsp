@@ -52,8 +52,9 @@ def test_parser_no_fts_and_fts_command():
     args = build_parser().parse_args(['extract', 'config.cf', '--db', 'o.db', '--no-fts'])
     assert args.no_fts
     assert not build_parser().parse_args(['extract', 'config.cf', '--db', 'o.db']).no_fts
-    args = build_parser().parse_args(['fts', 'out.db'])
-    assert args.cmd == 'fts' and args.db == 'out.db'
+    args = build_parser().parse_args(['fts', 'out.db', '--workers', '4'])
+    assert args.cmd == 'fts' and args.db == 'out.db' and args.workers == 4
+    assert build_parser().parse_args(['fts', 'out.db']).workers is None
 
 
 def test_main_fts_missing_db(tmp_path):
@@ -72,10 +73,10 @@ def test_main_fts_rejects_foreign_db(tmp_path):
 
 
 def test_fts_command_builds_index(tmp_path):
-    """confdb fts достраивает индекс в базе, собранной с --no-fts."""
+    """confdb fts достраивает приставной индекс для базы, собранной с --no-fts."""
     import sqlite3
 
-    from confdb.db.writer import write_db
+    from confdb.db.writer import FTS_TABLE, fts_index_info, fts_shard_paths, write_db
 
     from test_writer import make_dump
     dump = str(tmp_path / 'dump')
@@ -83,8 +84,17 @@ def test_fts_command_builds_index(tmp_path):
     db = str(tmp_path / 'out.sqlite')
     write_db(dump, db, source_file='t.cf', build_fts=False)
 
-    assert main(['fts', db]) == 0
+    assert main(['fts', db, '--workers', '2']) == 0
+    shards = fts_shard_paths(db)
+    info = fts_index_info(db)
+    assert info and shards and info['shards'] == len(shards)
     conn = sqlite3.connect(db)
-    assert conn.execute('SELECT COUNT(*) FROM method_fts').fetchone()[0] == \
-        conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
+    methods = conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
     conn.close()
+    assert info['methods'] == methods
+    total = 0
+    for path in shards:
+        shard = sqlite3.connect(path)
+        total += shard.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0]
+        shard.close()
+    assert total == methods

@@ -12,6 +12,7 @@
 import json
 import os
 import re
+import shutil
 import sqlite3
 import xml.sax.saxutils
 from datetime import datetime
@@ -1109,35 +1110,129 @@ def _parse_bsl_worker(path):
 # содержимое методов и молча обнулил бы выдачу find_methods.
 FTS_TABLE = 'method_fts'
 
+# Индекс живёт в приставных файлах-шардах `<база>.fts\0.db…`, а не в файле базы.
+# Сборка упирается в токенизацию (УНФ, 262 МБ тел — 49.1 с одним процессом), в один
+# файл SQLite пишет только один процесс, а слияние готовых шардов стоит как сборка
+# (47.9 с: строки при переносе токенизируются заново) — поэтому один файл и
+# параллельная сборка несовместимы. Шарды по `id % N`: 2 → 25.8 с, 4 → 12.8 с,
+# 8 → 7.5 с (6.5x), размер индекса +2.6%, выдача MATCH та же. База остаётся одним
+# файлом и без индекса работоспособна — поиск по телам уходит на body_has (~0.3 с).
+# Замеры: `_tmp\probe_fts_shards.py`, page `fts5-method-body`.
+FTS_DIR_SUFFIX = '.fts'
+MAX_FTS_SHARDS = 16
 
-def _fill_fts(conn):
-    """Создаёт и заполняет FTS5-индекс по телам методов; rowid = method.id."""
-    conn.execute(f'DROP TABLE IF EXISTS {FTS_TABLE}')
-    conn.execute(f'CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5(body, tokenize=trigram)')
-    conn.execute(f'INSERT INTO {FTS_TABLE}(rowid, body) SELECT id, body FROM method')
-    conn.commit()
+
+def fts_dir(db_path):
+    """Каталог приставных файлов FTS-индекса: `<база>.fts`."""
+    return os.path.abspath(db_path) + FTS_DIR_SUFFIX
 
 
-def build_fts_index(db_path):
-    """Строит (перестраивает) FTS-индекс готовой базы; возвращает число методов.
+def fts_shard_paths(db_path):
+    """Файлы шардов по порядку номеров; пустой список — индекса нет."""
+    d = fts_dir(db_path)
+    if not os.path.isdir(d):
+        return []
+    names = [n for n in os.listdir(d) if n.endswith('.db') and n[:-3].isdigit()]
+    names.sort(key=lambda n: int(n[:-3]))
+    return [os.path.join(d, n) for n in names]
 
-    Отдельная команда для извлечения с --no-fts: на УНФ индекс — половина
-    времени записи (44 с), и его можно собрать позже, не переизвлекая
-    конфигурацию.
+
+def drop_fts_index(db_path):
+    """Удаляет приставной FTS-индекс базы (каталог `<база>.fts` целиком)."""
+    d = fts_dir(db_path)
+    if os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def fts_index_info(db_path):
+    """Манифест приставного индекса или None, если индекса нет/он неполный.
+
+    Манифест `index.json` пишется последним, поэтому его отсутствие означает
+    прерванную сборку, а несовпадение числа шардов — частично удалённый индекс.
+    В обоих случаях сервер обязан искать через body_has, а не молча возвращать
+    часть выдачи.
+
+    :return: {'shards': N, 'methods': M, 'created': iso} или None
+    """
+    manifest = os.path.join(fts_dir(db_path), 'index.json')
+    if not os.path.isfile(manifest):
+        return None
+    try:
+        with open(manifest, 'r', encoding='utf-8') as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if len(fts_shard_paths(db_path)) != int(info.get('shards', -1)):
+        return None
+    return info
+
+
+def _build_fts_shard(args):
+    """Сборка одного шарда; рабочий процесс пула. База открывается read-only."""
+    db_path, shard_path, part, total = args
+    if os.path.exists(shard_path):
+        os.remove(shard_path)
+    src_uri = 'file:' + os.path.abspath(db_path).replace(os.sep, '/') + '?mode=ro'
+    conn = sqlite3.connect(src_uri, uri=True)
+    try:
+        conn.execute('PRAGMA synchronous=OFF')
+        conn.execute('PRAGMA cache_size=-65536')
+        conn.execute('ATTACH DATABASE ? AS dst', (shard_path,))
+        conn.execute(f'CREATE VIRTUAL TABLE dst.{FTS_TABLE}'
+                     ' USING fts5(body, tokenize=trigram)')
+        conn.execute('BEGIN')
+        # rowid = method.id во всех шардах, поэтому части не пересекаются и
+        # объединение выдачи не требует перенумерации
+        conn.execute(f'INSERT INTO dst.{FTS_TABLE}(rowid, body)'
+                     f' SELECT id, body FROM main.method WHERE id % {total} = {part}')
+        conn.commit()
+    finally:
+        conn.close()
+    return shard_path
+
+
+def build_fts_index(db_path, workers=1):
+    """Строит (перестраивает) приставной FTS-индекс базы; возвращает число методов.
+
+    Отдельная команда для извлечения с --no-fts: на УНФ индекс дороже самой записи
+    (49.1 с одним процессом, 7.5 с в 8 шардов), и его можно собрать позже, не
+    переизвлекая конфигурацию. Индекс прежней схемы (таблица `method_fts` внутри
+    базы) при пересборке удаляется: это производные данные, и две схемы сразу не
+    нужны.
+
+    :param db_path: путь к базе знаний
+    :param workers: число процессов сборки (1 — последовательно, без пула)
     """
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute('SELECT id FROM method LIMIT 1')
-    except sqlite3.Error:
-        conn.close()
-        raise ValueError(f'это не база знаний confdb (нет таблицы method): {db_path}')
-    try:
-        conn.execute('PRAGMA synchronous=OFF')
-        conn.execute('PRAGMA cache_size=-262144')
-        _fill_fts(conn)
-        return conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
+        try:
+            conn.execute('SELECT id FROM method LIMIT 1')
+        except sqlite3.Error:
+            raise ValueError(f'это не база знаний confdb (нет таблицы method): {db_path}')
+        methods = conn.execute('SELECT COUNT(*) FROM method').fetchone()[0]
+        conn.execute(f'DROP TABLE IF EXISTS {FTS_TABLE}')
+        conn.commit()
     finally:
         conn.close()
+
+    drop_fts_index(db_path)
+    shards = max(1, min(int(workers or 1), MAX_FTS_SHARDS, max(methods, 1)))
+    os.makedirs(helper.long_path(fts_dir(db_path)), exist_ok=True)
+    tasks = [(db_path, os.path.join(fts_dir(db_path), f'{k}.db'), k, shards)
+             for k in range(shards)]
+    if shards > 1:
+        import multiprocessing
+        mp_ctx = multiprocessing.get_context('spawn')
+        with mp_ctx.Pool(shards) as pool:
+            pool.map(_build_fts_shard, tasks)
+    else:
+        _build_fts_shard(tasks[0])
+    # манифест — последним: пока его нет, индекс считается неполным
+    # (fts_index_info) и поиск идёт через body_has
+    with open(os.path.join(fts_dir(db_path), 'index.json'), 'w', encoding='utf-8') as f:
+        json.dump({'shards': shards, 'methods': methods,
+                   'created': datetime.now().isoformat(timespec='seconds')}, f)
+    return methods
 
 
 def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=1,
@@ -1149,9 +1244,11 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     :param source_file: путь к исходному .cf/.cfe/.epf (для таблицы source)
     :param store_blobs: хранить бинарные файлы (image/bin) как BLOB
     :param workers: число процессов для разбора модулей BSL (1 — последовательно)
-    :param build_fts: строить FTS5-индекс по телам методов. На УНФ это половина
-        времени записи; без индекса база рабочая (поиск по телам идёт через
-        body_has), индекс собирается позже — `confdb fts <db>`
+    :param build_fts: строить FTS5-индекс по телам методов — приставные файлы
+        `<база>.fts\0.db…`, по одному на процесс (`workers`). На УНФ это дороже
+        самой записи (7.5 с в 8 шардов против 23 с записи); без индекса база
+        рабочая (поиск по телам идёт через body_has), индекс собирается позже —
+        `confdb fts <db>`
     :param headers_dir: каталог потока заголовков декодера (helper.sink_put).
         Когда он задан, заголовки объектов берутся оттуда, а не из 47 тысяч
         файлов <Класс>.json и <Класс>.id.json дампа — на УНФ это 6 с из 27
@@ -1165,6 +1262,9 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
     os.makedirs(helper.long_path(parent), exist_ok=True)
     if os.path.exists(db_path):
         os.remove(db_path)
+    # приставной индекс — производные данные ПЕРЕЗАПИСЫВАЕМОЙ базы: без его
+    # очистки сборка с --no-fts оставила бы серверу шарды от прошлой базы
+    drop_fts_index(db_path)
 
     # снимок обхода один на все проходы записи (поиск объектов, предпроход BSL,
     # основной цикл): дамп УНФ — 26 107 каталогов и 73 537 файлов
@@ -1521,13 +1621,13 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         flush(skd_params,
               'INSERT INTO skd_query (object_id, ord, query) VALUES (?, ?, ?)')
         conn.commit()
-        # FTS5-индекс — после commit основным данным: на УНФ это половина
-        # времени записи, и без него база остаётся рабочей (поиск через body_has)
-        if build_fts:
-            _fill_fts(conn)
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    # FTS-индекс — после закрытия базы: он собирается в приставные файлы-шарды,
+    # а рабочие процессы открывают базу read-only
+    if build_fts:
+        build_fts_index(db_path, workers=workers)
     return stats
