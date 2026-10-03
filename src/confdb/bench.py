@@ -7,13 +7,13 @@
 ~/.confdb/config.json (ключ 'bench') и подставляется по умолчанию.
 """
 import os
-import shutil
 import tempfile
 import time
 from datetime import datetime
 
 from . import config as user_config
 from .db.writer import write_db
+from .extract import remove_tree
 from .v8 import container_reader
 from .v8 import helper
 from .v8.decoder import Decoder
@@ -96,9 +96,9 @@ def bench(src_file, *, sample=1000, candidates=None, store=True):
             results[workers] = (round(t_decode, 1), round(t_write, 1))
             print(f' workers={workers:2}: стадия 3 {t_decode:6.1f} c, '
                   f'запись БД {t_write:6.1f} c, итого {t_decode + t_write:6.1f} c')
-            shutil.rmtree(stage3, ignore_errors=True)
+            remove_tree(stage3)
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        remove_tree(temp_dir)
 
     best = min(results, key=lambda w: sum(results[w]))
     if store:
