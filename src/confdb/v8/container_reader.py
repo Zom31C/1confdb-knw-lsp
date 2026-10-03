@@ -67,12 +67,14 @@ def decompress_and_extract(src_folder, dest_folder, *, pool=None):
     helper.clear_dir(dest_folder)
     tasks = []
     total = 0
+    show_progress = progress.is_enabled()
     for container in containers:
         _src_folder = os.path.join(src_folder, container)
         _dest_folder = os.path.join(dest_folder, container)
         helper.clear_dir(_dest_folder)
         for filename in os.listdir(_src_folder):
-            size = os.path.getsize(os.path.join(_src_folder, filename))
+            # размер файла нужен только индикатору — без него это лишние getsize
+            size = os.path.getsize(os.path.join(_src_folder, filename)) if show_progress else 0
             total += size
             tasks.append([_src_folder, filename, _dest_folder, size])
 

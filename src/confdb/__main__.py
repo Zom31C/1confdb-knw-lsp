@@ -35,6 +35,10 @@ def build_parser():
                    help='не строить FTS-индекс по телам методов (половина времени '
                         'записи БД); поиск по телам останется рабочим, но медленным, '
                         'индекс собирается позже — "confdb fts <база>"')
+    p.add_argument('--dump-indent', action='store_true',
+                   help='писать JSON дампа с отступами, как v8unpack — для побайтового '
+                        'сравнения дампов; по умолчанию вывод компактный, с ним стадия 3 '
+                        'заметно быстрее, а дамп примерно втрое меньше')
 
     c = subparsers.add_parser('check', help='проверить запросы СКД в готовой базе')
     c.add_argument('db', help='путь к базе SQLite')
@@ -202,6 +206,8 @@ def main(argv=None):
         options['prefix'] = args.prefix
     if args.skip_errors:
         options['skip_errors'] = True
+    if args.dump_indent:
+        options['dump_indent'] = 2
 
     try:
         stats = extract(

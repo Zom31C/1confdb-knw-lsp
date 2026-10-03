@@ -83,8 +83,10 @@ class MetaDataObject(MetaObject):
 
             id_data = self.decode_ids()
             self.header['obj_version'] = self.obj_version
-            helper.json_write(id_data, dest_full_path, f'{file_name}.id.json')
-            helper.json_write(self.header, dest_full_path, f'{file_name}.json')
+            helper.json_write(id_data, dest_full_path, f'{file_name}.id.json',
+                              indent=self.get_options('dump_indent'))
+            helper.json_write(self.header, dest_full_path, f'{file_name}.json',
+                              indent=self.get_options('dump_indent'))
             self.write_decode_code(dest_full_path, file_name)
         except Exception as err:
             raise ExtException(parent=err)

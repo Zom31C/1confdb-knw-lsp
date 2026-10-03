@@ -125,10 +125,14 @@ class Decoder:
     def decode(cls, src_dir, dest_dir, *, pool=None, options=None, workers=1):
         begin = datetime.now()
         print(f'{"Разбираем объект":30}')
+        # обход всего дерева стадии 1 нужен только проценту индикатора: когда он не
+        # рисуется (пайп, редирект), это десятки тысяч os.path.getsize впустую
+        show_progress = progress.is_enabled()
         total = 0
-        for dirpath, _, filenames in os.walk(src_dir):
-            for fn in filenames:
-                total += os.path.getsize(os.path.join(dirpath, fn))
+        if show_progress:
+            for dirpath, _, filenames in os.walk(src_dir):
+                for fn in filenames:
+                    total += os.path.getsize(os.path.join(dirpath, fn))
 
         own_pool = False
         _reset_err_counter()
@@ -136,7 +140,7 @@ class Decoder:
         if workers and workers > 1 and pool is None:
             import multiprocessing
             ctx = multiprocessing.get_context('spawn')
-            shared = ctx.Value('Q', 0)
+            shared = ctx.Value('Q', 0) if show_progress else None
             progress.start('Декодируем метаданные', total, shared=shared)
             pool = ctx.Pool(workers, initializer=_worker_init, initargs=(shared, err_count))
             own_pool = True

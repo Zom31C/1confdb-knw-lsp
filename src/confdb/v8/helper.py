@@ -62,12 +62,20 @@ def json_read(path, file_name):
         raise ExtException(message='Ошибка чтения', detail=f'{err} в файле ({_path})')
 
 
-def json_write(data, path, file_name):
+def json_write(data, path, file_name, indent=None):
+    """Запись JSON в дамп.
+
+    По умолчанию вывод компактный: `json.dumps` без отступов включает C-энкодер `_json`,
+    тогда как `json.dump` и любой `indent` всегда идут через рекурсивный Python-энкодер.
+    Замер на 405 МиБ заголовков УНФ: 12.98 с и 366 МиБ против 2.19 с и 127 МиБ.
+    `indent=2` возвращает побайтовое совпадение с дампом v8unpack (опция `--dump-indent`)
+    — его и применяют для сверки эквивалентности декодера.
+    """
     _path = os.path.normpath(os.path.join(path, file_name))
     makedirs(path, exist_ok=True)
     try:
         with open(long_path(_path), 'w', encoding='utf-8') as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.write(json.dumps(data, ensure_ascii=False, indent=indent))
     except Exception as err:
         raise ExtException(message='Ошибка записи', detail=f'{err} в файле ({_path})')
 

@@ -25,6 +25,8 @@ class Progress:
             enabled = bool(getattr(self.stream, 'isatty', None) and self.stream.isatty())
         self.enabled = enabled
         self._shared = shared
+        # байты считаются только когда индикатор рисуется сам или питает родительский
+        self.counting = bool(enabled or shared is not None)
         self._last = 0.0
         self._width = 0
         self._lock = threading.Lock()
@@ -86,6 +88,11 @@ class Progress:
             self._width = 0
 
 
+def is_enabled():
+    """Рисуется ли индикатор: вывод в терминал, а не в пайп или редирект."""
+    return bool(getattr(sys.stdout, 'isatty', None) and sys.stdout.isatty())
+
+
 def start(title, total=0, shared=None):
     """Создаёт и активирует индикатор; finish() деактивирует.
 
@@ -97,18 +104,24 @@ def start(title, total=0, shared=None):
 
 
 def attach_shared(shared):
-    """Инициализатор дочерних процессов: счётчик без отрисовки."""
+    """Инициализатор дочерних процессов: счётчик без отрисовки.
+
+    shared=None — индикатор не рисуется, поэтому учёт в дочернем процессе не нужен
+    вовсе: note_read не платит ни os.path.getsize, ни захватом межпроцессного лока.
+    """
     global CURRENT
-    CURRENT = Progress('', 0, enabled=False, shared=shared)
+    CURRENT = Progress('', 0, enabled=False, shared=shared) if shared is not None else None
 
 
 def note_read(path):
     """Учитывает прочитанный файл в активном индикаторе."""
-    if CURRENT is not None:
-        try:
-            CURRENT.update(os.path.getsize(path))
-        except OSError:
-            pass
+    current = CURRENT
+    if current is None or not current.counting:
+        return
+    try:
+        current.update(os.path.getsize(path))
+    except OSError:
+        pass
 
 
 def finish():

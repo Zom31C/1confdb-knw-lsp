@@ -207,8 +207,10 @@ class FormCore(SimpleNameFolder):
             # 'name': self.header.pop('name'),
         }
         self.header['obj_version'] = self.obj_version
-        helper.json_write(id_data, dest_full_path, f'{file_name}.id.json')
-        helper.json_write(self.header, dest_full_path, f'{file_name}.json')
+        helper.json_write(id_data, dest_full_path, f'{file_name}.id.json',
+                          indent=self.get_options('dump_indent'))
+        helper.json_write(self.header, dest_full_path, f'{file_name}.json',
+                          indent=self.get_options('dump_indent'))
         self.write_decode_code(dest_full_path, file_name)
 
         helper.json_write(
@@ -219,7 +221,8 @@ class FormCore(SimpleNameFolder):
                 tree=self.elements_tree,
                 data=self.elements_data,
             ),
-            self.new_dest_dir, f"{file_name}.elem.json")
+            self.new_dest_dir, f"{file_name}.elem.json",
+            indent=self.get_options('dump_indent'))
         return []
 
     def decode_data(self, src_dir, uuid):

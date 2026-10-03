@@ -238,7 +238,8 @@ class MetaObject:
             for elem in self._obj_info:
                 try:
                     data = helper.brace_file_read(src_dir, f'{self.header["uuid"]}.{self._obj_info[elem]}')
-                    helper.json_write(data, dest_dir, f'{dest_file_name}.{self._obj_info[elem]}.json')
+                    helper.json_write(data, dest_dir, f'{dest_file_name}.{self._obj_info[elem]}.json',
+                                      indent=self.get_options('dump_indent'))
 
                 except FileNotFoundError:
                     pass
@@ -315,7 +316,8 @@ class Configuration(MetaObject):
 
         tasks = self.decode_includes(src_dir, dest_dir, '', self.header['header'])
         self.header['obj_version'] = self.obj_version
-        helper.json_write(self.header, dest_dir, f'{file_name}.json')
+        helper.json_write(self.header, dest_dir, f'{file_name}.json',
+                          indent=self.get_options('dump_indent'))
         self.write_decode_code(dest_dir, file_name)
         return tasks
 
@@ -390,7 +392,8 @@ class ExternalDataProcessor(MetaObject):
         tasks = self.decode_includes(src_dir, dest_dir, '', self.header['header'])
 
         self.header['obj_version'] = self.obj_version
-        helper.json_write(self.header, dest_dir, f'{_file_name}.json')
+        helper.json_write(self.header, dest_dir, f'{_file_name}.json',
+                          indent=self.get_options('dump_indent'))
         self.write_decode_code(dest_dir, 'ExternalDataProcessor')
 
         return tasks
@@ -454,7 +457,8 @@ class ConfigurationExtension(Configuration):
 
         helper.txt_write(helper.str_decode(product_version), dest_dir, 'version.bin', encoding='utf-8')
         self.header['obj_version'] = self.obj_version
-        helper.json_write(self.header, dest_dir, f'{self.get_class_name_without_version()}.json')
+        helper.json_write(self.header, dest_dir, f'{self.get_class_name_without_version()}.json',
+                          indent=self.get_options('dump_indent'))
         self.write_decode_code(dest_dir, self.__class__.__name__)
 
         return tasks
