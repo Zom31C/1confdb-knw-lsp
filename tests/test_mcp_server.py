@@ -17,16 +17,12 @@ from confdb.mcp_server import McpServer, resolve_db, start_http_server  # noqa: 
 from test_writer import make_chart_dump, make_dump  # noqa: E402
 
 
-def _one_db(tmp_path_factory):
+def _server(tmp_path_factory):
     dump = str(tmp_path_factory.mktemp('dump'))
     make_dump(dump)
     db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
     write_db(dump, db, source_file='t.cf')
-    return db
-
-
-def _server(tmp_path_factory):
-    return McpServer(_one_db(tmp_path_factory))
+    return McpServer(db)
 
 
 def _call(server, tool, **args):
@@ -51,79 +47,17 @@ def test_tools_list(tmp_path_factory):
                      'find_method_context', 'method_dependencies',
                      'method_result_schema', 'find_methods',
                      'skd_of', 'find_skd', 'xdto_of', 'find_xdto',
-                     'check_query', 'schema', 'sql',
+                     'check_query', 'sql',
                      'compare_object', 'extension_diff', 'configuration_info',
-                     'db_list', 'db_open', 'db_use', 'db_close'}
-    # синтаксис модулей проверяет BSL Language Server (инструменты bsl_*),
-    # отдельного check_bsl в реестре нет
+                     'db_list', 'db_open', 'db_use', 'db_close',
+                     'group_create', 'group_add_db', 'group_remove_db',
+                     'group_list', 'group_use', 'group_close'}
+    # проверку синтаксиса модулей делает BSL Language Server (1confdb-knw-lsp),
+    # в mainline её быть не должно
     assert 'check_bsl' not in names
     # каждый инструмент указывает функцию-обработчик и схему
     for tool in resp['result']['tools']:
         assert tool['description'] and tool['inputSchema']['type'] == 'object'
-
-
-def test_db_schema(tmp_path_factory):
-    server = _server(tmp_path_factory)
-    resp = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-                          'params': {'name': 'schema', 'arguments': {}}})
-    text = resp['result']['content'][0]['text']
-    assert 'meta_object' in text and 'module' in text and 'строк' in text
-
-
-def test_get_method_pagination(tmp_path_factory):
-    db = _one_db(tmp_path_factory)
-    long_body = '\n'.join(['\tА = 1;'] +
-                          [f'\t// строка {i}' for i in range(320)] +
-                          ['\tБ = 2;'])
-    with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE method SET body=? WHERE name='Тест'", (long_body,))
-    server = McpServer(db)
-    text = _call(server, 'get_method', path='Справочник.Справочник1',
-                 code_name='obj', name='Тест')['content'][0]['text']
-    assert 'строки 1-250 из 322' in text
-    assert 'продолжение: offset=250' in text
-    tail = _call(server, 'get_method', path='Справочник.Справочник1',
-                 code_name='obj', name='Тест',
-                 offset=250, limit=100)['content'][0]['text']
-    assert 'строки 251-322 из 322' in tail
-    assert 'продолжение' not in tail
-    assert 'Б = 2;' in tail
-
-
-def test_module_outline_pagination(tmp_path_factory):
-    db = _one_db(tmp_path_factory)
-    long_body = '\n'.join(f'// заголовок {i}' for i in range(400))
-    with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE module SET body=? WHERE code_name='obj'",
-                     (long_body,))
-    server = McpServer(db)
-    text = _call(server, 'module_outline', path='Справочник.Справочник1',
-                 code_name='obj')['content'][0]['text']
-    assert 'строки 1-300 из 400' in text and 'продолжение: offset=300' in text
-
-
-def test_object_card_enum_and_predefined(tmp_path_factory):
-    db = _one_db(tmp_path_factory)
-    with sqlite3.connect(db) as conn:
-        oid = conn.execute("SELECT id FROM meta_object "
-                           "WHERE path='Catalog/Справочник1'").fetchone()[0]
-        # перечисление
-        conn.execute("UPDATE meta_object SET type='Enum' WHERE id=?", (oid,))
-        conn.execute("INSERT INTO enum_value (object_id, ord, name) "
-                     "VALUES (?, 1, 'Значение1'), (?, 2, 'Значение2')",
-                     (oid, oid))
-    server = McpServer(db)
-    text = _call(server, 'object_card',
-                 path='Catalog/Справочник1')['content'][0]['text']
-    assert 'Значения перечисления' in text and 'Значение1' in text
-    # предопределённые элементы справочника: дерево с кодом и наименованием
-    with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE meta_object SET type='Catalog' WHERE id=?", (oid,))
-        conn.execute("INSERT INTO predefined (object_id, ord, parent_ord, name, code) "
-                     "VALUES (?, 2, 0, 'Основной', '001')", (oid,))
-    text = _call(server, 'object_card',
-                 path='Catalog/Справочник1')['content'][0]['text']
-    assert 'Предопределённые элементы (2):' in text and '001 Основной' in text
 
 
 def test_find_objects_and_card(tmp_path_factory):
@@ -237,6 +171,117 @@ def test_object_card_tabular_sections(tmp_path_factory):
     assert 'None' not in card
 
 
+def test_object_card_predefined_accounts(tmp_path_factory):
+    # предопределённые счета плана печатаются деревом, с видами субконто и их
+    # флагами; корневой узел «Счета» в отчёт не попадает, но входит в дерево
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    make_chart_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf')
+    server = McpServer(db)
+    card = _call(server, 'object_card',
+                 path='ПланСчетов.ПланСчетов1')['content'][0]['text']
+    assert 'Предопределённые счета (3):' in card
+    assert '\n  01 ОсновныеСредства — Основные средства\n' in card
+    assert '\n    01.01 ОСвОрганизации — Основные средства в организации\n' in card
+    assert ('      субконто: Основные средства [Суммовой;Валютный;Количественный]'
+            in card)
+    assert ('  41 Товары\n'
+            '    субконто: Номенклатура [Суммовой;Валютный;Количественный];'
+            ' Основные средства') in card
+
+    # у справочника тот же блок называется «элементы» и идёт деревом
+    card_cat = _call(server, 'object_card',
+                     path='Справочник.Справочник1')['content'][0]['text']
+    assert 'Предопределённые элементы (1):' in card_cat
+    assert '  001 ПредЗначение — Предопределенное значение' in card_cat
+
+
+def test_object_card_sees_unextracted_tabular_fields(tmp_path_factory):
+    # секция объявляет поля, но в базе их нет: паспорт называет это пробелом
+    # извлечения и не выдаёт за пустую секцию конфигурации
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf')
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM meta_attribute WHERE tabular='Оплата'")
+    conn.commit()
+    conn.close()
+    card = _call(McpServer(db), 'object_card',
+                 path='Документ.ЗаказПокупателя')['content'][0]['text']
+    assert 'Табличная часть Оплата: полей не извлечено' in card
+    assert 'Табличная часть Доставка: полей не объявлено' in card
+
+
+def test_object_card_header_names_type_in_russian(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='Справочник.Справочник1')['content'][0]['text']
+    # тип в паспорте — как в конфигураторе, без английского stem
+    assert ('Справочник.Справочник1 — Справочник, имя Справочник1'
+            in card.splitlines())
+    assert '(Catalog)' not in card
+    # в списке find_objects stem остаётся: это значение фильтра type= и
+    # колонки meta_object.type для sql
+    listed = _call(server, 'find_objects',
+                   mask='Справочник1')['content'][0]['text']
+    assert 'Справочник.Справочник1 — Справочник (Catalog)' in listed
+
+
+def test_object_card_event_subscription(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='Подписка на событие.ПодпискаТест')['content'][0]['text']
+    # имя события — как в конфигураторе, без внутреннего английского имени
+    assert 'Событие: ПередЗаписью' in card
+    assert 'BeforeWrite' not in card
+    assert 'Обработчик: Общий модуль.ОбщийМодуль1.Экспортная' in card
+    # один источник распознан, второго в базе нет — и это сказано, а не потеряно
+    assert ('Источники (2): Определяемый тип.ТипТест; '
+            '1 из 2 не распознано') in card
+
+
+def test_object_card_shows_subscriptions_of_a_source(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='Определяемый тип.ТипТест')['content'][0]['text']
+    assert ('Подписки на события: ПередЗаписью → '
+            'Общий модуль.ОбщийМодуль1.Экспортная') in card
+    # у объекта, на который ничего не подписано, такой строки нет
+    other = _call(server, 'object_card',
+                  path='Документ.ЗаказПокупателя')['content'][0]['text']
+    assert 'Подписки на события' not in other
+
+
+def test_get_method_names_event_subscriptions(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    text = _call(server, 'get_method', path='Общий модуль.ОбщийМодуль1',
+                 code_name='obj', name='Экспортная')['content'][0]['text']
+    # обработчик подписки вызывает платформа: вызова в коде нет, поэтому
+    # без этой строки метод выглядит неиспользуемым
+    assert ('вызывается подписками на события: ПередЗаписью — '
+            'Подписка на событие.ПодпискаТест (источников: 2)') in text
+    other = _call(server, 'get_method', path='Общий модуль.ОбщийМодуль1',
+                  code_name='obj', name='Закрытая')['content'][0]['text']
+    assert 'вызывается подписками на события' not in other
+
+
+def test_object_card_exchange_plan_content(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    card = _call(server, 'object_card',
+                 path='План обмена.ПланОбмена1')['content'][0]['text']
+    # состав плана — объекты, которые он синхронизирует; uuid в info обычные
+    # meta_object.uuid, поэтому имена определяются, а не угадываются
+    assert ('Состав плана обмена (2): Справочник.Справочник1, '
+            'Определяемый тип.ТипТест') in card
+    # у объекта, который не план обмена, такой строки нет
+    other = _call(server, 'object_card',
+                  path='Справочник.Справочник1')['content'][0]['text']
+    assert 'Состав плана обмена' not in other
+
+
 def test_object_card_names_why_a_type_is_unresolved(tmp_path_factory):
     server = _server(tmp_path_factory)
     card = _call(server, 'object_card',
@@ -296,6 +341,16 @@ def test_find_xdto(tmp_path_factory):
     assert 'Пакет XDTO.ПакетТест — тип Товар (базовый d2p1:БазовыйТовар)' in by_type
     assert 'в пакетах XDTO ничего не найдено по «НетТакогоСвойства»' in \
         _call(server, 'find_xdto', mask='НетТакогоСвойства')['content'][0]['text']
+
+
+def test_characteristic_type_stem_is_translated():
+    # класс декодера — ChartOfCharacteristicType, в единственном числе: при
+    # множественном ключе в TYPE_RU тип печатался по-английски (и type_ru в
+    # базе оказывался равен stem), а русское имя не находило объект
+    assert mcp_server.ru_path('ChartOfCharacteristicType/Свойства') \
+        == 'План видов характеристик.Свойства'
+    assert 'ChartOfCharacteristicType' in \
+        mcp_server._RU2TYPES_LOW['планвидовхарактеристик']
 
 
 def test_path_type_is_case_insensitive(tmp_path_factory):
@@ -460,6 +515,45 @@ def test_analyze_resolves_modules_and_context(tmp_path_factory):
     # общий модуль с контекстом «Сервер» вызывается из клиентского кода
     assert report['context_warnings']
     assert 'серверный общий модуль' in report['context_warnings'][0]
+
+
+def test_analyze_detects_dynamic_calls(tmp_path_factory):
+    """Вычислить/Выполнить со строковыми литералами — динамические вызовы.
+
+    Анализатор должен найти строковые литералы, переданные в Вычислить() и
+    Выполнить(), и попытаться разрешить их как имена методов/модулей/объектов.
+    """
+    from confdb.bsl_analyzer import analyze
+    server = _server(tmp_path_factory)
+    code = ('Процедура Тест()\n'
+            '    Вычислить("ОбщийМодуль1.Экспортная");\n'
+            '    Вычислить("ОбщийМодуль1.Закрытая");\n'
+            '    Вычислить("ОбщийМодуль1.НетТакого");\n'
+            '    Вычислить("Справочники.Справочник1");\n'
+            '    Вычислить("Справочники.НетТакого");\n'
+            '    Вычислить("Неизвестный.Метод");\n'
+            '    Вычислить("ОбщийМодуль1");\n'
+            '    Выполнить("1 + 1");\n'
+            'КонецПроцедуры\n')
+    report = analyze(code, server.bsl_ctx())
+    dynamic = report['dynamic_calls']
+    # Литерал "1 + 1" не похож на идентификатор — не попадает
+    by_literal = {lit: (func, res) for _line, func, lit, res in dynamic}
+    assert 'ОбщийМодуль1.Экспортная' in by_literal
+    assert 'ok' in by_literal['ОбщийМодуль1.Экспортная'][1]
+    assert 'ОбщийМодуль1.Закрытая' in by_literal
+    assert 'не Экспорт' in by_literal['ОбщийМодуль1.Закрытая'][1]
+    assert 'ОбщийМодуль1.НетТакого' in by_literal
+    assert 'не найден' in by_literal['ОбщийМодуль1.НетТакого'][1]
+    assert 'Справочники.Справочник1' in by_literal
+    assert 'объект метаданных' in by_literal['Справочники.Справочник1'][1]
+    assert 'Справочники.НетТакого' in by_literal
+    assert 'не найден' in by_literal['Справочники.НетТакого'][1]
+    assert 'Неизвестный.Метод' in by_literal
+    assert 'не разрешено' in by_literal['Неизвестный.Метод'][1]
+    assert 'ОбщийМодуль1' in by_literal
+    assert 'общий модуль' in by_literal['ОбщийМодуль1'][1]
+    assert '1 + 1' not in by_literal  # не идентификатор
 
 
 def test_find_methods_searches_bodies(tmp_path_factory):
@@ -1045,378 +1139,150 @@ def test_find_db_candidates_dedup(tmp_path, monkeypatch):
                      str(tmp_path / '_out' / 'c.db')]
 
 
-# -- удобные формы путей модулей и опциональные маски -------------------
+# -- тесты групп конфигураций ------------------------------------------------
 
-def test_module_path_forms(tmp_path_factory):
+def _get_text(result):
+    """Извлекает текст из результата вызова инструмента."""
+    if isinstance(result, dict) and 'content' in result:
+        return result['content'][0]['text']
+    return str(result)
+
+
+def test_group_create_and_list(tmp_path_factory):
     server = _server(tmp_path_factory)
-    base = _call(server, 'module_outline', path='Справочник.Справочник1',
-                 code_name='obj')['content'][0]['text']
-    assert 'не найден' not in base
-    for form in ('Справочник.Справочник1.obj',
-                 'Справочник.Справочник1.obj.bsl',
-                 'Справочник.Справочник1.МодульОбъекта'):
-        text = _call(server, 'module_outline',
-                     path=form)['content'][0]['text']
-        assert text == base, form
-    # путь файла дампа
-    text = _call(server, 'module_outline',
-                 path='Catalog/Справочник1/Catalog.obj.bsl')['content'][0]['text']
-    assert text == base
-    # get_method с формой 'Объект.mgr'/'объект.obj.bsl'
-    m = _call(server, 'get_method', path='Справочник.Справочник1.obj.bsl',
-              code_name='obj', name='Тест')['content'][0]['text']
-    assert 'Процедура Тест' in m
+    # Создаём группу
+    result = _call(server, 'group_create', name='тестовая группа')
+    text = _get_text(result)
+    assert 'группа создана' in text
+    assert 'тестовая группа' in text
+    # Список групп
+    groups = _call(server, 'group_list')
+    text = _get_text(groups)
+    assert 'тестовая группа' in text
+    assert '0 баз' in text
 
 
-def test_optional_masks(tmp_path_factory):
+def test_group_add_and_remove_db(tmp_path_factory):
     server = _server(tmp_path_factory)
-    # просмотр объектов типа без маски
-    text = _call(server, 'find_objects', type='Catalog')['content'][0]['text']
+    # Получаем реальный алиас базы
+    db_alias = list(server.dbs.keys())[0]
+    # Открываем ту же базу под вторым алиасом
+    db_path = server.dbs[db_alias]['path']
+    server.open_db(db_path, alias='db2')
+    # Создаём группу и добавляем базы
+    _call(server, 'group_create', name='группа1')
+    result = _call(server, 'group_add_db', group='группа1', db=db_alias)
+    text = _get_text(result)
+    assert 'добавлена в группу' in text
+    result = _call(server, 'group_add_db', group='группа1', db='db2')
+    text = _get_text(result)
+    assert 'добавлена в группу' in text
+    # Проверяем список
+    groups = _call(server, 'group_list')
+    text = _get_text(groups)
+    assert 'группа1 (2 баз)' in text
+    # Убираем одну базу
+    result = _call(server, 'group_remove_db', group='группа1', db='db2')
+    text = _get_text(result)
+    assert 'удалена из группы' in text
+    groups = _call(server, 'group_list')
+    text = _get_text(groups)
+    assert 'группа1 (1 баз)' in text
+
+
+def test_group_use(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    _call(server, 'group_create', name='группа1')
+    _call(server, 'group_create', name='группа2')
+    # Первая созданная группа становится активной
+    groups = _call(server, 'group_list')
+    text = _get_text(groups)
+    assert '* группа1' in text
+    # Переключаем активную группу
+    result = _call(server, 'group_use', group='группа2')
+    text = _get_text(result)
+    assert 'активная группа: группа2' in text
+    groups = _call(server, 'group_list')
+    text = _get_text(groups)
+    assert '* группа2' in text
+
+
+def test_group_close(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    _call(server, 'group_create', name='группа1')
+    _call(server, 'group_create', name='группа2')
+    result = _call(server, 'group_close', group='группа1')
+    text = _get_text(result)
+    assert 'группа группа1 удалена' in text
+    groups = _call(server, 'group_list')
+    text = _get_text(groups)
+    assert 'группа1' not in text
+    assert 'группа2' in text
+
+
+def test_group_fanout_in_tools(tmp_path_factory):
+    """Параметр group выполняет инструмент по всем базам группы."""
+    server = _server(tmp_path_factory)
+    db_alias = list(server.dbs.keys())[0]
+    # Открываем ту же базу под вторым алиасом
+    db_path = server.dbs[db_alias]['path']
+    server.open_db(db_path, alias='db2')
+    # Создаём группу с двумя базами
+    _call(server, 'group_create', name='все базы')
+    _call(server, 'group_add_db', group='все базы', db=db_alias)
+    _call(server, 'group_add_db', group='все базы', db='db2')
+    # Запрос с group — должен вернуть результаты из обеих баз
+    result = _call(server, 'find_objects', mask='Справочник', group='все базы')
+    text = _get_text(result)
+    assert 'группа все базы / база' in text
     assert 'Справочник.Справочник1' in text
-    # список методов объекта без маски
-    text = _call(server, 'find_methods',
-                 path='Справочник.Справочник1')['content'][0]['text']
-    assert 'Тест' in text
 
 
-def test_http_client_reset_is_quiet(tmp_path_factory):
-    """Обрыв соединения клиентом (RST на keep-alive) не должен печатать
-    traceback и не должен ронять сервер."""
-    import contextlib
-    import http.client
-    import io
-    import socket
-    import struct
-    import time
-
+def test_group_star_fanout(tmp_path_factory):
+    """group='*' выполняет инструмент по всем группам."""
     server = _server(tmp_path_factory)
-    httpd, port = start_http_server(server)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-                       'params': {}}).encode('utf-8')
-    headers = {'Content-Type': 'application/json'}
-    try:
-        conn = http.client.HTTPConnection('127.0.0.1', port)
-        conn.request('POST', '/mcp', body=body, headers=headers)
-        assert conn.getresponse().status == 200
-        conn.close()
-
-        # клиент обрывает соединение с RST (SO_LINGER с нулевой задержкой)
-        sock = socket.create_connection(('127.0.0.1', port))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                        struct.pack('ii', 1, 0))
-        err_buf = io.StringIO()
-        with contextlib.redirect_stderr(err_buf):
-            sock.close()
-            time.sleep(0.5)
-        assert 'Traceback' not in err_buf.getvalue()
-
-        # сервер жив и обслуживает следующие запросы
-        conn = http.client.HTTPConnection('127.0.0.1', port)
-        conn.request('POST', '/mcp', body=body, headers=headers)
-        assert conn.getresponse().status == 200
-        conn.close()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+    db_alias = list(server.dbs.keys())[0]
+    # Открываем ту же базу под вторым алиасом
+    db_path = server.dbs[db_alias]['path']
+    server.open_db(db_path, alias='db2')
+    # Создаём две группы
+    _call(server, 'group_create', name='группа1')
+    _call(server, 'group_add_db', group='группа1', db=db_alias)
+    _call(server, 'group_create', name='группа2')
+    _call(server, 'group_add_db', group='группа2', db='db2')
+    # Запрос с group='*'
+    result = _call(server, 'find_objects', mask='Справочник', group='*')
+    text = _get_text(result)
+    assert '=== группа группа1 ===' in text
+    assert '=== группа группа2 ===' in text
+    assert 'Справочник.Справочник1' in text
 
 
-def test_http_chunked_request(tmp_path_factory):
-    """Claude Code шлёт POST с Transfer-Encoding: chunked — сервер обязан
-    прочитать тело и ответить 200."""
-    import http.client
-
+def test_group_priority_over_db(tmp_path_factory):
+    """Параметр group имеет приоритет над db."""
     server = _server(tmp_path_factory)
-    httpd, port = start_http_server(server)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-                       'params': {}}).encode('utf-8')
-    try:
-        conn = http.client.HTTPConnection('127.0.0.1', port)
-        # iterable-тело — http.client сам включает chunked-кодировку
-        conn.request('POST', '/mcp', body=iter([body]),
-                     headers={'Content-Type': 'application/json'})
-        resp = conn.getresponse()
-        assert resp.status == 200
-        data = json.loads(resp.read().decode('utf-8'))
-        assert data['result']['serverInfo']['name'] == '1confdb-knw'
-        conn.close()
-
-        # сервер продолжает работать и отвечать на обычные запросы
-        conn = http.client.HTTPConnection('127.0.0.1', port)
-        conn.request('POST', '/mcp', body=body,
-                     headers={'Content-Type': 'application/json'})
-        assert conn.getresponse().status == 200
-        conn.close()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+    db_alias = list(server.dbs.keys())[0]
+    # Открываем ту же базу под вторым алиасом
+    db_path = server.dbs[db_alias]['path']
+    server.open_db(db_path, alias='db2')
+    _call(server, 'group_create', name='группа1')
+    _call(server, 'group_add_db', group='группа1', db=db_alias)
+    _call(server, 'group_add_db', group='группа1', db='db2')
+    # Указаны и group, и db — group должен победить
+    result = _call(server, 'find_objects', mask='Справочник', group='группа1', db=db_alias)
+    text = _get_text(result)
+    # Должны вернуться результаты из обеих баз группы, а не только из db
+    assert 'группа группа1 / база' in text
 
 
-def test_http_unknown_path_drains_body(tmp_path_factory):
-    """404 на неизвестный путь обязан дочитать тело, иначе keep-alive
-    соединение съезжает (следующий запрос ломается)."""
-    import http.client
-
+def test_group_header_in_response(tmp_path_factory):
+    """Заголовки ответов идентифицируют группу при работе с группой."""
     server = _server(tmp_path_factory)
-    httpd, port = start_http_server(server)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        conn = http.client.HTTPConnection('127.0.0.1', port)
-        conn.request('POST', '/register',
-                     body=b'{"client_name": "test"}',
-                     headers={'Content-Type': 'application/json'})
-        resp = conn.getresponse()
-        assert resp.status == 201  # регистрация клиентов поддерживается
-        resp.read()
-        # то же соединение должно остаться рабочим
-        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-                           'params': {}}).encode('utf-8')
-        conn.request('POST', '/mcp', body=body,
-                     headers={'Content-Type': 'application/json'})
-        assert conn.getresponse().status == 200
-        conn.close()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-def test_http_oauth_flow(tmp_path_factory):
-    """OAuth 2.1 для клиентов типа Claude Code: метаданные, регистрация,
-    authorize с авто-редиректом, обмен кода с PKCE, работа MCP с токеном."""
-    import base64
-    import hashlib
-    import http.client
-    from urllib.parse import parse_qs, urlparse
-
-    server = _server(tmp_path_factory)
-    httpd, port = start_http_server(server)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        conn = http.client.HTTPConnection('127.0.0.1', port)
-
-        conn.request('GET', '/.well-known/oauth-protected-resource')
-        resp = conn.getresponse()
-        assert resp.status == 200
-        meta = json.loads(resp.read())
-        assert meta['authorization_servers']
-
-        conn.request('GET', '/.well-known/oauth-authorization-server')
-        meta = json.loads(conn.getresponse().read())
-        assert meta['registration_endpoint'].endswith('/oauth/register')
-        assert 'S256' in meta['code_challenge_methods_supported']
-
-        reg = json.dumps({'client_name': 'Claude Code',
-                          'redirect_uris': ['http://localhost:9/cb'],
-                          'grant_types': ['authorization_code'],
-                          'token_endpoint_auth_method': 'none'}).encode()
-        conn.request('POST', '/oauth/register', body=reg,
-                     headers={'Content-Type': 'application/json'})
-        resp = conn.getresponse()
-        assert resp.status == 201
-        client_id = json.loads(resp.read())['client_id']
-        assert client_id
-
-        verifier = 'verifier-1234567890abcdef'
-        challenge = base64.urlsafe_b64encode(
-            hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
-        conn.request('GET', '/oauth/authorize?'
-                     f'client_id={client_id}&redirect_uri=http://localhost:9/cb'
-                     f'&code_challenge={challenge}&code_challenge_method=S256'
-                     '&state=xyz')
-        resp = conn.getresponse()
-        assert resp.status == 302
-        location = resp.getheader('Location')
-        resp.read()
-        qs = parse_qs(urlparse(location).query)
-        assert qs['state'] == ['xyz']
-        code = qs['code'][0]
-
-        conn.request('POST', '/oauth/token',
-                     body=(f'grant_type=authorization_code&code={code}'
-                           f'&code_verifier={verifier}'
-                           '&redirect_uri=http://localhost:9/cb'
-                           f'&client_id={client_id}').encode(),
-                     headers={'Content-Type':
-                              'application/x-www-form-urlencoded'})
-        resp = conn.getresponse()
-        assert resp.status == 200
-        token = json.loads(resp.read())
-        assert token['access_token'] and token['token_type'] == 'Bearer'
-
-        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-                           'params': {}}).encode('utf-8')
-        conn.request('POST', '/mcp', body=body,
-                     headers={'Content-Type': 'application/json',
-                              'Authorization':
-                                  'Bearer ' + token['access_token']})
-        assert conn.getresponse().status == 200
-        conn.close()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-
-def test_object_card_predefined_accounts(tmp_path_factory):
-    # предопределённые счета плана печатаются деревом, с видами субконто и их
-    # флагами; корневой узел «Счета» в отчёт не попадает, но входит в дерево
-    dump = str(tmp_path_factory.mktemp('dump'))
-    make_dump(dump)
-    make_chart_dump(dump)
-    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
-    write_db(dump, db, source_file='t.cf')
-    server = McpServer(db)
-    card = _call(server, 'object_card',
-                 path='ПланСчетов.ПланСчетов1')['content'][0]['text']
-    assert 'Предопределённые счета (3):' in card
-    assert '\n  01 ОсновныеСредства — Основные средства\n' in card
-    assert '\n    01.01 ОСвОрганизации — Основные средства в организации\n' in card
-    assert ('      субконто: Основные средства [Суммовой;Валютный;Количественный]'
-            in card)
-    assert ('  41 Товары\n'
-            '    субконто: Номенклатура [Суммовой;Валютный;Количественный];'
-            ' Основные средства') in card
-
-    # у справочника тот же блок называется «элементы» и идёт деревом
-    card_cat = _call(server, 'object_card',
-                     path='Справочник.Справочник1')['content'][0]['text']
-    assert 'Предопределённые элементы (1):' in card_cat
-    assert '  001 ПредЗначение — Предопределенное значение' in card_cat
-
-
-def test_object_card_sees_unextracted_tabular_fields(tmp_path_factory):
-    # секция объявляет поля, но в базе их нет: паспорт называет это пробелом
-    # извлечения и не выдаёт за пустую секцию конфигурации
-    dump = str(tmp_path_factory.mktemp('dump'))
-    make_dump(dump)
-    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
-    write_db(dump, db, source_file='t.cf')
-    conn = sqlite3.connect(db)
-    conn.execute("DELETE FROM meta_attribute WHERE tabular='Оплата'")
-    conn.commit()
-    conn.close()
-    card = _call(McpServer(db), 'object_card',
-                 path='Документ.ЗаказПокупателя')['content'][0]['text']
-    assert 'Табличная часть Оплата: полей не извлечено' in card
-    assert 'Табличная часть Доставка: полей не объявлено' in card
-
-
-def test_object_card_header_names_type_in_russian(tmp_path_factory):
-    server = _server(tmp_path_factory)
-    card = _call(server, 'object_card',
-                 path='Справочник.Справочник1')['content'][0]['text']
-    # тип в паспорте — как в конфигураторе, без английского stem
-    assert ('Справочник.Справочник1 — Справочник, имя Справочник1'
-            in card.splitlines())
-    assert '(Catalog)' not in card
-    # в списке find_objects stem остаётся: это значение фильтра type= и
-    # колонки meta_object.type для sql
-    listed = _call(server, 'find_objects',
-                   mask='Справочник1')['content'][0]['text']
-    assert 'Справочник.Справочник1 — Справочник (Catalog)' in listed
-
-
-def test_object_card_event_subscription(tmp_path_factory):
-    server = _server(tmp_path_factory)
-    card = _call(server, 'object_card',
-                 path='Подписка на событие.ПодпискаТест')['content'][0]['text']
-    # имя события — как в конфигураторе, без внутреннего английского имени
-    assert 'Событие: ПередЗаписью' in card
-    assert 'BeforeWrite' not in card
-    assert 'Обработчик: Общий модуль.ОбщийМодуль1.Экспортная' in card
-    # один источник распознан, второго в базе нет — и это сказано, а не потеряно
-    assert ('Источники (2): Определяемый тип.ТипТест; '
-            '1 из 2 не распознано') in card
-
-
-def test_object_card_shows_subscriptions_of_a_source(tmp_path_factory):
-    server = _server(tmp_path_factory)
-    card = _call(server, 'object_card',
-                 path='Определяемый тип.ТипТест')['content'][0]['text']
-    assert ('Подписки на события: ПередЗаписью → '
-            'Общий модуль.ОбщийМодуль1.Экспортная') in card
-    # у объекта, на который ничего не подписано, такой строки нет
-    other = _call(server, 'object_card',
-                  path='Документ.ЗаказПокупателя')['content'][0]['text']
-    assert 'Подписки на события' not in other
-
-
-def test_get_method_names_event_subscriptions(tmp_path_factory):
-    server = _server(tmp_path_factory)
-    text = _call(server, 'get_method', path='Общий модуль.ОбщийМодуль1',
-                 code_name='obj', name='Экспортная')['content'][0]['text']
-    # обработчик подписки вызывает платформа: вызова в коде нет, поэтому
-    # без этой строки метод выглядит неиспользуемым
-    assert ('вызывается подписками на события: ПередЗаписью — '
-            'Подписка на событие.ПодпискаТест (источников: 2)') in text
-    other = _call(server, 'get_method', path='Общий модуль.ОбщийМодуль1',
-                  code_name='obj', name='Закрытая')['content'][0]['text']
-    assert 'вызывается подписками на события' not in other
-
-
-def test_object_card_exchange_plan_content(tmp_path_factory):
-    server = _server(tmp_path_factory)
-    card = _call(server, 'object_card',
-                 path='План обмена.ПланОбмена1')['content'][0]['text']
-    # состав плана — объекты, которые он синхронизирует; uuid в info обычные
-    # meta_object.uuid, поэтому имена определяются, а не угадываются
-    assert ('Состав плана обмена (2): Справочник.Справочник1, '
-            'Определяемый тип.ТипТест') in card
-    # у объекта, который не план обмена, такой строки нет
-    other = _call(server, 'object_card',
-                  path='Справочник.Справочник1')['content'][0]['text']
-    assert 'Состав плана обмена' not in other
-
-
-def test_characteristic_type_stem_is_translated():
-    # класс декодера — ChartOfCharacteristicType, в единственном числе: при
-    # множественном ключе в TYPE_RU тип печатался по-английски (и type_ru в
-    # базе оказывался равен stem), а русское имя не находило объект
-    assert mcp_server.ru_path('ChartOfCharacteristicType/Свойства') \
-        == 'План видов характеристик.Свойства'
-    assert 'ChartOfCharacteristicType' in \
-        mcp_server._RU2TYPES_LOW['планвидовхарактеристик']
-
-
-def test_analyze_detects_dynamic_calls(tmp_path_factory):
-    """Вычислить/Выполнить со строковыми литералами — динамические вызовы.
-
-    Анализатор должен найти строковые литералы, переданные в Вычислить() и
-    Выполнить(), и попытаться разрешить их как имена методов/модулей/объектов.
-    """
-    from confdb.bsl_analyzer import analyze
-    server = _server(tmp_path_factory)
-    code = ('Процедура Тест()\n'
-            '    Вычислить("ОбщийМодуль1.Экспортная");\n'
-            '    Вычислить("ОбщийМодуль1.Закрытая");\n'
-            '    Вычислить("ОбщийМодуль1.НетТакого");\n'
-            '    Вычислить("Справочники.Справочник1");\n'
-            '    Вычислить("Справочники.НетТакого");\n'
-            '    Вычислить("Неизвестный.Метод");\n'
-            '    Вычислить("ОбщийМодуль1");\n'
-            '    Выполнить("1 + 1");\n'
-            'КонецПроцедуры\n')
-    report = analyze(code, server.bsl_ctx())
-    dynamic = report['dynamic_calls']
-    # Литерал "1 + 1" не похож на идентификатор — не попадает
-    by_literal = {lit: (func, res) for _line, func, lit, res in dynamic}
-    assert 'ОбщийМодуль1.Экспортная' in by_literal
-    assert 'ok' in by_literal['ОбщийМодуль1.Экспортная'][1]
-    assert 'ОбщийМодуль1.Закрытая' in by_literal
-    assert 'не Экспорт' in by_literal['ОбщийМодуль1.Закрытая'][1]
-    assert 'ОбщийМодуль1.НетТакого' in by_literal
-    assert 'не найден' in by_literal['ОбщийМодуль1.НетТакого'][1]
-    assert 'Справочники.Справочник1' in by_literal
-    assert 'объект метаданных' in by_literal['Справочники.Справочник1'][1]
-    assert 'Справочники.НетТакого' in by_literal
-    assert 'не найден' in by_literal['Справочники.НетТакого'][1]
-    assert 'Неизвестный.Метод' in by_literal
-    assert 'не разрешено' in by_literal['Неизвестный.Метод'][1]
-    assert 'ОбщийМодуль1' in by_literal
-    assert 'общий модуль' in by_literal['ОбщийМодуль1'][1]
-    assert '1 + 1' not in by_literal
+    db_alias = list(server.dbs.keys())[0]
+    _call(server, 'group_create', name='моя группа')
+    _call(server, 'group_add_db', group='моя группа', db=db_alias)
+    _call(server, 'group_use', group='моя группа')
+    # Запрос к активной группе
+    result = _call(server, 'find_objects', mask='Справочник')
+    text = _get_text(result)
+    assert 'группа моя группа / база' in text

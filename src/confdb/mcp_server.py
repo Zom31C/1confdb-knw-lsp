@@ -27,9 +27,7 @@
 активная база переключается инструментом db_use.
 """
 import argparse
-import base64
 import glob
-import hashlib
 import json
 import os
 import queue
@@ -40,11 +38,11 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote as urllib_quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import compare
 from . import header_props
-from .config import load_config, save_config
+from .config import load_config
 from .db.writer import FTS_TABLE, TYPE_RU, fts_index_info, fts_shard_paths, \
     tabular_field_counts
 
@@ -270,66 +268,6 @@ def ru_text(text):
     return _TYPE_SLASH_RE.sub(lambda m: TYPE_RU[m.group(0)[:-1]] + '.', text)
 
 
-# страница пагинации (строк) для очень длинных тел методов и оглавлений модулей
-_METHOD_PAGE = 250
-_OUTLINE_PAGE = 300
-
-# суффиксы в пути модуля, которые модели передают вместо code_name:
-# 'Документ.Х.mgr', 'Документ.Х.МодульМенеджера', 'Документ.Х.obj.bsl'
-_CODE_ALIASES = {
-    'obj': 'obj', 'mgr': 'mgr', 'val': 'val', 'recordset': 'val',
-    'seance': 'seance', 'app': 'app', '802': '802', 'con': 'con',
-    'модульобъекта': 'obj', 'модульменеджера': 'mgr',
-    'модульнаборазаписей': 'val', 'модуль': 'obj',
-}
-
-
-def split_module_path(path, code_name):
-    """Нормализует путь модуля к виду (путь объекта, code_name).
-
-    Понимает: 'Документ.Х.mgr', 'Документ.Х.obj.bsl', 'Документ.Х.МодульМенеджера'
-    (суффикс переносится в code_name) и полные пути файлов дампа
-    'Document/Х/Document.mgr.bsl' (маппятся на объект и code_name).
-    """
-    path = (path or '').strip()
-    code_name = (code_name or 'obj').strip() or 'obj'
-    norm = path.replace('\\', '/')
-    if norm.endswith('.bsl') and '/' in norm:
-        # путь файла дампа: объект и code_name возьмём из таблиц file/module
-        return path, code_name, True
-    parts = path.split('.')
-    if len(parts) >= 2:
-        with_ext = parts[-1].lower() == 'bsl' and len(parts) >= 3
-        tail = parts[-2].lower() if with_ext else parts[-1].lower()
-        if tail in _CODE_ALIASES:
-            cut = 2 if with_ext else 1
-            return '.'.join(parts[:-cut]), _CODE_ALIASES[tail], False
-    return path, code_name, False
-
-
-def _paginate_lines(text, offset, limit, default_page, header=''):
-    """Постраничный вывод текста: строки offset..offset+limit (0-нумерация).
-
-    limit=0 — страница по умолчанию, если текст длиннее неё, иначе весь текст.
-    Всегда видно, сколько строк показано и как получить продолжение —
-    содержимое не обрезается молча.
-    """
-    lines = text.split('\n')
-    total = len(lines)
-    offset = max(0, offset)
-    page = limit if limit > 0 else (default_page if total > default_page else total)
-    chunk = lines[offset:offset + page]
-    shown_end = offset + len(chunk)
-    prefix = f'{header}: ' if header else ''
-    out = [f'{prefix}строки {offset + 1}-{shown_end} из {total}',
-           '\n'.join(chunk)]
-    if shown_end < total:
-        out.append(f'… продолжение: offset={shown_end}' +
-                   (f', limit={page}' if limit > 0 else ''))
-    return '\n'.join(out)
-
-
-
 def ru_type_str(text):
     """'Ссылка: Catalog/Валюты' -> 'Ссылка: Справочник.Валюты'.
 
@@ -381,6 +319,8 @@ DATABASE FILE: the SQLite file is internal to the server. Do NOT search for it, 
 
 MULTIPLE DATABASES: the server can hold several knowledge bases at once — typically the MAIN configuration plus extensions/data processors (.cfe/.epf extracted into their own .db files). Each open base has an alias. All tools query the ACTIVE base; to query a specific base without switching, pass its alias as the db parameter (e.g. find_objects(mask=…, db='расш_интеграция')). Management tools: db_list (what is open, which is active), db_open (open another base file while the server runs — the path comes from the user), db_use (switch the active base), db_close. An extension usually adds/overrides objects of the main configuration — if something is not found in one base, check the other. Special db value '*': run a tool on every open base at once (the answer is sectioned per base) — one call to compare the main configuration with all extensions.
 
+CONFIGURATION GROUPS: a group bundles related databases (main configuration + extensions + data processors) as a single unit. Use groups to compare different configurations or their versions. Management tools: group_create (create an empty group), group_add_db (add an open database to a group), group_remove_db (remove a database from a group — the database itself stays open), group_list (list all groups with their databases), group_use (switch the active group), group_close (delete a group — databases are NOT closed). When you specify the group parameter in a data tool, it runs on ALL databases in that group (fan-out). Special group value '*': run on every group at once. Priority: group > db > active_group > active database. Response headers identify both the group and the database: '=== группа <имя> / база <алиас> (<путь>) ==='.
+
 DATABASE IDENTIFIER: every tool response includes a header line identifying the source database: '=== база <алиас> (<путь>) ==='. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
 
 COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds and WHAT KIND of file it came from — .cf configuration, .cfe extension, .epf external data processor, .erf external report (name, version, compatibility mode, source file, build date); db_list repeats the kind and the version in one line per open base. These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
@@ -400,9 +340,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
-RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns.
-
-SYNTAX CHECKING: this variant DOES check 1C code syntax — the BSL Language Server reports diagnostics through the bsl_* tools (bsl_analyze_file and the rest listed below), so run it over a module before handing code to the user. Those tools are present only when the language-server workspace is up: if they are missing from the tool list, the jar/workspace is not running. The confdb tools themselves never check syntax.
+RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns. This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
 
 All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing."""
 
@@ -413,15 +351,13 @@ class McpServer:
     Держит несколько баз одновременно (например, основная конфигурация
     плюс расширения/обработки): каждая видна под алиасом, инструменты
     работают с активной базой либо с явно указанной параметром db.
-
-    :param bsl: запущенный :class:`BslMcpProxy` (необязательно) — добавляет
-        к инструментам базы инструменты ``bsl_*`` (BSL Language Server).
     """
 
-    def __init__(self, db_paths=None, bsl=None):
-        self.bsl = bsl
+    def __init__(self, db_paths=None):
         self.dbs = {}      # алиас -> {'path':…, 'conn':…, 'ctx':…}
         self.active = None
+        self.groups = {}   # имя_группы -> [алиас1, алиас2, ...]
+        self.active_group = None
         if isinstance(db_paths, str):
             db_paths = [db_paths]
         for path in db_paths or ():
@@ -442,12 +378,15 @@ class McpServer:
 
         Файл проверяется: должен существовать и содержать таблицу
         meta_object (база знаний confdb). Повторное открытие того же
-        файла просто возвращает прежний алиас.
+        файла без явного алиаса возвращает прежний алиас. Если alias
+        указан явно и отличается от существующего — создаётся новое
+        подключение (позволяет работать с одной базой под разными именами).
         """
         path = os.path.abspath(path)
         known = next((a for a, d in self.dbs.items()
                       if os.path.abspath(d['path']) == path), None)
-        if known is not None:
+        if known is not None and alias is None:
+            # Повторное открытие без явного алиаса — возвращаем существующий
             if activate:
                 self.active = known
             return known
@@ -541,6 +480,99 @@ class McpServer:
             '(SELECT COUNT(*) FROM module), '
             '(SELECT COUNT(*) FROM method)').fetchone()
 
+    # -- группы баз ----------------------------------------------------------
+    def create_group(self, name):
+        """Создаёт пустую группу баз. Имя группы уникально (регистр не важен)."""
+        if not name or not str(name).strip():
+            raise ValueError('имя группы не может быть пустым')
+        name = str(name).strip()
+        if name.lower() in (g.lower() for g in self.groups):
+            raise ValueError(f'группа уже существует: {name}')
+        self.groups[name] = []
+        if self.active_group is None:
+            self.active_group = name
+        return name
+
+    def add_db_to_group(self, group_name, db_alias):
+        """Добавляет базу в группу. База должна быть открыта."""
+        if not group_name or not str(group_name).strip():
+            raise ValueError('имя группы не может быть пустым')
+        group_name = str(group_name).strip()
+        # Поиск группы без учёта регистра
+        actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
+        if actual_group is None:
+            raise ValueError(f'группа не найдена: {group_name}')
+        alias = self._alias(db_alias)  # Проверит, что база открыта
+        if alias not in self.groups[actual_group]:
+            self.groups[actual_group].append(alias)
+        return actual_group, alias
+
+    def remove_db_from_group(self, group_name, db_alias):
+        """Убирает базу из группы. База не закрывается."""
+        if not group_name or not str(group_name).strip():
+            raise ValueError('имя группы не может быть пустым')
+        group_name = str(group_name).strip()
+        actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
+        if actual_group is None:
+            raise ValueError(f'группа не найдена: {group_name}')
+        alias = self._alias(db_alias)
+        if alias in self.groups[actual_group]:
+            self.groups[actual_group].remove(alias)
+        return actual_group, alias
+
+    def list_groups(self):
+        """Возвращает список групп с содержимым."""
+        result = []
+        for group_name, db_aliases in self.groups.items():
+            mark = '*' if group_name == self.active_group else ' '
+            dbs_info = []
+            for alias in db_aliases:
+                if alias in self.dbs:
+                    path = self.dbs[alias]['path']
+                    dbs_info.append(f'{alias} ({path})')
+            result.append({
+                'name': group_name,
+                'active': group_name == self.active_group,
+                'databases': dbs_info,
+                'mark': mark
+            })
+        return result
+
+    def use_group(self, group_name):
+        """Делает группу активной."""
+        if not group_name or not str(group_name).strip():
+            raise ValueError('имя группы не может быть пустым')
+        group_name = str(group_name).strip()
+        actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
+        if actual_group is None:
+            raise ValueError(f'группа не найдена: {group_name}')
+        self.active_group = actual_group
+        return actual_group
+
+    def close_group(self, group_name):
+        """Удаляет группу. Базы не закрываются."""
+        if not group_name or not str(group_name).strip():
+            raise ValueError('имя группы не может быть пустым')
+        group_name = str(group_name).strip()
+        actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
+        if actual_group is None:
+            raise ValueError(f'группа не найдена: {group_name}')
+        del self.groups[actual_group]
+        if self.active_group == actual_group:
+            self.active_group = next(iter(self.groups), None)
+        return actual_group
+
+    def get_group_dbs(self, group_name=None):
+        """Возвращает список алиасов баз в группе. None = активная группа."""
+        if group_name is None:
+            if self.active_group is None:
+                raise ValueError('нет активной группы — укажите имя группы')
+            group_name = self.active_group
+        actual_group = next((g for g in self.groups if g.lower() == str(group_name).lower()), None)
+        if actual_group is None:
+            raise ValueError(f'группа не найдена: {group_name}')
+        return self.groups[actual_group]
+
     # -- инфраструктура ----------------------------------------------------
     def conn(self, db=None):
         return self.dbs[self._alias(db)]['conn']
@@ -582,50 +614,22 @@ class McpServer:
         method = msg.get('method')
         msg_id = msg.get('id')
         if method == 'initialize':
-            instructions = PRIMER
-            if self.bsl is not None:
-                instructions += (
-                    '\n\nBSL CODE ANALYSIS (bsl_* tools): AST-level analysis of '
-                    'configuration modules in the dump workspace — '
-                    'bsl_analyze_file (diagnostics/metrics), bsl_document_symbols, '
-                    'bsl_find_references, bsl_call_hierarchy, bsl_hover, bsl_definition, '
-                    'bsl_type_info, bsl_type_at_position, bsl_global_member_info, '
-                    'bsl_global_member_search. File paths — relative to the dump root '
-                    '(e.g. Catalog/Товары/Товары.obj.bsl). Metadata (types, fields, '
-                    'references) comes from the same confdb database.')
             return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
                 'protocolVersion': PROTOCOL_VERSION,
                 'capabilities': {'tools': {}},
                 'serverInfo': {'name': '1confdb-knw', 'version': '1.0'},
-                'instructions': instructions}}
+                'instructions': PRIMER}}
         if msg_id is None or (method or '').startswith('notifications/'):
             return None  # уведомления
         if method == 'ping':
             return {'jsonrpc': '2.0', 'id': msg_id, 'result': {}}
         if method == 'tools/list':
-            tools = [t.spec() for t in TOOLS]
-            if self.bsl is not None:
-                tools.extend(self.bsl.prefixed_tools())
             return {'jsonrpc': '2.0', 'id': msg_id,
-                    'result': {'tools': tools}}
+                    'result': {'tools': [t.spec() for t in TOOLS]}}
         if method == 'tools/call':
             params = msg.get('params', {})
             name = params.get('name')
             args = params.get('arguments', {}) or {}
-            if isinstance(name, str) and name.startswith('bsl_'):
-                if self.bsl is None:
-                    return {'jsonrpc': '2.0', 'id': msg_id, 'error': {
-                        'code': -32602,
-                        'message': 'инструменты bsl_* недоступны: запустите '
-                                   'с --lsp-workspace <каталог дампа>'}}
-                try:
-                    text = self.bsl.call(name[len('bsl_'):], args)
-                    return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
-                        'content': [{'type': 'text', 'text': text}]}}
-                except Exception as err:  # noqa: BLE001 — ошибка инструмента
-                    return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
-                        'content': [{'type': 'text', 'text': f'ошибка: {err}'}],
-                        'isError': True}}
             tool = next((t for t in TOOLS if t.name == name), None)
             if tool is None:
                 return {'jsonrpc': '2.0', 'id': msg_id, 'error': {
@@ -642,7 +646,7 @@ class McpServer:
             'code': -32601, 'message': f'method not found: {method}'}}
 
     # -- инструменты ---------------------------------------------------------
-    def find_objects(self, mask='', type=None, limit=20, db=None):  # noqa: A002
+    def find_objects(self, mask, type=None, limit=20, db=None):  # noqa: A002
         like = f'%{mask}%'
         # имена в 1С пишутся Слитно, а маски часто приходят с пробелами
         # и в другой раскладке регистра
@@ -760,16 +764,6 @@ class McpServer:
         if mods:
             out.append('Модули: ' + ', '.join(
                 c + (f' [{x}]' if x else '') for c, x in mods))
-        if row[0] == 'Enum':
-            vals = [v[0] for v in q(
-                'SELECT name FROM enum_value WHERE object_id=? '
-                'ORDER BY ord LIMIT 60', (oid,))]
-            cnt = q('SELECT COUNT(*) FROM enum_value WHERE object_id=?',
-                    (oid,)).fetchone()[0]
-            if vals:
-                extra = f' (всего {cnt})' if cnt > len(vals) else ''
-                out.append('Значения перечисления' + extra + ': ' +
-                           ', '.join(vals))
         out.extend(self._children_lines(q, oid))
         nskd = q('SELECT COUNT(*) FROM skd_query WHERE object_id=?',
                  (oid,)).fetchone()[0]
@@ -1018,38 +1012,19 @@ class McpServer:
                        if rows else '—'))
         return '\n'.join(out)
 
-    def _module_target(self, path, code_name, db=None):
-        """(путь объекта, code_name) из разных форм записи пути модуля:
-        'Объект.mgr', 'Объект.obj.bsl', 'Объект.МодульМенеджера' или путь
-        файла дампа 'Document/Х/Document.mgr.bsl'."""
-        p, cn, is_file = split_module_path(path, code_name)
-        if is_file:
-            row = self.conn(db).execute(
-                "SELECT o.path, m.code_name FROM file f "
-                "JOIN meta_object o ON o.id=f.object_id "
-                "JOIN module m ON m.object_id=f.object_id "
-                "WHERE f.kind='bsl' AND f.path=? "
-                "AND f.path LIKE '%.' || m.code_name || '.bsl'",
-                (p.replace('\\', '/'),)).fetchone()
-            if row:
-                return row[0], row[1]
-            return p, cn
-        return self.resolve_path(p, db), cn
-
-    def module_outline(self, path, code_name='obj', offset=0, limit=0, db=None):
-        path, code_name = self._module_target(path, code_name, db)
+    def module_outline(self, path, code_name='obj', db=None):
+        path = self.resolve_path(path, db)
         row = self.conn(db).execute(
             'SELECT m.body FROM module m JOIN meta_object o ON o.id=m.object_id '
             'WHERE o.path=? AND m.code_name=?', (path, code_name)).fetchone()
         if not row or not row[0]:
             return f'модуль не найден: {path} ({code_name})'
-        return _paginate_lines(row[0], int(offset or 0), int(limit or 0),
-                               _OUTLINE_PAGE)
+        return row[0]
 
     def _method_row(self, path, code_name, name, db=None):
         """Строка метода: kind, name, signature, directives, description, body,
         is_export, контекст модуля, line_start — либо None."""
-        path, code_name = self._module_target(path, code_name, db)
+        path = self.resolve_path(path, db)
         return self.conn(db).execute(
             'SELECT mt.kind, mt.name, mt.signature, mt.directives, '
             'mt.description, mt.body, mt.is_export, m.context, mt.line_start '
@@ -1131,10 +1106,10 @@ class McpServer:
             return f'общий модуль в базе «{alias}»: {method} — {state}'
         return None
 
-    def get_method(self, path, code_name, name, offset=0, limit=0, db=None):
+    def get_method(self, path, code_name, name, db=None):
         row = self._method_row(path, code_name, name, db)
         if not row:
-            path, code_name = self._module_target(path, code_name, db)
+            path = self.resolve_path(path, db)
             return f'метод не найден: {path} ({code_name}) :: {name}'
         head = f'{row[0]} {row[1]}({row[2]})' + (' Экспорт' if row[6] else '')
         parts = [head]
@@ -1148,12 +1123,7 @@ class McpServer:
             # обработчик подписки вызывает платформа: в коде конфигурации
             # вызова нет, и лексический анализ его не показывает
             parts.append(_method_subscriptions_line(subs))
-        body = row[5] or ''
-        total = body.count('\n') + 1
-        parts.append(_paginate_lines(body, int(offset or 0), int(limit or 0),
-                                     _METHOD_PAGE, header='тело'))
-        if total > _METHOD_PAGE and int(offset or 0) + _METHOD_PAGE < total:
-            parts.append('метод длинный — листай: offset/limit')
+        parts.append('тело:\n' + row[5])
         return '\n'.join(parts)
 
     def find_method_context(self, path, code_name, name, match='', before=20,
@@ -1624,19 +1594,6 @@ class McpServer:
             out.append(' | '.join(cells))
         return '\n'.join(out)
 
-    def db_schema(self, db=None):
-        conn = self.conn(db)
-        tables = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-        out = []
-        for name in tables:
-            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{name}")')]
-            cnt = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
-            out.append(f'{name} ({cnt} строк): ' + ', '.join(cols))
-        return ('Таблицы базы знаний (используй в sql; повторно схему не '
-                'запрашивай):\n' + '\n'.join(out))
-
     # -- управление базами ---------------------------------------------------
     def cfg_props(self, alias):
         """Свойства конфигурации базы; разбираются один раз и кэшируются.
@@ -1711,6 +1668,42 @@ class McpServer:
             return f'база {alias} закрыта; открытых баз не осталось'
         return f'база {alias} закрыта; активная: {self.active}'
 
+    # -- инструменты групп ---------------------------------------------------
+    def group_create(self, name):
+        name = self.create_group(name)
+        return f'группа создана: {name}'
+
+    def group_add_db(self, group, db):
+        group_name, alias = self.add_db_to_group(group, db)
+        return f'база {alias} добавлена в группу {group_name}'
+
+    def group_remove_db(self, group, db):
+        group_name, alias = self.remove_db_from_group(group, db)
+        return f'база {alias} удалена из группы {group_name}'
+
+    def group_list(self):
+        groups = self.list_groups()
+        if not groups:
+            return 'нет созданных групп — создайте через group_create'
+        out = []
+        for g in groups:
+            mark = g['mark']
+            out.append(f'{mark} {g["name"]} ({len(g["databases"])} баз):')
+            for db_info in g['databases']:
+                out.append(f'    {db_info}')
+        return 'Группы баз (* — активная):\n' + '\n'.join(out)
+
+    def group_use(self, group):
+        group_name = self.use_group(group)
+        dbs = self.groups[group_name]
+        return f'активная группа: {group_name} (баз: {len(dbs)})'
+
+    def group_close(self, group):
+        group_name = self.close_group(group)
+        if not self.groups:
+            return f'группа {group_name} удалена; групп не осталось'
+        return f'группа {group_name} удалена; активная: {self.active_group}'
+
 
 # Категории ошибок инструмента: клиенту нужен понятный код, а не «Unknown».
 LOCKED_RE = re.compile(r'lock|busy', re.I)
@@ -1768,8 +1761,54 @@ class Tool:
                 'inputSchema': self.schema}
 
     def run(self, server, **args):
-        if args.get('db') == '*' and 'db' in self.schema.get('properties', {}):
-            # db='*' — выполнить инструмент по всем открытым базам сразу
+        # Поддержка групп: приоритет group > db > active_group > active
+        group = args.get('group')
+        db = args.get('db')
+
+        # Инструменты управления группами не используют fan-out
+        is_group_management = self.name.startswith('group_')
+
+        # group='*' — fan-out по всем группам
+        if group == '*' and 'group' in self.schema.get('properties', {}) and not is_group_management:
+            if not server.groups:
+                raise ValueError('нет созданных групп — создайте через group_create')
+            parts = []
+            for group_name, db_aliases in server.groups.items():
+                group_parts = []
+                for alias in db_aliases:
+                    if alias in server.dbs:
+                        info = server.dbs[alias]
+                        # Убираем group из args, т.к. методы не принимают этот параметр
+                        call_args = {k: v for k, v in args.items() if k != 'group'}
+                        call_args['db'] = alias
+                        part = call_with_retry(self.fn, server, **call_args)
+                        group_parts.append(f'=== база {alias} ({info["path"]}) ===\n{part}')
+                if group_parts:
+                    parts.append(f'=== группа {group_name} ===\n' + '\n\n'.join(group_parts))
+            if not parts:
+                raise ValueError('группы не содержат открытых баз')
+            return '\n\n'.join(parts)
+
+        # Конкретная группа — fan-out по её базам
+        if group and 'group' in self.schema.get('properties', {}) and not is_group_management:
+            db_aliases = server.get_group_dbs(group)
+            if not db_aliases:
+                raise ValueError(f'группа {group} пуста — добавьте базы через group_add_db')
+            parts = []
+            for alias in db_aliases:
+                if alias in server.dbs:
+                    info = server.dbs[alias]
+                    # Убираем group из args, т.к. методы не принимают этот параметр
+                    call_args = {k: v for k, v in args.items() if k != 'group'}
+                    call_args['db'] = alias
+                    part = call_with_retry(self.fn, server, **call_args)
+                    parts.append(f'=== группа {group} / база {alias} ({info["path"]}) ===\n{part}')
+            if not parts:
+                raise ValueError(f'группа {group} не содержит открытых баз')
+            return '\n\n'.join(parts)
+
+        # db='*' — выполнить инструмент по всем открытым базам сразу
+        if db == '*' and 'db' in self.schema.get('properties', {}):
             parts = []
             for alias, info in server.dbs.items():
                 part = call_with_retry(self.fn, server, **dict(args, db=alias))
@@ -1785,7 +1824,11 @@ class Tool:
         if 'db' in self.schema.get('properties', {}):
             alias = server._alias(args.get('db'))  # разрешает None → активная база
             info = server.dbs[alias]
-            return f'=== база {alias} ({info["path"]}) ===\n{result}'
+            # Если есть активная группа и база в ней — добавляем имя группы
+            group_prefix = ''
+            if server.active_group and alias in server.groups.get(server.active_group, []):
+                group_prefix = f'группа {server.active_group} / '
+            return f'=== {group_prefix}база {alias} ({info["path"]}) ===\n{result}'
 
         return result
 
@@ -1801,16 +1844,21 @@ _DB = {'type': 'string',
                       'active one (see db_list). Omit to use the active base. '
                       "Special value '*': run the tool on EVERY open base at "
                       'once; the answer comes back sectioned per base.'}
+_GROUP = {'type': 'string',
+          'description': 'Name of the configuration group to query. A group '
+                         'bundles related databases (main config + extensions '
+                         '+ processors). When specified, the tool runs on ALL '
+                         "databases in the group. Special value '*': run on "
+                         'every group at once. Takes priority over db parameter.'}
 
 TOOLS = [
     Tool('find_objects',
          'Search metadata objects by name or path substring. Returns '
          "configurator-style dotted paths ('Справочник.Имя') with Russian and "
          'English type labels. First step for anything: locate '
-         'справочник/документ/регистр by its Russian name. mask is optional: '
-         'omit it to browse all objects of a given type.',
+         'справочник/документ/регистр by its Russian name.',
          _schema({'mask': _STR, 'type': _STR,
-                  'limit': _INT, 'db': _DB}),
+                  'limit': _INT, 'db': _DB, 'group': _GROUP}, ('mask',)),
          McpServer.find_objects),
     Tool('object_card',
          "Full 'passport' of one object in a single call: type, header "
@@ -1820,46 +1868,37 @@ TOOLS = [
          'EventSubscription: its event, handler module.method and source '
          'objects; for an ExchangePlan: the objects it synchronizes. '
          'Use right after find_objects.',
-         _schema({'path': _STR, 'db': _DB}, ('path',)),
+         _schema({'path': _STR, 'db': _DB, 'group': _GROUP}, ('path',)),
          McpServer.object_card),
     Tool('object_tree',
          "Browse the metadata tree 'as in the configurator' (subsystems, "
          'nested forms/commands). path empty = configuration root.',
-         _schema({'path': _STR, 'depth': _INT, 'db': _DB}),
+         _schema({'path': _STR, 'depth': _INT, 'db': _DB, 'group': _GROUP}),
          McpServer.object_tree),
     Tool('find_field',
          'Reverse search: which objects contain a field/tabular-section field '
          'with this name. Use to discover join paths between tables.',
-         _schema({'name': _STR, 'limit': _INT, 'db': _DB}, ('name',)),
+         _schema({'name': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP}, ('name',)),
          McpServer.find_field),
     Tool('refs_of',
          "Reference links of an object via attribute types: forward ('on what "
          "it references') and reverse ('who references it') — impact analysis.",
-         _schema({'path': _STR, 'direction': _STR, 'limit': _INT, 'db': _DB},
+         _schema({'path': _STR, 'direction': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP},
                  ('path',)),
          McpServer.refs_of),
     Tool('module_outline',
          'Table of contents of a 1C module: signatures, comments, #Если '
-         "regions, WITHOUT method bodies. path — object path ('Документ.Х' "
-         "or 'Document/Х'); code_name: 'obj' (object module), 'mgr' (manager "
-         'module) etc. Path forms are also accepted: Документ.Х.mgr, '
-         'Документ.Х.obj.bsl, Document/Х/Document.mgr.bsl. '
-         'For very long modules use offset/limit (0-based lines) to page.',
-         _schema({'path': _STR, 'code_name': _STR,
-                  'offset': _INT, 'limit': _INT, 'db': _DB}, ('path',)),
+         "regions, WITHOUT method bodies. code_name: 'obj' (object module), "
+         "'mgr' (manager module) etc. Cheap way to inspect a module.",
+         _schema({'path': _STR, 'code_name': _STR, 'db': _DB, 'group': _GROUP}, ('path',)),
          McpServer.module_outline),
     Tool('get_method',
          'Full source of one procedure/function: signature, directives '
          '(&НаСервере…), description comment and body. If the method is an '
          'event-subscription handler, the answer names the subscriptions that '
          'call it — the platform calls those, so no call site exists in code. '
-         'Use after find_methods/module_outline. Path forms are also accepted: '
-         'Документ.Х.mgr, Документ.Х.obj.bsl, Document/Х/Document.mgr.bsl. '
-         'Long methods are paginated: the '
-         'response shows which lines are given and how to fetch the rest '
-         '(offset/limit, 0-based lines) — nothing is silently truncated.',
-         _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
-                  'offset': _INT, 'limit': _INT, 'db': _DB},
+         'Use after find_methods/module_outline.',
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB, 'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.get_method),
     Tool('find_method_context',
@@ -1869,7 +1908,7 @@ TOOLS = [
          'than get_method on a big method and the right way to pick a place '
          'to insert code. before/after = how many lines to show (default 20).',
          _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
-                  'match': _STR, 'before': _INT, 'after': _INT, 'db': _DB},
+                  'match': _STR, 'before': _INT, 'after': _INT, 'db': _DB, 'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.find_method_context),
     Tool('method_dependencies',
@@ -1883,7 +1922,7 @@ TOOLS = [
          'and the answer names the base each one was found in instead of just '
          'saying "not found". Use it before porting a customization to '
          'another configuration — it lists everything the code needs there.',
-         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB},
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB, 'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.method_dependencies),
     Tool('method_result_schema',
@@ -1893,7 +1932,7 @@ TOOLS = [
          'function returns a temporary table and you need to know its columns '
          'without guessing. HEURISTIC: names built at runtime are reported as '
          'dynamic, and the answer says what it could not see.',
-         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB},
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB, 'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.method_result_schema),
     Tool('find_methods',
@@ -1903,23 +1942,21 @@ TOOLS = [
          'that touches something (all writes to a register, all calls of a '
          'common module, all uses of a field) without falling back to sql — '
          'each hit comes with its module line number and the line itself. '
-         'mask and text may be combined; mask is optional — with only path it '
-         'lists the methods of that object. Not sure about the exact name — '
-         'give a partial mask (piece of the name), do not guess the full name. '
-         'Body search is case-insensitive and scans every method, so it takes '
-         'seconds on a large base.',
+         'mask and text may be combined; path narrows the search to one object '
+         '(it is a real filter now). Body search is case-insensitive and scans '
+         'every method, so it takes seconds on a large base.',
          _schema({'mask': _STR, 'text': _STR, 'path': _STR, 'limit': _INT,
-                  'db': _DB}),
+                  'db': _DB, 'group': _GROUP}),
          McpServer.find_methods),
     Tool('skd_of',
          'All SKD (report) queries of an object — the best examples of how '
          'THIS configuration queries its own tables.',
-         _schema({'path': _STR, 'db': _DB}, ('path',)),
+         _schema({'path': _STR, 'db': _DB, 'group': _GROUP}, ('path',)),
          McpServer.skd_of),
     Tool('find_skd',
          'Search across all SKD query texts (e.g. a table name like '
          "'РегистрНакопления.Запасы'). Returns snippets around the match.",
-         _schema({'mask': _STR, 'limit': _INT, 'db': _DB}, ('mask',)),
+         _schema({'mask': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP}, ('mask',)),
          McpServer.find_skd),
     Tool('xdto_of',
          'Contents of an XDTO package: target namespace, imported namespaces, '
@@ -1927,31 +1964,24 @@ TOOLS = [
          'attribute/element form) and nested anonymous types. This is the '
          'contract of web/HTTP services and of message-based exchange. '
          'Optional type= shows a single type.',
-         _schema({'path': _STR, 'type': _STR, 'db': _DB}, ('path',)),
+         _schema({'path': _STR, 'type': _STR, 'db': _DB, 'group': _GROUP}, ('path',)),
          McpServer.xdto_of),
     Tool('find_xdto',
          'Search type and property NAMES inside every XDTO package of the base '
          '(e.g. the field of a message an exchange contract defines). Each hit '
          'names its package and type.',
-         _schema({'mask': _STR, 'limit': _INT, 'db': _DB}, ('mask',)),
+         _schema({'mask': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP}, ('mask',)),
          McpServer.find_xdto),
     Tool('check_query',
          'Validate a 1C query: syntax (Russian keywords) + existence of '
          'tables/fields/reference chains against this configuration. ALWAYS '
          'run it on a query you wrote before using it.',
-         _schema({'text': _STR, 'db': _DB}, ('text',)),
+         _schema({'text': _STR, 'db': _DB, 'group': _GROUP}, ('text',)),
          McpServer.check_query),
-    Tool('schema',
-         'Knowledge base schema reference: all tables, their columns and row '
-         'counts. Call it ONCE before writing sql — do not guess column names, '
-         'do not query sqlite_master/PRAGMA.',
-         _schema({'db': _DB}),
-         McpServer.db_schema),
     Tool('sql',
          'Read-only SELECT escape hatch for anything not covered by the '
-         'dedicated tools. Call `schema` first if unsure about tables/columns. '
-         'Non-SELECT is rejected; LIMIT 200 enforced.',
-         _schema({'query': _STR, 'db': _DB}, ('query',)),
+         'dedicated tools. Non-SELECT is rejected; LIMIT 200 enforced.',
+         _schema({'query': _STR, 'db': _DB, 'group': _GROUP}, ('query',)),
          McpServer.sql),
     Tool('compare_object',
          'Compare ONE metadata object between two open knowledge bases in a '
@@ -1986,7 +2016,7 @@ TOOLS = [
          'base was built, object/module/method counts. Call it first when you '
          'need to know WHICH configuration and which release you are looking '
          'at (e.g. before porting code between configurations).',
-         _schema({'db': _DB}),
+         _schema({'db': _DB, 'group': _GROUP}),
          McpServer.configuration_info),
     Tool('db_list',
          'List the knowledge bases open on this server: alias, file path, '
@@ -2013,33 +2043,47 @@ TOOLS = [
          'open bases keep working.',
          _schema({'alias': _STR}),
          McpServer.db_close),
+    # -- инструменты групп ---------------------------------------------------
+    Tool('group_create',
+         'Create a new configuration group. A group bundles related databases '
+         '(main configuration + extensions + data processors) as a single unit. '
+         'Use groups to compare different configurations or their versions.',
+         _schema({'name': _STR}, ('name',)),
+         McpServer.group_create),
+    Tool('group_add_db',
+         'Add an open database to a group. The database must be opened first '
+         'via db_open. A database can belong to multiple groups.',
+         _schema({'group': _STR, 'db': _STR}, ('group', 'db')),
+         McpServer.group_add_db),
+    Tool('group_remove_db',
+         'Remove a database from a group. The database itself is NOT closed.',
+         _schema({'group': _STR, 'db': _STR}, ('group', 'db')),
+         McpServer.group_remove_db),
+    Tool('group_list',
+         'List all configuration groups with their databases. * marks the '
+         'ACTIVE group that other tools query by default when group parameter '
+         'is omitted.',
+         _schema({}),
+         McpServer.group_list),
+    Tool('group_use',
+         'Switch the ACTIVE configuration group — the one all other tools '
+         'query by default when the group parameter is omitted.',
+         _schema({'group': _STR}, ('group',)),
+         McpServer.group_use),
+    Tool('group_close',
+         'Delete a configuration group. Databases in the group are NOT closed.',
+         _schema({'group': _STR}, ('group',)),
+         McpServer.group_close),
 ]
 
 
 def make_handler(server):
-    """HTTP-обработчик MCP: Streamable HTTP (POST /mcp), legacy SSE (/sse)
-    и минимальный OAuth 2.1 для клиентов, которым он нужен (Claude Code).
-
-    OAuth реализован по спецификации MCP (RFC 9728/8414/7591, authorization
-    code + PKCE) с автоматическим одобрением: сервер локальный, база
-    отдаётся read-only, реальная авторизация не требуется — поток нужен
-    только чтобы клиенты, ожидающие OAuth, могли подключиться.
-    """
-    state = {'lock': threading.Lock(), 'sessions': {},
-             'oauth_clients': {}, 'oauth_codes': {}, 'oauth_tokens': set()}
+    """HTTP-обработчик MCP: Streamable HTTP (POST /mcp) и legacy SSE (/sse)."""
+    state = {'lock': threading.Lock(), 'sessions': {}}
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
         server_version = '1confdb-knw'
-
-        def handle(self):
-            # MCP-клиенты часто закрывают соединение сразу после ответа
-            # (новый коннект на каждый запрос) — обрыв на keep-alive не ошибка
-            try:
-                super().handle()
-            except (ConnectionResetError, ConnectionAbortedError,
-                    BrokenPipeError, TimeoutError):
-                self.close_connection = True
 
         def _send(self, code, body=None, extra=None):
             data = None if body is None else (
@@ -2054,171 +2098,25 @@ def make_handler(server):
             if data:
                 self.wfile.write(data)
 
-        def _base_url(self):
-            return 'http://' + (self.headers.get('Host') or 'localhost')
-
-        def _read_body_bytes(self):
-            if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
-                return self._read_chunked()
-            length = int(self.headers.get('Content-Length') or 0)
-            return self.rfile.read(length) if length > 0 else b''
-
-        def _drain_body(self):
-            """Дочитать тело запроса, чтобы keep-alive соединение не съехало."""
-            self._read_body_bytes()
-
         def _read_msg(self):
-            if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
-                body = self._read_chunked()
-            else:
-                length = int(self.headers.get('Content-Length') or 0)
-                body = self.rfile.read(length)
+            length = int(self.headers.get('Content-Length') or 0)
             try:
-                return json.loads(body)
+                return json.loads(self.rfile.read(length))
             except ValueError:
                 return None
 
-        def _read_chunked(self):
-            """Тело запроса в chunked-кодировке (так шлют Node-клиенты,
-            например Claude Code)."""
-            parts = []
-            while True:
-                size_line = self.rfile.readline(65536)
-                if not size_line:
-                    break
-                size_token = size_line.strip().split(b';')[0]
-                if not size_token:
-                    continue
-                try:
-                    size = int(size_token, 16)
-                except ValueError:
-                    break
-                if size == 0:
-                    # финальный блок: дочитать трейлеры до пустой строки
-                    while True:
-                        trailer = self.rfile.readline(65536)
-                        if trailer in (b'\r\n', b'\n', b''):
-                            break
-                    break
-                parts.append(self.rfile.read(size))
-                self.rfile.readline(65536)  # CRLF после чанка
-            return b''.join(parts)
-
-        # -- OAuth 2.1 (авто-одобрение) -------------------------------------
-
-        def _oauth_resource_metadata(self):
-            base = self._base_url()
-            return self._send(200, {
-                'resource': base + '/mcp',
-                'authorization_servers': [base]})
-
-        def _oauth_server_metadata(self):
-            base = self._base_url()
-            return self._send(200, {
-                'issuer': base,
-                'authorization_endpoint': base + '/oauth/authorize',
-                'token_endpoint': base + '/oauth/token',
-                'registration_endpoint': base + '/oauth/register',
-                'response_types_supported': ['code'],
-                'grant_types_supported': ['authorization_code',
-                                          'refresh_token'],
-                'code_challenge_methods_supported': ['S256'],
-                'token_endpoint_auth_methods_supported': ['none']})
-
-        def _oauth_register(self):
-            try:
-                meta = json.loads(self._read_body_bytes() or b'{}')
-            except ValueError:
-                meta = {}
-            client_id = uuid.uuid4().hex
-            with state['lock']:
-                state['oauth_clients'][client_id] = meta
-            resp = {'client_id': client_id,
-                    'token_endpoint_auth_method': 'none'}
-            for key in ('client_name', 'redirect_uris', 'grant_types',
-                        'response_types'):
-                if meta.get(key) is not None:
-                    resp[key] = meta[key]
-            return self._send(201, resp)
-
-        def _oauth_authorize(self, qs):
-            params = parse_qs(qs)
-            redirect_uri = params.get('redirect_uri', [''])[0]
-            if not redirect_uri:
-                self._drain_body()
-                return self._send(400, {'error': 'redirect_uri required'})
-            code = uuid.uuid4().hex
-            with state['lock']:
-                state['oauth_codes'][code] = {
-                    'client_id': params.get('client_id', [''])[0],
-                    'redirect_uri': redirect_uri,
-                    'challenge': params.get('code_challenge', [''])[0]}
-            location = redirect_uri + ('&' if '?' in redirect_uri else '?') \
-                + 'code=' + code
-            if params.get('state'):
-                location += '&state=' + urllib_quote(params['state'][0])
-            self.send_response(302)
-            self.send_header('Location', location)
-            self.send_header('Content-Length', '0')
-            self.end_headers()
-
-        def _oauth_token(self):
-            params = parse_qs(self._read_body_bytes().decode('utf-8', 'replace'))
-            grant = params.get('grant_type', [''])[0]
-            if grant == 'refresh_token':
-                token = uuid.uuid4().hex
-                with state['lock']:
-                    state['oauth_tokens'].add(token)
-                return self._send(200, {'access_token': token,
-                                        'token_type': 'Bearer',
-                                        'expires_in': 3600,
-                                        'refresh_token': uuid.uuid4().hex})
-            code = params.get('code', [''])[0]
-            with state['lock']:
-                stored = state['oauth_codes'].pop(code, None)
-            if stored is None:
-                return self._send(400, {'error': 'invalid_grant'})
-            challenge = stored.get('challenge') or ''
-            if challenge:
-                verifier = params.get('code_verifier', [''])[0]
-                digest = hashlib.sha256(verifier.encode('ascii', 'ignore')).digest()
-                expect = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
-                if expect != challenge:
-                    return self._send(400, {'error': 'invalid_grant'})
-            token = uuid.uuid4().hex
-            with state['lock']:
-                state['oauth_tokens'].add(token)
-            return self._send(200, {'access_token': token,
-                                    'token_type': 'Bearer',
-                                    'expires_in': 3600,
-                                    'refresh_token': uuid.uuid4().hex})
-
-        # -- маршрутизация ----------------------------------------------------
-
         def do_OPTIONS(self):
             self._send(204, extra={
-                'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-                'Access-Control-Allow-Headers':
-                    'Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, '
-                    'Authorization'})
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Mcp-Session-Id'})
 
         def do_GET(self):
             path = urlparse(self.path)
             if path.path in ('/sse', '/mcp'):
                 return self._sse_stream()
-            if path.path in ('/.well-known/oauth-protected-resource',
-                             '/.well-known/oauth-protected-resource/mcp'):
-                return self._oauth_resource_metadata()
-            if path.path in ('/.well-known/oauth-authorization-server',
-                             '/.well-known/oauth-authorization-server/mcp'):
-                return self._oauth_server_metadata()
-            if path.path == '/oauth/authorize':
-                return self._oauth_authorize(path.query)
-            self._drain_body()
             return self._send(404, {'error': f'not found: {path.path}'})
 
         def do_DELETE(self):
-            self._drain_body()
             self._send(405, {'error': 'сессии не сохраняются'},
                        extra={'Allow': 'GET, POST'})
 
@@ -2258,12 +2156,7 @@ def make_handler(server):
 
         def do_POST(self):
             path = urlparse(self.path)
-            if path.path in ('/oauth/register', '/register'):
-                return self._oauth_register()
-            if path.path == '/oauth/token':
-                return self._oauth_token()
             if path.path not in ('/mcp', '/messages'):
-                self._drain_body()
                 return self._send(404, {'error': f'not found: {path.path}'})
             msg = self._read_msg()
             if msg is None:
@@ -2285,20 +2178,9 @@ def make_handler(server):
     return Handler
 
 
-class _QuietThreadingHTTPServer(ThreadingHTTPServer):
-    """Не печатает traceback на штатные обрывы связи со стороны клиента."""
-
-    def handle_error(self, request, client_address):
-        exc = sys.exc_info()[1]
-        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
-                            BrokenPipeError, TimeoutError)):
-            return
-        super().handle_error(request, client_address)
-
-
 def start_http_server(server, host='127.0.0.1', port=0):
     """Поднимает ThreadingHTTPServer; возвращает (httpd, фактический порт)."""
-    httpd = _QuietThreadingHTTPServer((host, port), make_handler(server))
+    httpd = ThreadingHTTPServer((host, port), make_handler(server))
     httpd.daemon_threads = True
     return httpd, httpd.server_address[1]
 
@@ -2383,55 +2265,14 @@ def _print_dbs(server):
         print(f' {mark} база {alias}: {info["path"]}', file=sys.stderr)
 
 
-def create_bsl_proxy(args, db):
-    """Создаёт и запускает шлюз BSL Language Server.
-
-    Возвращает запущенный :class:`BslMcpProxy` или None (нет workspace/jar,
-    ошибка запуска) — сервер при этом продолжает работать без инструментов
-    ``bsl_*``. Удачный workspace запоминается в ~/.confdb/config.json
-    (ключ lsp_workspace) для следующих запусков без опции.
-    """
-    workspace = getattr(args, 'lsp_workspace', None) or load_config().get('lsp_workspace')
-    if not workspace:
-        return None
-    if not os.path.isdir(workspace):
-        print(f'1confdb-knw: каталог LSP-workspace не найден: {workspace} — '
-              'инструменты bsl_* недоступны', file=sys.stderr)
-        return None
-    from .mcp_bsl_proxy import BslMcpProxy, find_jar
-    jar = find_jar(getattr(args, 'bsl_jar', None))
-    if not jar:
-        print('1confdb-knw: jar BSL Language Server не найден — соберите его '
-              '(build-lsp-jar.bat) или задайте CONFDB_BSL_JAR; '
-              'инструменты bsl_* недоступны', file=sys.stderr)
-        return None
-    proxy = BslMcpProxy(jar, workspace, db, java=getattr(args, 'java', None))
-    print(f'1confdb-knw: запускаю BSL Language Server '
-          f'(workspace: {os.path.abspath(workspace)})...', file=sys.stderr)
-    try:
-        proxy.start()
-    except Exception as err:  # noqa: BLE001 — шлюз не обязателен для работы
-        print(f'1confdb-knw: BSL LS не запустился: {err} — '
-              'инструменты bsl_* недоступны', file=sys.stderr)
-        proxy.stop()
-        return None
-    print(f'1confdb-knw: BSL LS готов, инструментов: {len(proxy.tools)}',
-          file=sys.stderr)
-    config = load_config()
-    if config.get('lsp_workspace') != os.path.abspath(workspace):
-        config['lsp_workspace'] = os.path.abspath(workspace)
-        save_config(config)
-    return proxy
-
-
-def serve_http(db_paths, host='127.0.0.1', port=8765, bsl=None):
+def serve_http(db_paths, host='127.0.0.1', port=8765):
     if isinstance(db_paths, str):
         db_paths = [db_paths]
     for path in db_paths:
         if not os.path.isfile(path):
             print(f'Файл базы не найден: {path}', file=sys.stderr)
             return 2
-    server = McpServer(db_paths, bsl=bsl)
+    server = McpServer(db_paths)
     _print_dbs(server)
     httpd, real_port = start_http_server(server, host, port)
     print(f'1confdb-knw: слушаю http://{host}:{real_port}/mcp '
@@ -2477,42 +2318,24 @@ def main(argv=None):
                         help='адрес для HTTP-режима (по умолчанию 127.0.0.1)')
     parser.add_argument('--port', type=int, default=0,
                         help='порт HTTP-режима (без него — stdio)')
-    parser.add_argument('--lsp-workspace', metavar='DIR', default=None,
-                        help='каталог дампа для инструментов BSL Language Server '
-                             '(bsl_*); запоминается в конфиге, при следующих '
-                             'запусках можно не указывать')
-    parser.add_argument('--bsl-jar', metavar='JAR', default=None,
-                        help='путь к jar BSL Language Server '
-                             '(по умолчанию ищется в bin/ дистрибутива)')
-    parser.add_argument('--java', metavar='EXE', default=None,
-                        help='путь к java (по умолчанию JAVA_HOME или PATH)')
     args = parser.parse_args(argv)
     dbs = resolve_dbs(args.db)
-    bsl = create_bsl_proxy(args, dbs[0])
     if args.port:
-        try:
-            return serve_http(dbs, args.host, args.port, bsl=bsl)
-        finally:
-            if bsl is not None:
-                bsl.stop()
-    server = McpServer(dbs, bsl=bsl)
+        return serve_http(dbs, args.host, args.port)
+    server = McpServer(dbs)
     _print_dbs(server)
-    try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            resp = server.handle(msg)
-            if resp is not None:
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + '\n')
-                sys.stdout.flush()
-    finally:
-        if bsl is not None:
-            bsl.stop()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        resp = server.handle(msg)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + '\n')
+            sys.stdout.flush()
     return 0
 
 
