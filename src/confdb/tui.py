@@ -166,12 +166,6 @@ def replace_server_dbs(server, paths):
     return opened, errors
 
 
-def _bsl_proxy_args():
-    """Аргументы прокси BSL при запуске из TUI (пути берутся из конфига)."""
-    from types import SimpleNamespace
-    return SimpleNamespace(lsp_workspace=None, bsl_jar=None, java=None)
-
-
 class Tui:
     def __init__(self):
         config = _load_config()
@@ -703,16 +697,13 @@ class Tui:
             print('Нужно целое число.')
             input('Нажмите Enter…')
             return
-        from .mcp_server import McpServer, start_http_server, create_bsl_proxy
-        bsl = create_bsl_proxy(_bsl_proxy_args(), dbs[0])
-        server = McpServer(dbs, bsl=bsl)
+        from .mcp_server import McpServer, start_http_server
+        server = McpServer(dbs)
         try:
             httpd, real_port = start_http_server(server, '127.0.0.1', int(port))
         except OSError as err:
             print(f'Не удалось занять порт {port}: {err}')
             input('Нажмите Enter…')
-            if bsl is not None:
-                bsl.stop()
             return
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _cls()
@@ -729,32 +720,30 @@ class Tui:
         finally:
             httpd.shutdown()
             httpd.server_close()
-            if bsl is not None:
-                bsl.stop()
         print('Сервер остановлен.')
         input('Нажмите Enter…')
-
-    def _rebind_bsl(self, server, alias):
-        """Перепривязывает BSL-шлюз к новой первой базе после перезагрузки."""
-        if getattr(server, 'bsl', None) is None:
-            return
-        from .mcp_server import create_bsl_proxy
-        new_bsl = create_bsl_proxy(_bsl_proxy_args(),
-                                   server.dbs[alias]['path'])
-        if new_bsl is not None:
-            server.bsl.stop()
-            server.bsl = new_bsl
 
     def _server_control(self, server):
         while True:
             _cls()
-            print('--- Управление базами запущенного MCP-сервера ---')
+            print('--- Управление базами и группами запущенного MCP-сервера ---')
             print(server.db_list())
+            # Показываем группы конфигураций
+            if server.groups:
+                print()
+                print('Группы конфигураций:')
+                for group_name, db_aliases in server.groups.items():
+                    mark = '*' if group_name == server.active_group else ' '
+                    dbs_str = ', '.join(db_aliases) if db_aliases else '(пусто)'
+                    print(f'  {mark} {group_name}: {dbs_str}')
             print()
             print(' 1. Сменить активную базу')
             print(' 2. Открыть ещё базу')
             print(' 3. Закрыть базу')
-            print(' 4. Применить группу (заменить открытые базы)')
+            print(' 4. Применить группу из конфига (заменить открытые базы)')
+            print(' 5. Создать группу конфигураций')
+            print(' 6. Добавить базу в группу конфигураций')
+            print(' 7. Удалить группу конфигураций')
             print(' 0. Остановить сервер и выйти')
             choice = input('Выбор: ').strip()
             if choice == '0':
@@ -809,10 +798,69 @@ class Tui:
                         print(f'Ошибка: {err}')
                     if opened:
                         print('Открыты базы: ' + ', '.join(opened))
-                        self._rebind_bsl(server, opened[0])
                     else:
                         print('Сервер остался без баз — откройте вручную (пункт 2).')
                     input('Нажмите Enter…')
+            elif choice == '5':
+                # Создать группу конфигураций
+                name = _ask('Имя группы конфигураций')
+                if name:
+                    try:
+                        server.create_group(name)
+                        print(f'Группа «{name}» создана.')
+                    except ValueError as err:
+                        print(f'Ошибка: {err}')
+                input('Нажмите Enter…')
+            elif choice == '6':
+                # Добавить базу в группу конфигураций
+                if not server.groups:
+                    print('Нет групп — создайте сначала (пункт 5).')
+                    input('Нажмите Enter…')
+                    continue
+                aliases = list(server.dbs)
+                if not aliases:
+                    print('Нет открытых баз.')
+                    input('Нажмите Enter…')
+                    continue
+                group_names = list(server.groups)
+                print('Группы:')
+                for i, g in enumerate(group_names, 1):
+                    print(f'  {i}. {g}')
+                pick = _ask('Номер группы')
+                if not (pick.isdigit() and 1 <= int(pick) <= len(group_names)):
+                    continue
+                group_name = group_names[int(pick) - 1]
+                print('Базы:')
+                for i, a in enumerate(aliases, 1):
+                    in_group = '✓' if a in server.groups[group_name] else ' '
+                    print(f'  {in_group} {i}. {a}')
+                pick = _ask('Номер базы для добавления в группу')
+                if pick.isdigit() and 1 <= int(pick) <= len(aliases):
+                    alias = aliases[int(pick) - 1]
+                    try:
+                        server.add_db_to_group(group_name, alias)
+                        print(f'База {alias} добавлена в группу {group_name}.')
+                    except ValueError as err:
+                        print(f'Ошибка: {err}')
+                input('Нажмите Enter…')
+            elif choice == '7':
+                # Удалить группу конфигураций
+                if not server.groups:
+                    print('Нет групп.')
+                    input('Нажмите Enter…')
+                    continue
+                group_names = list(server.groups)
+                for i, g in enumerate(group_names, 1):
+                    print(f'  {i}. {g}')
+                pick = _ask('Номер группы для удаления')
+                if pick.isdigit() and 1 <= int(pick) <= len(group_names):
+                    group_name = group_names[int(pick) - 1]
+                    try:
+                        server.close_group(group_name)
+                        print(f'Группа {group_name} удалена.')
+                    except ValueError as err:
+                        print(f'Ошибка: {err}')
+                input('Нажмите Enter…')
             else:
                 print('Неизвестный пункт.')
                 input('Нажмите Enter…')
