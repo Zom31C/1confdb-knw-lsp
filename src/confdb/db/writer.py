@@ -695,7 +695,9 @@ CREATE TABLE source (
     created TEXT NOT NULL,
     root_type TEXT,
     root_name TEXT,
-    root_uuid TEXT
+    root_uuid TEXT,
+    file_size INTEGER,
+    file_sha256 TEXT
 );
 CREATE TABLE meta_object (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1235,13 +1237,17 @@ def build_fts_index(db_path, workers=1):
     return methods
 
 
-def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=1,
+def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
+             source_size=None, store_blobs=False, workers=1,
              build_fts=True, headers_dir=None):
     """Пишет дамп каталога stage 3 в SQLite. Возвращает статистику.
 
     :param dump_dir: каталог результата декодера (стадия 3)
     :param db_path: файл SQLite (существующий перезаписывается)
     :param source_file: путь к исходному .cf/.cfe/.epf (для таблицы source)
+    :param source_sha256: отпечаток исходного файла — по нему повторное
+        извлечение той же конфигурации видно до распаковки (`extract.same_source`)
+    :param source_size: размер исходного файла в байтах
     :param store_blobs: хранить бинарные файлы (image/bin) как BLOB
     :param workers: число процессов для разбора модулей BSL (1 — последовательно)
     :param build_fts: строить FTS5-индекс по телам методов — приставные файлы
@@ -1302,8 +1308,10 @@ def write_db(dump_dir, db_path, *, source_file=None, store_blobs=False, workers=
         conn.executescript(SCHEMA)
         conn.execute('BEGIN')
         cur = conn.execute(
-            'INSERT INTO source (file, created) VALUES (?, ?)',
-            (source_file or '', datetime.now().isoformat(timespec='seconds'))
+            'INSERT INTO source (file, created, file_size, file_sha256) '
+            'VALUES (?, ?, ?, ?)',
+            (source_file or '', datetime.now().isoformat(timespec='seconds'),
+             source_size, source_sha256)
         )
         source_id = cur.lastrowid
 

@@ -4,7 +4,7 @@ import os
 import sys
 
 from . import __version__
-from .extract import extract
+from .extract import check_same_source, extract
 
 
 def build_parser():
@@ -19,6 +19,10 @@ def build_parser():
     p = subparsers.add_parser('extract', help='распаковать файл конфигурации')
     p.add_argument('src', help='путь к файлу .cf/.cfe/.epf')
     p.add_argument('--db', metavar='FILE', help='записать результат в базу SQLite')
+    p.add_argument('--force', action='store_true',
+                   help='пересобрать базу, даже если она уже собрана из этого же '
+                        'файла: до распаковки сравнивается SHA-256 исходника '
+                        '(885 МБ — 1,7 с) с отпечатком в source')
     p.add_argument('--dump', metavar='DIR', help='сохранить распакованное дерево в каталог')
     p.add_argument('--temp-dir', metavar='DIR', help='рабочий каталог для стадий 0-1')
     p.add_argument('--keep-temp', action='store_true', help='не удалять рабочий каталог')
@@ -223,6 +227,13 @@ def main(argv=None):
         options['dump_indent'] = 2
 
     try:
+        # отпечаток исходника считывается один раз: он и решает, нужна ли
+        # распаковка, и уходит в source собранной базы
+        src_sha256 = None
+        if args.db:
+            src_sha256, skip = check_same_source(args.src, args.db, args.force)
+            if skip:
+                return 0
         stats = extract(
             args.src,
             db_path=args.db,
@@ -232,6 +243,7 @@ def main(argv=None):
             options=options,
             workers=args.workers,
             build_fts=not args.no_fts,
+            source_sha256=src_sha256,
         )
     except FileNotFoundError as err:
         print(f'Файл не найден: {err}', file=sys.stderr)
@@ -240,7 +252,7 @@ def main(argv=None):
         print(f'Ошибка: {err}', file=sys.stderr)
         return 1
 
-    for key in ('src', 'db', 'dump_dir', 'db_rows', 'elapsed'):
+    for key in ('src', 'src_sha256', 'db', 'dump_dir', 'db_rows', 'elapsed'):
         if stats.get(key) is not None:
             print(f'{key}: {stats[key]}')
     return 0

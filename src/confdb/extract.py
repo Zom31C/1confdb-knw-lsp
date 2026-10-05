@@ -7,6 +7,7 @@
 (стадия 2 оригинала — конвертация в json отдельным прогоном — отключена и там)
 """
 import concurrent.futures
+import hashlib
 import os
 import shutil
 import tempfile
@@ -14,6 +15,100 @@ from datetime import datetime
 
 from .v8 import container_reader
 from .v8 import decoder as v8_decoder
+from .v8.helper import long_path
+
+HASH_CHUNK = 1 << 20
+
+
+def file_sha256(path, chunk=HASH_CHUNK):
+    """SHA-256 файла, прочитанного кусками по 1 МиБ.
+
+    .cf весит сотни мегабайт (УНФ — 885 МБ), поэтому файл не читается в память
+    целиком. Полный обход стоит 1,74 с (замер `_tmp/hash_bench.py`) — 2,5% от
+    извлечения той же конфигурации (~70 с), так что отпечаток можно считать ДО
+    стадии 0 и отсечь повторную распаковку того же файла.
+
+    :param path: путь к .cf/.cfe/.epf
+    :return: шестнадцатеричный SHA-256
+    """
+    digest = hashlib.sha256()
+    with open(long_path(path), 'rb') as fh:
+        for block in iter(lambda: fh.read(chunk), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def source_info(db_path):
+    """Что записано в `source` готовой базы: file, created, file_sha256, file_size.
+
+    :param db_path: путь к базе знаний (может отсутствовать)
+    :return: словарь либо None — файла нет, это не база знаний confdb или строки
+        source в ней нет. Ключи `file_sha256`/`file_size` присутствуют всегда, но
+        равны None в базах, собранных до появления отпечатка: сравнение с такой
+        базой невозможно, и это не ошибка.
+    """
+    if not db_path or not os.path.isfile(db_path):
+        return None
+    # sqlite импортируется здесь: извлечение без --db не должно его тянуть
+    import sqlite3
+    uri = 'file:' + os.path.abspath(db_path).replace(os.sep, '/') + '?mode=ro'
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(source)')}
+        if 'file' not in cols:
+            return None
+        names = [c for c in ('file', 'created', 'file_sha256', 'file_size')
+                 if c in cols]
+        row = conn.execute(
+            f'SELECT {", ".join(names)} FROM source ORDER BY id LIMIT 1'
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row:
+        return None
+    info = dict(zip(names, row))
+    info.setdefault('file_sha256', None)
+    info.setdefault('file_size', None)
+    return info
+
+
+def check_same_source(src_file, db_path, force=False, log=print):
+    """Не собрана ли целевая база из этого же файла — до распаковки.
+
+    Сравнивает SHA-256 исходника с отпечатком в `source` базы `db_path`. Ответ на
+    вопрос пользователя «не извлекаю ли я одну и ту же конфигурацию повторно»:
+    совпавший отпечаток означает, что база уже содержит ровно этот файл, и
+    ~70 с распаковки можно не платить.
+
+    :param src_file: путь к .cf/.cfe/.epf
+    :param db_path: целевая база (может отсутствовать или быть старой — без отпечатка)
+    :param force: пересобрать даже при совпадении (аналог --force)
+    :param log: куда печатать пояснения (по умолчанию print)
+    :return: (sha256, skip). sha256 передают в `extract(source_sha256=…)`, чтобы не
+        считать его второй раз; skip=True — извлечение не нужно.
+    """
+    sha256 = file_sha256(src_file)
+    stored = source_info(db_path)
+    if not stored or not stored.get('file_sha256'):
+        return sha256, False
+    if stored['file_sha256'] != sha256:
+        log(f'Целевая база {db_path} собрана из другого файла '
+            f'({stored.get("file") or "?"}) — она будет перезаписана.')
+        return sha256, False
+    if force:
+        log('Отпечаток совпал с уже собранной базой, но задано принудительное '
+            'извлечение — пересобираю.')
+        return sha256, False
+    log(f'Извлечение не требуется: {db_path} уже собрана из этого же файла.')
+    log(f'SHA-256 {sha256} совпал; база собрана {stored.get("created")} '
+        f'из {stored.get("file")}.')
+    log('Пересобрать принудительно — --force.')
+    return sha256, True
 
 
 def remove_tree(root, workers=8):
@@ -77,7 +172,7 @@ def make_temp_dir(target=None):
 
 
 def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=False, options=None,
-            workers=1, build_fts=True):
+            workers=1, build_fts=True, source_sha256=None):
     """Распаковывает файл 1С и (опционально) загружает результат в SQLite.
 
     :param src_file: путь к .cf/.cfe/.epf
@@ -90,6 +185,9 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
     :param workers: число процессов стадии 3 (1 — последовательно)
     :param build_fts: строить FTS5-индекс по телам методов (половина времени
         записи БД; без него база рабочая, индекс собирается позже — `confdb fts`)
+    :param source_sha256: готовый отпечаток исходного файла (`file_sha256`).
+        None — посчитать здесь; вызывающая сторона передаёт его, когда уже
+        считала для проверки «не та же ли это конфигурация»
     :return: словарь со статистикой
     """
     src_file = os.path.abspath(src_file)
@@ -99,13 +197,21 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
     if options is None:
         options = {}
 
+    # отпечаток исходника пишется в source: по нему повторное извлечение той же
+    # конфигурации видно до распаковки, а две базы — сравниваются на происхождение
+    src_size = os.path.getsize(src_file)
+    if source_sha256 is None:
+        source_sha256 = file_sha256(src_file)
+    print(f'SHA-256 исходного файла: {source_sha256} ({src_size} байт)')
+
     own_temp = temp_dir is None
     if own_temp:
         temp_dir = make_temp_dir(db_path or dump_dir)
     stage0 = os.path.join(temp_dir, 'decode_stage_0')
     stage1 = os.path.join(temp_dir, 'decode_stage_1')
 
-    stats = {'src': src_file, 'temp_dir': temp_dir, 'dump_dir': dump_dir, 'db': db_path}
+    stats = {'src': src_file, 'src_sha256': source_sha256, 'src_size': src_size,
+             'temp_dir': temp_dir, 'dump_dir': dump_dir, 'db': db_path}
     begin = datetime.now()
     try:
         print(f'Стадия 0: читаем контейнеры {src_file}')
@@ -139,6 +245,8 @@ def extract(src_file, *, db_path=None, dump_dir=None, temp_dir=None, keep_temp=F
             db_path = os.path.abspath(db_path)
             print(f'Пишем базу данных {db_path}')
             stats['db_rows'] = write_db(stage3, db_path, source_file=src_file,
+                                        source_sha256=source_sha256,
+                                        source_size=src_size,
                                         store_blobs=options.get('store_blobs', False),
                                         workers=workers, build_fts=build_fts,
                                         headers_dir=headers_dir)

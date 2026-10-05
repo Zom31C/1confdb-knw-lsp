@@ -1507,3 +1507,31 @@ def test_page_size_is_capped_at_200(tmp_path_factory):
     assert len(_rows(tail)) == 50 and 'это все результаты' in tail
     server.close_db()
 
+
+# -- отпечаток исходного файла ------------------------------------------------
+
+def test_configuration_info_names_the_source_fingerprint(tmp_path_factory):
+    """SHA-256 исходника виден в configuration_info (полный) и в db_list (короткий)."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf', source_sha256='ab' * 32,
+             source_size=885012556)
+    server = McpServer(db)
+    info = _text(server, 'configuration_info')
+    assert f'SHA-256 исходника: {"ab" * 32} (885012556 байт)' in info
+    listed = _text(server, 'db_list')
+    assert f'SHA-256 {"ab" * 8}…' in listed
+    server.close_db()
+
+
+def test_configuration_info_of_a_base_without_fingerprint(tmp_path_factory):
+    """База, собранная до появления отпечатка: сказано, что его нет, а не пусто."""
+    server = _server(tmp_path_factory)
+    info = _text(server, 'configuration_info')
+    assert 'SHA-256 исходника: не сохранён' in info
+    assert '--force' in info
+    # в короткую строку db_list нечего писать
+    assert 'SHA-256' not in _text(server, 'db_list')
+
+

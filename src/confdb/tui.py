@@ -20,7 +20,7 @@ from . import __version__
 from .config import bench_workers
 from .config import load_config as _load_config
 from .config import save_config as _save_config
-from .extract import extract
+from .extract import check_same_source, extract
 
 PRESETS = [
     ('Состав конфигурации',
@@ -392,6 +392,15 @@ class Tui:
             options['prefix'] = self.prefix
         if self.skip_errors:
             options['skip_errors'] = True
+        # отпечаток исходника считается один раз: он же отвечает, не собрана ли
+        # целевая база из этого же файла (SHA-256 885 МБ — 1,7 с против ~70 с
+        # извлечения), и уходит в source новой базы
+        src_sha256 = None
+        if self.db:
+            src_sha256, skip = check_same_source(self.src, self.db)
+            if skip and not _yes_no('Пересобрать базу всё равно?', False):
+                input('Нажмите Enter…')
+                return
         _cls()
         try:
             stats = extract(
@@ -403,6 +412,7 @@ class Tui:
                 options=options,
                 workers=self.workers,
                 build_fts=self.build_fts,
+                source_sha256=src_sha256,
             )
         except Exception as err:
             print(f'Ошибка извлечения: {err}')

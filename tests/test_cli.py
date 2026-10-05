@@ -98,3 +98,44 @@ def test_fts_command_builds_index(tmp_path):
         total += shard.execute(f'SELECT COUNT(*) FROM {FTS_TABLE}').fetchone()[0]
         shard.close()
     assert total == methods
+
+
+def test_parser_force_flag():
+    assert build_parser().parse_args(
+        ['extract', 'config.cf', '--db', 'o.db', '--force']).force
+    assert not build_parser().parse_args(
+        ['extract', 'config.cf', '--db', 'o.db']).force
+
+
+def test_main_skips_when_the_source_is_already_extracted(tmp_path, monkeypatch):
+    """Целевая база собрана из этого же файла — распаковка не запускается вовсе."""
+    import sqlite3
+
+    import confdb.__main__ as cli
+    from confdb.extract import file_sha256
+
+    src = tmp_path / 'config.cf'
+    src.write_bytes(b'1CV8' + b'x' * 1024)
+    db = str(tmp_path / 'out.sqlite')
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE source (id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                 'file TEXT NOT NULL, created TEXT NOT NULL, '
+                 'file_size INTEGER, file_sha256 TEXT)')
+    conn.execute('INSERT INTO source (file, created, file_size, file_sha256) '
+                 'VALUES (?, ?, ?, ?)',
+                 (str(src), '2026-10-05T00:00:00', src.stat().st_size,
+                  file_sha256(str(src))))
+    conn.commit()
+    conn.close()
+
+    calls = []
+    monkeypatch.setattr(cli, 'extract',
+                        lambda *a, **kw: calls.append(kw) or {'src': a[0]})
+    assert main(['extract', str(src), '--db', db]) == 0
+    assert not calls
+
+    # --force пересобирает, а посчитанный отпечаток уходит в extract: второй раз
+    # файл не хэшируется
+    assert main(['extract', str(src), '--db', db, '--force']) == 0
+    assert len(calls) == 1
+    assert calls[0]['source_sha256'] == file_sha256(str(src))

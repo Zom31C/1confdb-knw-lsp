@@ -345,6 +345,37 @@ def page_note(total, offset, shown, detail=''):
     return f'всего найдено {total}{detail}; показано {first}–{last}; это все результаты'
 
 
+def _source_row(conn):
+    """Строка `source` базы как словарь: file, created, root_uuid, file_sha256, file_size.
+
+    Отпечаток исходника (`extract.file_sha256`) пишется в базу с 2026-10-05, поэтому
+    в старых базах колонок file_sha256/file_size просто нет: их отсутствие — не
+    ошибка схемы, а «отпечаток неизвестен».
+    """
+    cols = {row[1] for row in conn.execute('PRAGMA table_info(source)')}
+    names = [c for c in ('file', 'created', 'root_uuid', 'file_sha256',
+                         'file_size') if c in cols]
+    if not names:
+        return {}
+    row = conn.execute(
+        f'SELECT {", ".join(names)} FROM source ORDER BY id LIMIT 1').fetchone()
+    if not row:
+        return {}
+    info = dict(zip(names, row))
+    info.setdefault('file_sha256', None)
+    info.setdefault('file_size', None)
+    return info
+
+
+def sha_line(sha256, size=None):
+    """'SHA-256 исходника: <отпечаток> (<размер> байт)' либо почему его нет."""
+    if not sha256:
+        return ('SHA-256 исходника: не сохранён (база собрана раньше, чем '
+                'появился отпечаток; пересобрать — confdb extract --force)')
+    tail = f' ({size} байт)' if size else ''
+    return f'SHA-256 исходника: {sha256}{tail}'
+
+
 PRIMER = """1confdb-knw: MCP server over one or several knowledge bases of a 1C:Enterprise 8 configuration — metadata, BSL code and SKD queries, extracted from binary .cf/.cfe/.epf files into SQLite. 1C is a Russian business-automation platform; a configuration contains metadata objects, their fields, modules of 1C-language code (Russian keywords) and SKD report queries. All object/field names are in Russian.
 
 GLOSSARY: Catalog=справочник (directory), Document=документ, InformationRegister/AccumulationRegister=регистры, Enum=перечисление, DataProcessor=обработка, Report=отчет, DefinedType=определяемый тип, CommonAttribute=общий реквизит, CommonModule=общий модуль. Tabular section (табличная часть) = row table of an object (e.g. Документ.ЗаказПокупателя has section Запасы with fields Номенклатура, Цена…).
@@ -376,7 +407,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 - attribute_ref(attribute_id, ord, uuid, object_id) — which metadata objects a field's type references (one row per member; NULL object = a generic platform type, whose uuid matches no object of this configuration). Use for joins and impact analysis ('who references X').
 - xdto_type(object_id, ord, name, kind, base, base_ns, facets, enum_values) — the types an XDTO package declares: kind is objectType, valueType (a simple/enumeration type) or typeDef (an anonymous type nested in a property); base/base_ns name the base type and the namespace it comes from; facets holds the remaining XML attributes as 'name=value; …' (maxLength, totalDigits, localName…); enum_values lists the allowed values of an enumeration type. xdto_property(type_id, object_id, ord, name, type, type_ns, lower_bound, upper_bound, nillable, form, extra, nested_type_id) — properties: lower_bound=1 = obligatory, upper_bound=-1 = a list, form = Attribute|Element, nested_type_id → an anonymous nested type, extra = the remaining attributes; type_id NULL = a property declared by the package itself, outside any type. xdto_import(object_id, ord, namespace) — the namespaces the package imports. Prefer xdto_of/find_xdto over querying these directly.
 - skd_query(object_id, ord, query) — report queries in the 1C query language (Russian keywords ВЫБРАТЬ/ИЗ/ГДЕ/СОЕДИНЕНИЕ/ОБЪЕДИНИТЬ).
-- enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, parent_ord, uuid, name, code, display) — predefined elements (catalog items, chart-of-accounts accounts, characteristic-chart values) in depth-first order: parent_ord is the ord of the parent, and NULL only for the root node ('Счета'/'Элементы'), which is not an element; uuid identifies the element and is what a subconto kind points at; predefined_subconto(predefined_id, ord, uuid, kind_id, flags) — the subconto kinds of a predefined account: kind_id → the predefined element of the characteristic chart that names the kind, flags = 'Суммовой;Валютный;Количественный'; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source, file.
+- enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, parent_ord, uuid, name, code, display) — predefined elements (catalog items, chart-of-accounts accounts, characteristic-chart values) in depth-first order: parent_ord is the ord of the parent, and NULL only for the root node ('Счета'/'Элементы'), which is not an element; uuid identifies the element and is what a subconto kind points at; predefined_subconto(predefined_id, ord, uuid, kind_id, flags) — the subconto kinds of a predefined account: kind_id → the predefined element of the characteristic chart that names the kind, flags = 'Суммовой;Валютный;Количественный'; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source(file, created, root_type/root_name/root_uuid, file_size, file_sha256) — which .cf/.cfe/.epf the base was built from, when, and the SHA-256 of that file: equal digests in two bases mean the very same source file, so nothing has to be re-extracted (NULL in bases built before the digest was added); file.
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
@@ -916,16 +947,17 @@ class McpServer:
                    '(см. режим совместимости)')
         if props.get('obj_version'):
             out.append(f'Формат метаданных (obj_version): {props["obj_version"]}')
-        src = self.conn(db).execute(
-            'SELECT file, created, root_uuid FROM source '
-            'ORDER BY id LIMIT 1').fetchone()
+        src = _source_row(self.conn(db))
         if src:
-            if src[0]:
-                out.append(f'Источник выгрузки: {src[0]}')
-            if src[1]:
-                out.append(f'База знаний собрана: {src[1]}')
-            if src[2]:
-                out.append(f'UUID корня: {src[2]}')
+            if src.get('file'):
+                out.append(f'Источник выгрузки: {src["file"]}')
+            # отпечаток исходника — способ убедиться, что две базы собраны из
+            # одного и того же файла (и что повторное извлечение не нужно)
+            out.append(sha_line(src.get('file_sha256'), src.get('file_size')))
+            if src.get('created'):
+                out.append(f'База знаний собрана: {src["created"]}')
+            if src.get('root_uuid'):
+                out.append(f'UUID корня: {src["root_uuid"]}')
         nobj, nmod, nmeth = self.db_stats(db)
         nskd = self.conn(db).execute(
             'SELECT COUNT(*) FROM skd_query').fetchone()[0]
@@ -1716,11 +1748,12 @@ class McpServer:
                 props.setdefault('name', row[2])
                 props['root_type'] = row[0]
                 props['root_type_ru'] = row[1]
-            src = info['conn'].execute(
-                'SELECT file FROM source ORDER BY id LIMIT 1').fetchone()
+            src = _source_row(info['conn'])
             # путь исходника нужен для типа файла: .erf и .epf дают один
             # и тот же root_type, различает их только расширение
-            props['source_file'] = src[0] if src else None
+            props['source_file'] = src.get('file')
+            props['source_sha256'] = src.get('file_sha256')
+            props['source_size'] = src.get('file_size')
             info['cfg'] = props
         return info['cfg']
 
@@ -1740,6 +1773,10 @@ class McpServer:
             bits.append(f'режим совместимости {compat}')
         if props.get('name_prefix'):
             bits.append(f'префикс имён {props["name_prefix"]}')
+        if props.get('source_sha256'):
+            # короткий отпечаток исходника: по нему видно, что две открытые базы
+            # собраны из одного и того же файла; полный — в configuration_info
+            bits.append(f'SHA-256 {props["source_sha256"][:16]}…')
         return props.get('name') or '?', '; '.join(bits)
 
     def db_list(self):
@@ -2136,7 +2173,9 @@ TOOLS = [
          'compatibility mode (режим совместимости — external reports and data '
          'processors have none, an extension inherits it from the main '
          'configuration), extension name prefix, source file and the date the '
-         'base was built, object/module/method counts. Call it first when you '
+         'base was built, the SHA-256 of the source file (the same digest in '
+         'two bases means they were built from the very same file, so no '
+         're-extraction is needed), object/module/method counts. Call it first when you '
          'need to know WHICH configuration and which release you are looking '
          'at (e.g. before porting code between configurations).',
          _schema({'db': _DB, 'group': _GROUP}),
