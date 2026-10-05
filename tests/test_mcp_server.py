@@ -1,6 +1,7 @@
 """Тесты MCP-сервера: протокол и инструменты на синтетической базе."""
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -612,8 +613,9 @@ def test_find_methods_same_result_after_late_fts_build(tmp_path_factory):
     assert server.dbs[server.active]['fts_shards']
     indexed = _call(server, 'find_methods',
                     text='Справочник.Справочник1')['content'][0]['text']
-    # порядок строк без ORDER BY зависит от плана запроса — сравниваем состав
-    assert sorted(indexed.splitlines()) == sorted(plain.splitlines())
+    # порядок выдачи строгий (путь, модуль, строка метода), поэтому оба пути
+    # поиска — body_has и FTS-индекс — обязаны дать тот же список строк
+    assert indexed.splitlines() == plain.splitlines()
     server.close_db()
 
 
@@ -1286,3 +1288,222 @@ def test_group_header_in_response(tmp_path_factory):
     result = _call(server, 'find_objects', mask='Справочник')
     text = _get_text(result)
     assert 'группа моя группа / база' in text
+
+
+# -- пагинация поисковой выдачи ---------------------------------------------
+
+_TOTAL_RE = re.compile(r'всего найдено (\d+)')
+_METHOD_HINT = 'тело метода целиком — get_method'
+
+
+def _text(server, tool, **args):
+    """Текст ответа инструмента — так, как его видит клиент."""
+    return _get_text(_call(server, tool, **args))
+
+
+def _rows(text):
+    """Строки выдачи: без заголовка базы, хвоста пагинации и подсказки."""
+    return [ln for ln in text.splitlines()
+            if ln and not ln.startswith(('===', '… ', _METHOD_HINT))]
+
+
+def _total(text):
+    return int(_TOTAL_RE.search(text).group(1))
+
+
+def _walk_pages(server, tool, **args):
+    """Вся выдача инструмента страницами по одной строке.
+
+    Идёт по offset из хвоста ответа и останавливается на «это все результаты»:
+    если порядок нестабилен, страницы начинают повторяться или терять строки,
+    и сравнение с одноразовой выдачей это показывает.
+    """
+    rows, offset = [], 0
+    while True:
+        text = _text(server, tool, limit=1, offset=offset, **args)
+        assert 'всего найдено' in text
+        rows.extend(_rows(text))
+        if 'это все результаты' in text:
+            return rows
+        assert f'следующий вызов с offset={offset + 1}' in text
+        offset += 1
+        assert offset <= 500
+
+
+def test_page_helpers_clamp_and_word_the_note():
+    """Потолок страницы, неотрицательный offset и формулировки хвоста."""
+    assert mcp_server.page_limit(0) == 1
+    assert mcp_server.page_limit(-5) == 1
+    assert mcp_server.page_limit(10 ** 6) == mcp_server.MAX_PAGE_LIMIT == 200
+    assert mcp_server.page_offset(-3) == 0
+    # total_count, has_more и offset следующей порции — одной строкой
+    assert mcp_server.page_note(13, 2, 2) == ('всего найдено 13; показано 3–4; '
+                                              'есть ещё 9 — следующий вызов '
+                                              'с offset=4')
+    assert 'это все результаты' in mcp_server.page_note(4, 2, 2)
+    assert 'за пределами' in mcp_server.page_note(4, 10, 0)
+    assert mcp_server.page_note(0, 0, 0) == 'всего найдено 0'
+
+
+def test_find_objects_pages_cover_the_whole_result(tmp_path_factory):
+    """Страницы по строке = один вызов с большим limit, без повторов и пропусков."""
+    server = _server(tmp_path_factory)
+    whole = _rows(_text(server, 'find_objects', mask='', limit=200))
+    assert len(whole) == 13
+    assert _walk_pages(server, 'find_objects', mask='') == whole
+
+    first = _text(server, 'find_objects', mask='', limit=2)
+    assert 'всего найдено 13; показано 1–2' in first
+    assert 'есть ещё 11 — следующий вызов с offset=2' in first
+    second = _text(server, 'find_objects', mask='', limit=2, offset=2)
+    assert 'показано 3–4' in second
+    assert not set(_rows(first)) & set(_rows(second))
+    tail = _text(server, 'find_objects', mask='', limit=2, offset=12)
+    assert len(_rows(tail)) == 1 and 'это все результаты' in tail
+
+
+def test_find_objects_type_filter_applies_to_every_match(tmp_path_factory):
+    """Фильтр type= связан со всей OR-группой совпадений, а не с её последней веткой.
+
+    Без скобок вокруг OR объект находился веткой name LIKE и попадал в выдачу
+    при любом type=, т.е. фильтр молча не работал — а total_count считал бы
+    другое число строк, чем показывал список.
+    """
+    server = _server(tmp_path_factory)
+    assert 'Документ.ЗаказПокупателя' in _text(server, 'find_objects',
+                                               mask='ЗаказПокупателя',
+                                               type='Document')
+    assert 'ничего не найдено' in _text(server, 'find_objects',
+                                        mask='ЗаказПокупателя', type='Catalog')
+
+
+def test_find_field_and_find_methods_page(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    fields = _text(server, 'find_field', name='', limit=200)
+    assert _total(fields) == 15
+    assert _walk_pages(server, 'find_field', name='') == _rows(fields)
+
+    methods = _text(server, 'find_methods', mask='', limit=200)
+    assert _total(methods) == 3
+    assert _walk_pages(server, 'find_methods', mask='') == _rows(methods)
+
+
+def test_body_search_totals_do_not_collide_in_the_cache(tmp_path_factory):
+    """Кэш итогов различает поиски: игла входит в ключ, а не только SQL.
+
+    С приставным FTS-индексом игла уходит во временную таблицу совпадений, и
+    текст запроса у двух разных поисков одинаков — без иглы в ключе второй
+    поиск ответил бы итогом первого.
+    """
+    from confdb.db.writer import build_fts_index
+    server = _server(tmp_path_factory)
+    assert _total(_text(server, 'find_methods', text='КонецПроцедуры')) == 2
+    assert _total(_text(server, 'find_methods', text='Тест')) == 1
+    db = server.dbs[server.active]['path']
+    server.close_db()
+
+    build_fts_index(db, workers=2)
+    indexed = McpServer(db)
+    assert indexed.dbs[indexed.active]['fts_shards']
+    assert _total(_text(indexed, 'find_methods', text='КонецПроцедуры')) == 2
+    assert _total(_text(indexed, 'find_methods', text='Тест')) == 1
+    indexed.close_db()
+
+
+def test_find_skd_pages(tmp_path_factory):
+    """Запросов СКД в fixture нет — добавляем три и листаем их."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf')
+    conn = sqlite3.connect(db)
+    oid = conn.execute("SELECT id FROM meta_object "
+                       "WHERE path='Document/ЗаказПокупателя'").fetchone()[0]
+    for ord_ in range(3):
+        conn.execute('INSERT INTO skd_query (object_id, ord, query) '
+                     'VALUES (?, ?, ?)',
+                     (oid, ord_, f'ВЫБРАТЬ Т.Порция{ord_} '
+                                 'ИЗ Документ.ЗаказПокупателя КАК Т'))
+    conn.commit()
+    conn.close()
+
+    server = McpServer(db)
+    whole = _rows(_text(server, 'find_skd', mask='ВЫБРАТЬ', limit=200))
+    assert len(whole) == 3 and _total(
+        _text(server, 'find_skd', mask='ВЫБРАТЬ')) == 3
+    assert _walk_pages(server, 'find_skd', mask='ВЫБРАТЬ') == whole
+    server.close_db()
+
+
+def test_find_xdto_pages_types_then_properties(tmp_path_factory):
+    """Склейка: сначала все типы, потом свойства — offset считает их одним списком."""
+    server = _server(tmp_path_factory)
+    whole = _rows(_text(server, 'find_xdto', mask='', limit=200))
+    types = [ln for ln in whole if ' — тип ' in ln]
+    props = [ln for ln in whole if ' — тип ' not in ln]
+    assert len(types) == 2 and len(props) == 4
+    assert whole == types + props
+    assert '(типов 2, свойств 4)' in _text(server, 'find_xdto', mask='')
+    # страница, начинающаяся ровно со свойств
+    assert _rows(_text(server, 'find_xdto', mask='', limit=2,
+                       offset=2)) == props[:2]
+    assert _walk_pages(server, 'find_xdto', mask='') == whole
+
+
+def test_refs_of_pages_each_list(tmp_path_factory):
+    """У каждой из двух секций refs_of свой итог, а offset общий."""
+    server = _server(tmp_path_factory)
+    assert _text(server, 'refs_of', path='Catalog/Справочник1').count(
+        'всего найдено') == 2
+
+    path = 'Catalog/Справочник1'
+    full = _text(server, 'refs_of', path=path, direction='forward', limit=200)
+    listed = [p.strip() for p in
+              full.splitlines()[1].split(': ', 1)[1].split(', ')]
+    assert len(listed) == 2
+
+    one = _text(server, 'refs_of', path=path, direction='forward', limit=1)
+    assert 'всего найдено 2; показано 1–1' in one
+    assert 'следующий вызов с offset=1' in one
+    rest = _text(server, 'refs_of', path=path, direction='forward',
+                 limit=1, offset=1)
+    assert rest.splitlines()[1].split(': ', 1)[1].strip() == listed[1]
+    assert 'это все результаты' in rest
+
+
+def test_offset_past_the_end_says_so(tmp_path_factory):
+    """Слишком большой offset — не «ничего не найдено»: поиск что-то нашёл."""
+    server = _server(tmp_path_factory)
+    text = _text(server, 'find_objects', mask='Справочник1', offset=500)
+    assert 'за пределами' in text and 'всего найдено 2' in text
+    assert 'ничего не найдено' in _text(server, 'find_objects',
+                                        mask='НетТакогоОбъекта', offset=10)
+
+
+def test_page_size_is_capped_at_200(tmp_path_factory):
+    """limit больше потолка не растягивает ответ: страница — 200 строк."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 't.sqlite')
+    write_db(dump, db, source_file='t.cf')
+    conn = sqlite3.connect(db)
+    oid = conn.execute("SELECT id FROM meta_object "
+                       "WHERE path='Catalog/Справочник1'").fetchone()[0]
+    conn.executemany('INSERT INTO meta_attribute '
+                     '(object_id, ord, name, type_str, tabular) '
+                     "VALUES (?, ?, ?, 'Число', NULL)",
+                     [(oid, 1000 + i, f'СинтетическоеПоле{i:03}')
+                      for i in range(250)])
+    conn.commit()
+    conn.close()
+
+    server = McpServer(db)
+    page = _text(server, 'find_field', name='СинтетическоеПоле', limit=10 ** 6)
+    assert len(_rows(page)) == 200
+    assert 'всего найдено 250; показано 1–200' in page
+    assert 'есть ещё 50 — следующий вызов с offset=200' in page
+    tail = _text(server, 'find_field', name='СинтетическоеПоле',
+                 limit=10 ** 6, offset=200)
+    assert len(_rows(tail)) == 50 and 'это все результаты' in tail
+    server.close_db()
+

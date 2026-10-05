@@ -307,6 +307,44 @@ def body_hits(body, needle, line_start=1, limit=3, width=150):
     return hits
 
 
+MAX_PAGE_LIMIT = 200    # потолок страницы поисковых инструментов (как LIMIT у sql)
+COUNT_CACHE_MAX = 128   # сколько итогов COUNT(*) помнить на одну базу
+
+
+def page_limit(limit):
+    """Размер страницы поиска: целое в границах 1..MAX_PAGE_LIMIT.
+
+    Потолок общий для всех поисковых инструментов: раз выдачу можно листать
+    параметром offset, раздувать limit незачем, а большой ответ съедает
+    контекст вызывающей модели.
+    """
+    return max(1, min(int(limit), MAX_PAGE_LIMIT))
+
+
+def page_offset(offset):
+    """Сколько первых совпадений того же поиска пропустить: целое >= 0."""
+    return max(0, int(offset))
+
+
+def page_note(total, offset, shown, detail=''):
+    """Хвост поискового ответа: total_count, диапазон и offset следующей порции.
+
+    Модель обязана видеть, что список обрезан, и как взять продолжение: без
+    этой строки «первые 20» выглядят как все найденные, и вместо листания
+    страниц вызывающая сторона начинает уточнять маску наугад.
+    """
+    if not shown:
+        if not total:
+            return f'всего найдено 0{detail}'
+        return (f'всего найдено {total}{detail}; offset={offset} за пределами '
+                'списка — повторите с offset=0')
+    first, last = offset + 1, offset + shown
+    if last < total:
+        return (f'всего найдено {total}{detail}; показано {first}–{last}; '
+                f'есть ещё {total - last} — следующий вызов с offset={last}')
+    return f'всего найдено {total}{detail}; показано {first}–{last}; это все результаты'
+
+
 PRIMER = """1confdb-knw: MCP server over one or several knowledge bases of a 1C:Enterprise 8 configuration — metadata, BSL code and SKD queries, extracted from binary .cf/.cfe/.epf files into SQLite. 1C is a Russian business-automation platform; a configuration contains metadata objects, their fields, modules of 1C-language code (Russian keywords) and SKD report queries. All object/field names are in Russian.
 
 GLOSSARY: Catalog=справочник (directory), Document=документ, InformationRegister/AccumulationRegister=регистры, Enum=перечисление, DataProcessor=обработка, Report=отчет, DefinedType=определяемый тип, CommonAttribute=общий реквизит, CommonModule=общий модуль. Tabular section (табличная часть) = row table of an object (e.g. Документ.ЗаказПокупателя has section Запасы with fields Номенклатура, Цена…).
@@ -322,6 +360,8 @@ MULTIPLE DATABASES: the server can hold several knowledge bases at once — typi
 CONFIGURATION GROUPS: a group bundles related databases (main configuration + extensions + data processors) as a single unit. Use groups to compare different configurations or their versions. Management tools: group_create (create an empty group), group_add_db (add an open database to a group), group_remove_db (remove a database from a group — the database itself stays open), group_list (list all groups with their databases), group_use (switch the active group), group_close (delete a group — databases are NOT closed). When you specify the group parameter in a data tool, it runs on ALL databases in that group (fan-out). Special group value '*': run on every group at once. Priority: group > db > active_group > active database. Response headers identify both the group and the database: '=== группа <имя> / база <алиас> (<путь>) ==='.
 
 DATABASE IDENTIFIER: every tool response includes a header line identifying the source database: '=== база <алиас> (<путь>) ==='. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
+
+PAGING SEARCH RESULTS: find_objects, find_field, find_methods, find_skd, find_xdto and refs_of return ONE PAGE of their hits — limit is the page size (1..200), offset is how many hits of the SAME search to skip. Every answer ends with a paging line: '… всего найдено N; показано a–b; есть ещё K — следующий вызов с offset=b' (total hit count, the range shown, how many are left and the offset to pass for the next page); when the page holds everything it says 'это все результаты' instead. The order of hits is stable, so consecutive pages never overlap or skip — to read further, call the same tool with the printed offset. Do NOT raise limit to 200 and do not narrow the mask just to fit one answer: page. find_xdto counts matching types and properties as one list (types first, then properties) and names both counts; refs_of pages each of its two lists with the same offset.
 
 COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds and WHAT KIND of file it came from — .cf configuration, .cfe extension, .epf external data processor, .erf external report (name, version, compatibility mode, source file, build date); db_list repeats the kind and the version in one line per open base. These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
 
@@ -577,6 +617,23 @@ class McpServer:
     def conn(self, db=None):
         return self.dbs[self._alias(db)]['conn']
 
+    def count_of(self, sql, params=(), db=None, extra=()):
+        """Сколько всего строк набирает поиск (total_count ответа).
+
+        Итог кэшируется на базу: она открыта read-only, поэтому значение не
+        устареет, а листание страниц не платит повторным полным проходом —
+        для find_methods(text=…) без FTS-индекса это секунды на каждую страницу.
+        `extra` входит в ключ: часть условий поиска живёт не в params
+        (временная таблица совпадений FTS5 строится из иглы).
+        """
+        cache = self.dbs[self._alias(db)].setdefault('counts', {})
+        key = (sql, tuple(params), tuple(extra))
+        if key not in cache:
+            if len(cache) >= COUNT_CACHE_MAX:
+                cache.clear()
+            cache[key] = self.conn(db).execute(sql, list(params)).fetchone()[0]
+        return cache[key]
+
     def ctx(self, db=None):
         alias = self._alias(db)
         info = self.dbs[alias]
@@ -646,25 +703,33 @@ class McpServer:
             'code': -32601, 'message': f'method not found: {method}'}}
 
     # -- инструменты ---------------------------------------------------------
-    def find_objects(self, mask, type=None, limit=20, db=None):  # noqa: A002
+    def find_objects(self, mask, type=None, limit=20, offset=0,
+                     db=None):  # noqa: A002
         like = f'%{mask}%'
         # имена в 1С пишутся Слитно, а маски часто приходят с пробелами
         # и в другой раскладке регистра
         like_ns = f'%{mask.replace(" ", "").lower()}%'
-        sql = ('SELECT path, type, type_ru, name FROM meta_object '
-               'WHERE name LIKE ? OR path LIKE ? '
-               "OR lower_ru(REPLACE(name, ' ', '')) LIKE ? "
-               "OR lower_ru(REPLACE(path, ' ', '')) LIKE ?")
+        where = ('(name LIKE ? OR path LIKE ? '
+                 "OR lower_ru(REPLACE(name, ' ', '')) LIKE ? "
+                 "OR lower_ru(REPLACE(path, ' ', '')) LIKE ?)")
         params = [like, like, like_ns, like_ns]
         if type:
-            sql += ' AND (type = ? OR type_ru = ?)'
+            where += ' AND (type = ? OR type_ru = ?)'
             params += [type, type]
-        sql += ' ORDER BY length(path), path LIMIT ?'
-        params.append(int(limit))
-        rows = self.conn(db).execute(sql, params).fetchall()
-        if not rows:
+        limit, offset = page_limit(limit), page_offset(offset)
+        total = self.count_of(f'SELECT COUNT(*) FROM meta_object WHERE {where}',
+                              params, db)
+        if not total:
             return 'ничего не найдено'
-        return '\n'.join(f'{ru_path(p)} — {ru} ({t})' for p, t, ru, _ in rows)
+        # порядок стабилен: id разрывает равенство путей, иначе страница
+        # с offset повторяет и теряет строки на границе
+        rows = self.conn(db).execute(
+            'SELECT path, type, type_ru, name FROM meta_object '
+            f'WHERE {where} ORDER BY length(path), path, id LIMIT ? OFFSET ?',
+            params + [limit, offset]).fetchall()
+        out = [f'{ru_path(p)} — {ru} ({t})' for p, t, ru, _ in rows]
+        out.append('… ' + page_note(total, offset, len(rows)))
+        return '\n'.join(out)
 
     def _subscription_card(self, q, path, db=None):
         """Строки подписки на событие; [] — заголовок не распознан."""
@@ -971,45 +1036,59 @@ class McpServer:
         walk(root_id, 1)
         return '\n'.join(out)
 
-    def find_field(self, name, limit=20, db=None):
+    def find_field(self, name, limit=20, offset=0, db=None):
         like = f'%{name}%'
         like_ns = f'%{name.replace(" ", "").lower()}%'
+        where = ("(a.name LIKE ? OR lower_ru(REPLACE(a.name, ' ', '')) LIKE ?)")
+        params = [like, like_ns]
+        limit, offset = page_limit(limit), page_offset(offset)
+        total = self.count_of(
+            'SELECT COUNT(*) FROM meta_attribute a '
+            'JOIN meta_object o ON o.id=a.object_id '
+            f'WHERE {where}', params, db)
+        if not total:
+            return 'ничего не найдено'
+        # одно имя поля встречается у многих объектов и во многих табличных
+        # частях, поэтому порядок заканчивается уникальным a.id
         rows = self.conn(db).execute(
             'SELECT o.path, a.name, a.tabular, a.type_str FROM meta_attribute a '
             'JOIN meta_object o ON o.id=a.object_id '
-            "WHERE a.name LIKE ? OR lower_ru(REPLACE(a.name, ' ', '')) LIKE ? "
-            'ORDER BY o.path LIMIT ?',
-            (like, like_ns, int(limit))).fetchall()
-        if not rows:
-            return 'ничего не найдено'
-        return '\n'.join(
-            f'{ru_path(p)} :: поле {n} ({ru_type_str(t) or "?"})' +
-            (f' [табчасть {s}]' if s else '')
-            for p, n, s, t in rows)
+            f'WHERE {where} '
+            'ORDER BY o.path, a.tabular, a.ord, a.id LIMIT ? OFFSET ?',
+            params + [limit, offset]).fetchall()
+        out = [f'{ru_path(p)} :: поле {n} ({ru_type_str(t) or "?"})' +
+               (f' [табчасть {s}]' if s else '')
+               for p, n, s, t in rows]
+        out.append('… ' + page_note(total, offset, len(out)))
+        return '\n'.join(out)
 
-    def refs_of(self, path, direction='both', limit=30, db=None):
+    def refs_of(self, path, direction='both', limit=30, offset=0, db=None):
         path = self.resolve_path(path, db)
-        q = self.conn(db).execute
-        out = []
+        limit, offset = page_limit(limit), page_offset(offset)
+        joined = (' FROM attribute_ref r '
+                  'JOIN meta_attribute a ON a.id=r.attribute_id '
+                  'JOIN meta_object v ON v.id=a.object_id '
+                  'JOIN meta_object t ON t.id=r.object_id ')
+        # (заголовок, колонка результата, условие): обе секции листаются одним
+        # offset, поэтому хвост пагинации печатается у каждой свой
+        sections = []
         if direction in ('both', 'forward'):
-            rows = q(
-                'SELECT DISTINCT t.path FROM attribute_ref r '
-                'JOIN meta_attribute a ON a.id=r.attribute_id '
-                'JOIN meta_object v ON v.id=a.object_id '
-                'JOIN meta_object t ON t.id=r.object_id '
-                'WHERE v.path=? AND t.path IS NOT NULL LIMIT ?',
-                (path, int(limit))).fetchall()
-            out.append('Ссылается на: ' + (', '.join(ru_path(r[0]) for r in rows)
-                       if rows else '—'))
+            sections.append(('Ссылается на', 't.path',
+                             'v.path=? AND t.path IS NOT NULL'))
         if direction in ('both', 'reverse'):
-            rows = q(
-                'SELECT DISTINCT v.path FROM attribute_ref r '
-                'JOIN meta_attribute a ON a.id=r.attribute_id '
-                'JOIN meta_object v ON v.id=a.object_id '
-                'JOIN meta_object t ON t.id=r.object_id '
-                'WHERE t.path=? LIMIT ?', (path, int(limit))).fetchall()
-            out.append('На него ссылаются: ' + (', '.join(ru_path(r[0]) for r in rows)
-                       if rows else '—'))
+            sections.append(('На него ссылаются', 'v.path', 't.path=?'))
+        out = []
+        for title, column, cond in sections:
+            where = f'WHERE {cond} '
+            total = self.count_of(
+                f'SELECT COUNT(DISTINCT {column}){joined}{where}', (path,), db)
+            rows = self.conn(db).execute(
+                f'SELECT DISTINCT {column}{joined}{where}'
+                f'ORDER BY {column} LIMIT ? OFFSET ?',
+                (path, limit, offset)).fetchall()
+            out.append(title + ': ' + (', '.join(ru_path(r[0]) for r in rows)
+                                       if rows else '—'))
+            out.append('… ' + page_note(total, offset, len(rows)))
         return '\n'.join(out)
 
     def module_outline(self, path, code_name='obj', db=None):
@@ -1347,16 +1426,19 @@ class McpServer:
                          ((hit,) for hit in sorted(hits)))
         return ' AND mt.id IN (SELECT id FROM temp._fts_hits)', []
 
-    def find_methods(self, mask='', text='', path=None, limit=20, db=None):
+    def find_methods(self, mask='', text='', path=None, limit=20, offset=0,
+                     db=None):
         """Поиск методов: mask — имя/сигнатура/описание, text — подстрока в теле.
 
         text отвечает на вопрос «где в коде это упоминается» — все обращения к
         объекту, все точки записи регистра, все вызовы общего модуля. По каждому
         совпадению выдаётся номер строки модуля и сама строка, поэтому искать
-        дальше инструментом sql не нужно.
+        дальше инструментом sql не нужно. Совпадений обычно больше страницы —
+        выдача листается параметром offset; порядок строгий (по id метода,
+        а он растёт вдоль объектов и модулей), поэтому страницы не пересекаются.
         """
         path = self.resolve_path(path, db) if path else None
-        limit = max(1, int(limit))
+        limit, offset = page_limit(limit), page_offset(offset)
         like = f'%{mask}%'
         like_ns = f'%{mask.replace(" ", "").lower()}%'
         # OR-группа обязана быть в скобках: AND связывается сильнее OR, и без
@@ -1381,21 +1463,32 @@ class McpServer:
                 # ловила бы лишь тот регистр, в котором игла передана
                 cond += ' AND body_has(mt.body, ?)'
                 params.append(text.lower())
-        sql = ('SELECT o.path, m.code_name, mt.kind, mt.name, mt.signature, '
-               'mt.directives, mt.description'
-               + (', mt.body, mt.line_start' if text else '')
-               + ' FROM method mt '
-               'JOIN module m ON m.id=mt.module_id '
-               'JOIN meta_object o ON o.id=m.object_id WHERE ' + cond)
         if path:
-            sql += ' AND o.path=?'
+            cond += ' AND o.path=?'
             params.append(path)
-        sql += ' LIMIT ?'
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
-        if not rows:
+        tables = (' FROM method mt '
+                  'JOIN module m ON m.id=mt.module_id '
+                  'JOIN meta_object o ON o.id=m.object_id WHERE ')
+        # extra=(text,): при поиске по FTS-индексу игла попадает не в params,
+        # а во временную таблицу совпадений, и без неё ключ кэша совпал бы
+        # у двух разных поисков
+        total = self.count_of(f'SELECT COUNT(*){tables}{cond}', params, db,
+                              extra=(text,))
+        if not total:
             return f'в телах методов ничего не найдено: {text}' if text \
                 else 'ничего не найдено'
+        rows = conn.execute(
+            'SELECT o.path, m.code_name, mt.kind, mt.name, mt.signature, '
+            'mt.directives, mt.description'
+            + (', mt.body, mt.line_start' if text else '')
+            + tables + cond
+            # порядок по первичному ключу: writer вставляет методы вдоль
+            # объектов и модулей, поэтому выдача читается так же, как
+            # «путь, модуль, строка», но планировщик снимает её прямо с
+            # обхода таблицы (без temp B-tree) и обрывает на LIMIT —
+            # сортировка всех совпадений на короткой игле стоила 3,3 с
+            + ' ORDER BY mt.id LIMIT ? OFFSET ?',
+            params + [limit, offset]).fetchall()
         out = []
         for row in rows:
             p, code, kind, name, sig, dirs, desc = row[:7]
@@ -1409,9 +1502,7 @@ class McpServer:
             elif desc:
                 line += ' | ' + desc.splitlines()[0][:80]
             out.append(line)
-        if len(rows) >= limit:
-            out.append(f'… показаны первые {limit}; уточните mask/text/path '
-                       'или увеличьте limit')
+        out.append('… ' + page_note(total, offset, len(rows)))
         if text:
             out.append('тело метода целиком — get_method, окно строк вокруг '
                        'нужного вызова — find_method_context')
@@ -1427,19 +1518,24 @@ class McpServer:
             return f'у объекта нет запросов СКД: {path}'
         return ('\n;\n'.join(r[0] for r in rows))[:20000]
 
-    def find_skd(self, mask, limit=10, db=None):
-        rows = self.conn(db).execute(
-            'SELECT q.id, o.path, q.query FROM skd_query q '
-            'JOIN meta_object o ON o.id=q.object_id '
-            'WHERE q.query LIKE ? LIMIT ?',
-            (f'%{mask}%', int(limit))).fetchall()
-        if not rows:
+    def find_skd(self, mask, limit=10, offset=0, db=None):
+        like = f'%{mask}%'
+        limit, offset = page_limit(limit), page_offset(offset)
+        tables = (' FROM skd_query q JOIN meta_object o ON o.id=q.object_id '
+                  'WHERE q.query LIKE ? ')
+        total = self.count_of(f'SELECT COUNT(*){tables}', (like,), db)
+        if not total:
             return 'ничего не найдено'
+        rows = self.conn(db).execute(
+            f'SELECT q.id, o.path, q.query{tables}'
+            'ORDER BY o.path, q.ord, q.id LIMIT ? OFFSET ?',
+            (like, limit, offset)).fetchall()
         out = []
         for rid, path, text in rows:
             pos = text.lower().find(mask.lower())
             snippet = text[max(0, pos - 120):pos + 240].replace('\n', ' ')
             out.append(f'[{rid}] {ru_path(path)} … {snippet} …')
+        out.append('… ' + page_note(total, offset, len(rows)))
         return '\n'.join(out)
 
     def xdto_of(self, path, type=None, db=None):
@@ -1528,34 +1624,43 @@ class McpServer:
                                                       by_id, indent + '    '))
         return out
 
-    def find_xdto(self, mask, limit=20, db=None):
-        """Типы и свойства пакетов XDTO, чьё имя содержит mask."""
-        q = self.conn(db).execute
+    def find_xdto(self, mask, limit=20, offset=0, db=None):
+        """Типы и свойства пакетов XDTO, чьё имя содержит mask.
+
+        Список виртуально склеен: сначала все совпавшие типы, потом все
+        свойства, поэтому total_count и offset считаются по склейке, а
+        страница может начинаться уже со свойств.
+        """
         like = f'%{mask}%'
-        limit = max(1, int(limit))
+        limit, offset = page_limit(limit), page_offset(offset)
+        type_from = (' FROM xdto_type t JOIN meta_object o ON o.id=t.object_id '
+                     'WHERE t.name LIKE ? ')
+        prop_from = (' FROM xdto_property p JOIN xdto_type t ON t.id=p.type_id '
+                     'JOIN meta_object o ON o.id=p.object_id '
+                     'WHERE p.name LIKE ? ')
+        types_total = self.count_of(f'SELECT COUNT(*){type_from}', (like,), db)
+        props_total = self.count_of(f'SELECT COUNT(*){prop_from}', (like,), db)
+        total = types_total + props_total
+        if not total:
+            return f'в пакетах XDTO ничего не найдено по «{mask}»'
         out = []
-        for path, name, base in q(
-                'SELECT o.path, t.name, t.base FROM xdto_type t '
-                'JOIN meta_object o ON o.id=t.object_id '
-                'WHERE t.name LIKE ? ORDER BY o.path, t.ord LIMIT ?',
-                (like, limit)):
-            out.append(f'{ru_path(path)} — тип {name}'
-                       + (f' (базовый {base})' if base else ''))
+        if offset < types_total:
+            for path, name, base in self.conn(db).execute(
+                    f'SELECT o.path, t.name, t.base{type_from}'
+                    'ORDER BY o.path, t.ord, t.id LIMIT ? OFFSET ?',
+                    (like, limit, offset)):
+                out.append(f'{ru_path(path)} — тип {name}'
+                           + (f' (базовый {base})' if base else ''))
         if len(out) < limit:
-            for path, tname, pname, ptype in q(
-                    'SELECT o.path, t.name, p.name, p.type FROM xdto_property p '
-                    'JOIN xdto_type t ON t.id=p.type_id '
-                    'JOIN meta_object o ON o.id=p.object_id '
-                    'WHERE p.name LIKE ? ORDER BY o.path LIMIT ?',
-                    (like, limit - len(out))):
+            for path, tname, pname, ptype in self.conn(db).execute(
+                    f'SELECT o.path, t.name, p.name, p.type{prop_from}'
+                    'ORDER BY o.path, t.ord, p.ord, p.id LIMIT ? OFFSET ?',
+                    (like, limit - len(out), max(0, offset - types_total))):
                 out.append(f'{ru_path(path)} — {tname}.{pname}'
                            + (f': {ptype}' if ptype else ''))
-        else:
-            # лимит выбран именами типов: ответ не должен выглядеть полным
-            out.append(f'… показаны только имена типов (limit {limit}): '
-                       'свойства не выводились, уточните маску')
-        if not out:
-            return f'в пакетах XDTO ничего не найдено по «{mask}»'
+        out.append('… ' + page_note(total, offset, len(out),
+                                    f' (типов {types_total}, '
+                                    f'свойств {props_total})'))
         return '\n'.join(out)
 
     def check_query(self, text, db=None):
@@ -1850,6 +1955,16 @@ _GROUP = {'type': 'string',
                          '+ processors). When specified, the tool runs on ALL '
                          "databases in the group. Special value '*': run on "
                          'every group at once. Takes priority over db parameter.'}
+_LIMIT = {'type': 'integer',
+          'description': 'Page size, 1..200. When the search has more hits '
+                         'than one page, read the next page with offset '
+                         'instead of raising limit.'}
+_OFFSET = {'type': 'integer',
+           'description': 'Hits of the SAME search to skip, i.e. the start of '
+                          'the page (default 0 = the first page). The answer '
+                          'ends with the total hit count, the range shown and '
+                          'the offset to pass for the next page; the order of '
+                          'hits is stable, so pages never overlap or skip.'}
 
 TOOLS = [
     Tool('find_objects',
@@ -1857,8 +1972,8 @@ TOOLS = [
          "configurator-style dotted paths ('Справочник.Имя') with Russian and "
          'English type labels. First step for anything: locate '
          'справочник/документ/регистр by its Russian name.',
-         _schema({'mask': _STR, 'type': _STR,
-                  'limit': _INT, 'db': _DB, 'group': _GROUP}, ('mask',)),
+         _schema({'mask': _STR, 'type': _STR, 'limit': _LIMIT,
+                  'offset': _OFFSET, 'db': _DB, 'group': _GROUP}, ('mask',)),
          McpServer.find_objects),
     Tool('object_card',
          "Full 'passport' of one object in a single call: type, header "
@@ -1878,13 +1993,15 @@ TOOLS = [
     Tool('find_field',
          'Reverse search: which objects contain a field/tabular-section field '
          'with this name. Use to discover join paths between tables.',
-         _schema({'name': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP}, ('name',)),
+         _schema({'name': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
+                  'db': _DB, 'group': _GROUP}, ('name',)),
          McpServer.find_field),
     Tool('refs_of',
          "Reference links of an object via attribute types: forward ('on what "
-         "it references') and reverse ('who references it') — impact analysis.",
-         _schema({'path': _STR, 'direction': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP},
-                 ('path',)),
+         "it references') and reverse ('who references it') — impact analysis. "
+         'limit/offset page each of the two lists separately.',
+         _schema({'path': _STR, 'direction': _STR, 'limit': _LIMIT,
+                  'offset': _OFFSET, 'db': _DB, 'group': _GROUP}, ('path',)),
          McpServer.refs_of),
     Tool('module_outline',
          'Table of contents of a 1C module: signatures, comments, #Если '
@@ -1944,9 +2061,11 @@ TOOLS = [
          'each hit comes with its module line number and the line itself. '
          'mask and text may be combined; path narrows the search to one object '
          '(it is a real filter now). Body search is case-insensitive and scans '
-         'every method, so it takes seconds on a large base.',
-         _schema({'mask': _STR, 'text': _STR, 'path': _STR, 'limit': _INT,
-                  'db': _DB, 'group': _GROUP}),
+         'every method, so it takes seconds on a large base. Hits are paged: '
+         'the answer ends with the total count and the offset of the next '
+         'page, so page through a broad search instead of raising limit.',
+         _schema({'mask': _STR, 'text': _STR, 'path': _STR, 'limit': _LIMIT,
+                  'offset': _OFFSET, 'db': _DB, 'group': _GROUP}),
          McpServer.find_methods),
     Tool('skd_of',
          'All SKD (report) queries of an object — the best examples of how '
@@ -1956,7 +2075,8 @@ TOOLS = [
     Tool('find_skd',
          'Search across all SKD query texts (e.g. a table name like '
          "'РегистрНакопления.Запасы'). Returns snippets around the match.",
-         _schema({'mask': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP}, ('mask',)),
+         _schema({'mask': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
+                  'db': _DB, 'group': _GROUP}, ('mask',)),
          McpServer.find_skd),
     Tool('xdto_of',
          'Contents of an XDTO package: target namespace, imported namespaces, '
@@ -1969,8 +2089,11 @@ TOOLS = [
     Tool('find_xdto',
          'Search type and property NAMES inside every XDTO package of the base '
          '(e.g. the field of a message an exchange contract defines). Each hit '
-         'names its package and type.',
-         _schema({'mask': _STR, 'limit': _INT, 'db': _DB, 'group': _GROUP}, ('mask',)),
+         'names its package and type. Hits are one list — matching types '
+         'first, then matching properties — paged by limit/offset; the answer '
+         'names both counts.',
+         _schema({'mask': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
+                  'db': _DB, 'group': _GROUP}, ('mask',)),
          McpServer.find_xdto),
     Tool('check_query',
          'Validate a 1C query: syntax (Russian keywords) + existence of '
