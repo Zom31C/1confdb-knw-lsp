@@ -916,6 +916,7 @@ CREATE TABLE role_right (
     target_tabular_id INTEGER REFERENCES meta_tabular(id) ON DELETE CASCADE,
     sub_index INTEGER,
     collection_uuid TEXT,
+    target_flags TEXT,
     right_uuid TEXT NOT NULL,
     value TEXT NOT NULL,
     rls_text TEXT
@@ -1317,11 +1318,35 @@ def build_fts_index(db_path, workers=1):
 
 _ROLE_RIGHT_SQL = ('INSERT INTO role_right (role_id, target_uuid,'
                    ' target_object_id, target_attr_id, target_tabular_id,'
-                   ' sub_index, collection_uuid, right_uuid, value, rls_text)'
-                   ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                   ' sub_index, collection_uuid, target_flags,'
+                   ' right_uuid, value, rls_text)'
+                   ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
 _ROLE_STATE_SQL = ('INSERT INTO role_rights_state (role_id, version, parsed,'
                    ' targets, rights, rls_templates, error)'
                    ' VALUES (?, ?, ?, ?, ?, ?, ?)')
+
+
+def _flag_token(value):
+    """Один флаг записи цели как текст: блок ['-12', uuid] -> '-12:uuid'."""
+    if isinstance(value, (list, tuple)):
+        return ':'.join(str(item) for item in value)
+    return str(value)
+
+
+def _target_flags(target):
+    """Флаги записи цели дословно ('0/1'); None — в записи их нет.
+
+    Смысл флагов не подтверждён, поэтому они хранятся как есть и не печатаются
+    без нужды. Хранить их обязывает счётчик целей: один и тот же uuid встречается
+    в роли несколько раз с разными флагами, и без них цели сливаются в одну
+    (у УНФ так терялись 4 цели роли ДобавлениеИзменениеВозвратовПоставщикам —
+    7335 в файле против 7331 различимых). Флаг бывает и вложенным блоком
+    ['-K', uuid] — вторая ступень адресации внутри цели (8 строк у той же роли),
+    поэтому блок раскладывается через ':', а не печатается как список Python.
+    """
+    if target.flag_a is None and target.flag_b is None:
+        return None
+    return '/'.join(_flag_token(value) for value in (target.flag_a, target.flag_b))
 
 
 def _right_targets(conn):
@@ -1383,7 +1408,8 @@ def _write_role_rights(conn, dump_dir, stats):
             obj_id, attr_id, tab_id = targets.get(target.uuid, (None, None, None))
             right_params.append((role_id, target.uuid, obj_id, attr_id, tab_id,
                                  target.sub_index, target.collection_uuid,
-                                 entry.right_uuid, entry.value, entry.rls_text))
+                                 _target_flags(target), entry.right_uuid,
+                                 entry.value, entry.rls_text))
             count += 1
         for ord_no, (name, text) in enumerate(parsed.rls_templates):
             tmpl_params.append((role_id, ord_no, name, text))

@@ -392,11 +392,13 @@ CONFIGURATION GROUPS: a group bundles related databases (main configuration + ex
 
 DATABASE IDENTIFIER: every tool response includes a header line identifying the source database and, when the base belongs to a group, the group: '=== группа <имя> / база <алиас> (<путь>) ===' (a base in several groups prints all of them: '=== группы A, B / база …'). Read it before trusting a result: it says which configuration the answer came from. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
 
-PAGING SEARCH RESULTS: find_objects, find_field, find_methods, find_skd, find_xdto and refs_of return ONE PAGE of their hits — limit is the page size (1..200), offset is how many hits of the SAME search to skip. Every answer ends with a paging line: '… всего найдено N; показано a–b; есть ещё K — следующий вызов с offset=b' (total hit count, the range shown, how many are left and the offset to pass for the next page); when the page holds everything it says 'это все результаты' instead. The order of hits is stable, so consecutive pages never overlap or skip — to read further, call the same tool with the printed offset. Do NOT raise limit to 200 and do not narrow the mask just to fit one answer: page. find_xdto counts matching types and properties as one list (types first, then properties) and names both counts; refs_of pages each of its two lists with the same offset.
+PAGING SEARCH RESULTS: find_objects, find_field, find_methods, find_skd, find_xdto, refs_of, role_rights and object_rights return ONE PAGE of their hits — limit is the page size (1..200), offset is how many hits of the SAME search to skip. Every answer ends with a paging line: '… всего найдено N; показано a–b; есть ещё K — следующий вызов с offset=b' (total hit count, the range shown, how many are left and the offset to pass for the next page); when the page holds everything it says 'это все результаты' instead. The order of hits is stable, so consecutive pages never overlap or skip — to read further, call the same tool with the printed offset. Do NOT raise limit to 200 and do not narrow the mask just to fit one answer: page. find_xdto counts matching types and properties as one list (types first, then properties) and names both counts; refs_of pages each of its two lists with the same offset; role_rights pages the targets of a role and object_rights pages the roles touching an object.
 
 COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds and WHAT KIND of file it came from — .cf configuration, .cfe extension, .epf external data processor, .erf external report (name, version, compatibility mode, source file, build date); db_list repeats the kind and the version in one line per open base. These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
 
 REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
+
+ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. A right is printed as the first 8 hex chars of its platform uuid plus the value exactly as stored (1 or -1): the configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed. Bases built before 2026-10-07 have no rights tables at all and both tools say so instead of failing.
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
@@ -408,10 +410,11 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 - xdto_type(object_id, ord, name, kind, base, base_ns, facets, enum_values) — the types an XDTO package declares: kind is objectType, valueType (a simple/enumeration type) or typeDef (an anonymous type nested in a property); base/base_ns name the base type and the namespace it comes from; facets holds the remaining XML attributes as 'name=value; …' (maxLength, totalDigits, localName…); enum_values lists the allowed values of an enumeration type. xdto_property(type_id, object_id, ord, name, type, type_ns, lower_bound, upper_bound, nillable, form, extra, nested_type_id) — properties: lower_bound=1 = obligatory, upper_bound=-1 = a list, form = Attribute|Element, nested_type_id → an anonymous nested type, extra = the remaining attributes; type_id NULL = a property declared by the package itself, outside any type. xdto_import(object_id, ord, namespace) — the namespaces the package imports. Prefer xdto_of/find_xdto over querying these directly.
 - skd_query(object_id, ord, query) — report queries in the 1C query language (Russian keywords ВЫБРАТЬ/ИЗ/ГДЕ/СОЕДИНЕНИЕ/ОБЪЕДИНИТЬ).
 - enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, parent_ord, uuid, name, code, display) — predefined elements (catalog items, chart-of-accounts accounts, characteristic-chart values) in depth-first order: parent_ord is the ord of the parent, and NULL only for the root node ('Счета'/'Элементы'), which is not an element; uuid identifies the element and is what a subconto kind points at; predefined_subconto(predefined_id, ord, uuid, kind_id, flags) — the subconto kinds of a predefined account: kind_id → the predefined element of the characteristic chart that names the kind, flags = 'Суммовой;Валютный;Количественный'; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source(file, created, root_type/root_name/root_uuid, file_size, file_sha256) — which .cf/.cfe/.epf the base was built from, when, and the SHA-256 of that file: equal digests in two bases mean the very same source file, so nothing has to be re-extracted (NULL in bases built before the digest was added); file.
+- role_right(role_id, target_uuid, target_object_id, target_attr_id, target_tabular_id, sub_index, collection_uuid, target_flags, right_uuid, value, rls_text) — explicit role rights, SPARSE (no row = the right is not set); target_flags keeps the flags of the target record verbatim (their meaning is NOT confirmed — they only tell two targets sharing one uuid apart); role_rls_template(role_id, ord, name, text) — the role RLS templates; role_rights_state(role_id, version, parsed, targets, rights, rls_templates, error) — parsed=0 means the rights file could NOT be read (the reason is in error), which is not the same as a role without rights. Absent in bases built before 2026-10-07. Prefer role_rights / object_rights over querying these.
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
-RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns. This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
+RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns; 8) role_rights / object_rights for access analysis — what a role is given and which roles carry explicit rights on an object (its fields and tabular sections included). This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
 
 All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing."""
 
@@ -431,6 +434,79 @@ def _group_items(groups):
             paths = [paths]
         result.append((str(name).strip(), list(paths or ())))
     return result
+
+
+# -- права ролей ----------------------------------------------------------
+# Право печатается первыми знаками его uuid: словаря «uuid -> русское имя права»
+# в конфигурации нет (66 uuid прав не встречаются ни в одном .json дампа),
+# поэтому выдуманного имени в выдаче быть не должно. Значение тоже идёт как
+# записано в роли: его смысл платформенным словарём не подтверждён.
+RIGHT_UUID_PREFIX = 8
+RLS_TEXT_LIMIT = 600      # ограничение доступа длинное — страница не должна тонуть
+TARGETS_PER_ROLE = 12     # сколько целей объекта печатать в строке роли
+
+RIGHTS_NOTE = ('право = первые 8 знаков его uuid (имени права в конфигурации нет),'
+               ' значение — как в файле роли (1 или -1), смысл значения'
+               ' платформенным словарём не подтверждён')
+
+NO_RIGHTS_TABLES = ('в базе нет прав ролей: она собрана раньше, чем появились'
+                    ' таблицы role_right/role_rights_state (2026-10-07) —'
+                    ' пересобрать: confdb extract <файл> --db <база> --force')
+
+
+def _rights_tables(conn):
+    """Есть ли в базе таблицы прав ролей (пишутся с 2026-10-07)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        " AND name IN ('role_right','role_rights_state')").fetchone()[0] == 2
+
+
+def _right_labels(rows):
+    """'287b74b8=1; aa6448f2=-1' — из записей (uuid права, значение, RLS)."""
+    return '; '.join(f'{right[:RIGHT_UUID_PREFIX]}={value}'
+                     for right, value, _rls in rows)
+
+
+def _target_label(obj_path, attr_name, attr_tabular, tab_name, target_uuid,
+                  sub_index, collection_uuid, flags=None):
+    """Кем приходится цель права: объект, его реквизит/поле ТЧ или его ТЧ.
+
+    Неразрешённый uuid печатается как есть: ни объектом, ни реквизитом, ни
+    табличной частью этой базы он не является, а выдумывать сущность нельзя —
+    смысл адресации «объект + отрицательный номер внутри коллекции» и у
+    специального маркера `de29c81d-…` не подтверждён. `flags` — флаги записи
+    цели из файла роли: они добавляются только когда без них две цели
+    неотличимы, потому что их смысл тоже не подтверждён.
+    """
+    if attr_name:
+        base = ru_path(obj_path)
+        label = (f'{base}, поле {attr_tabular}.{attr_name}' if attr_tabular
+                 else f'{base}, реквизит {attr_name}')
+    elif tab_name:
+        label = f'{ru_path(obj_path)}, табличная часть {tab_name}'
+    elif obj_path:
+        label = ru_path(obj_path)
+    else:
+        label = f'цель не распознана (uuid {target_uuid})'
+    if sub_index is not None:
+        tail = f'подобъект №{sub_index}'
+        if collection_uuid:
+            tail += f' коллекции {collection_uuid[:RIGHT_UUID_PREFIX]}'
+        label = f'{label} — {tail}'
+    return f'{label} (флаги цели {flags})' if flags else label
+
+
+def _rls_lines(rows):
+    """Тексты ограничений доступа (RLS) из записей права — по строке на право."""
+    out = []
+    for right, _value, rls in rows:
+        if not rls:
+            continue
+        text = ' '.join(str(rls).split())
+        if len(text) > RLS_TEXT_LIMIT:
+            text = text[:RLS_TEXT_LIMIT] + '… (обрезано)'
+        out.append(f'    RLS для права {right[:RIGHT_UUID_PREFIX]}: {text}')
+    return out
 
 
 class McpServer:
@@ -1216,6 +1292,244 @@ class McpServer:
             out.append(title + ': ' + (', '.join(ru_path(r[0]) for r in rows)
                                        if rows else '—'))
             out.append('… ' + page_note(total, offset, len(rows)))
+        return '\n'.join(out)
+
+    # -- права ролей -------------------------------------------------------
+    def _role_path(self, role, db=None):
+        """Путь роли по имени ('ПолныеПрава') или пути ('Role/…', 'Роль.…')."""
+        value = (role or '').strip()
+        if not value:
+            return None
+        q = self.conn(db).execute
+        row = q("SELECT path FROM meta_object WHERE type='Role' AND path=?",
+                (self.resolve_path(value, db),)).fetchone()
+        if row:
+            return row[0]
+        row = q("SELECT path FROM meta_object WHERE type='Role' AND name=?"
+                ' ORDER BY path LIMIT 1', (value,)).fetchone()
+        return row[0] if row else None
+
+    def _role_state(self, db, role_id):
+        """Строка role_rights_state роли или None — состояние не сохранено."""
+        return self.conn(db).execute(
+            'SELECT version, parsed, targets, rights, rls_templates, error'
+            ' FROM role_rights_state WHERE role_id=?', (role_id,)).fetchone()
+
+    def _rights_of_targets(self, db, keys):
+        """{(role_id, uuid цели, sub_index, collection_uuid, флаги): [(право, значение, RLS)]}.
+
+        Один запрос на страницу вместо запроса на цель: фильтр по двум спискам
+        (роли и uuid целей) даёт надмножество нужного, а ключ отбирает ровно те
+        записи, по которым сгруппирована выдача. Адресация подобъекта И флаги
+        записи входят в ключ: один и тот же uuid объекта встречается в роли
+        несколько раз с разными sub_index («подобъект №-K») или флагами, и это
+        РАЗНЫЕ цели — слить их значит показать право дважды и занизить счётчик.
+        """
+        if not keys:
+            return {}
+        role_ids = sorted({key[0] for key in keys})
+        uuids = sorted({key[1] for key in keys})
+        wanted = set(keys)
+        marks = ','.join('?' * len(role_ids))
+        marks_uuid = ','.join('?' * len(uuids))
+        out = {}
+        for row in self.conn(db).execute(
+                'SELECT role_id, target_uuid, sub_index, collection_uuid,'
+                ' target_flags, right_uuid, value, rls_text FROM role_right'
+                f' WHERE role_id IN ({marks}) AND target_uuid IN ({marks_uuid})'
+                ' ORDER BY id', role_ids + uuids):
+            key = tuple(row[:5])
+            if key in wanted:
+                out.setdefault(key, []).append(tuple(row[5:]))
+        return out
+
+    def _flag_ambiguous(self, db, where, params):
+        """Ключи (uuid цели, sub_index, collection_uuid), различимые только флагами.
+
+        Флаги записи цели хранятся дословно, а их смысл не подтверждён, поэтому
+        в выдаче они появляются лишь там, где без них две цели выглядели бы
+        одинаково: иначе одна и та же строка встретилась бы дважды без объяснения.
+        """
+        rows = self.conn(db).execute(
+            'SELECT target_uuid, sub_index, collection_uuid FROM role_right'
+            f' WHERE {where}'
+            ' GROUP BY target_uuid, sub_index, collection_uuid'
+            " HAVING COUNT(DISTINCT COALESCE(target_flags, '-')) > 1",
+            params).fetchall()
+        return {tuple(row) for row in rows}
+
+    def role_rights(self, role, limit=50, offset=0, db=None):
+        """Явные права роли: строка на цель (объект, его реквизит/поле или ТЧ).
+
+        Хранятся только ЯВНЫЕ записи, поэтому цели нет в списке — значит право
+        на неё ролью не задано, а не запрещено. `parsed=0` — файл прав не
+        прочитан: ответ обязан сказать «данные недоступны», а не показать пустой
+        список, который читается как «роли ничего не разрешено».
+        """
+        conn = self.conn(db)
+        if not _rights_tables(conn):
+            return NO_RIGHTS_TABLES
+        path = self._role_path(role, db)
+        if not path:
+            return (f'роль не найдена: {role} (список ролей:'
+                    ' find_objects(mask="", type="Role"))')
+        q = conn.execute
+        role_id = q('SELECT id FROM meta_object WHERE path=?', (path,)).fetchone()[0]
+        state = self._role_state(db, role_id)
+        out = [ru_path(path)]
+        if state is None:
+            out.append('состояние извлечения прав этой роли не сохранено —'
+                       ' список ниже может быть неполным')
+        else:
+            version, parsed, targets, rights, templates, error = state
+            out[0] += (f': формат версии {version or "?"}, целей {targets},'
+                       f' явных записей прав {rights}, шаблонов RLS {templates}')
+            if not parsed:
+                out.append(f'данные недоступны: {error or "причина не сохранена"}'
+                           ' — это НЕ «права не заданы»: файл прав не прочитан')
+                return '\n'.join(out)
+            if not rights:
+                out.append('явных записей прав нет: права роли не заданы'
+                           ' (факт конфигурации, а не сбой извлечения)')
+                return '\n'.join(out)
+            if templates:
+                names = [r[0] for r in q(
+                    'SELECT name FROM role_rls_template WHERE role_id=?'
+                    ' ORDER BY ord', (role_id,)) if r[0]]
+                out.append('Шаблоны RLS: ' + ', '.join(names) +
+                           ' (тексты — sql: SELECT name, text FROM'
+                           f' role_rls_template WHERE role_id={role_id})')
+        out.append(RIGHTS_NOTE)
+        limit, offset = page_limit(limit), page_offset(offset)
+        groups = (
+            'SELECT r.target_uuid, o.path, a.name, a.tabular, t.name,'
+            ' r.sub_index, r.collection_uuid, r.target_flags, COUNT(*)'
+            ' FROM role_right r'
+            ' LEFT JOIN meta_object o ON o.id=r.target_object_id'
+            ' LEFT JOIN meta_attribute a ON a.id=r.target_attr_id'
+            ' LEFT JOIN meta_tabular t ON t.id=r.target_tabular_id'
+            ' WHERE r.role_id=?'
+            ' GROUP BY r.target_uuid, r.target_object_id, r.target_attr_id,'
+            ' r.target_tabular_id, r.sub_index, r.collection_uuid, r.target_flags'
+            ' ORDER BY o.path IS NULL, o.path, t.name, a.tabular, a.name,'
+            ' r.sub_index, r.target_uuid, r.target_flags')
+        total = self.count_of(f'SELECT COUNT(*) FROM ({groups})', (role_id,), db)
+        rows = q(groups + ' LIMIT ? OFFSET ?',
+                 [role_id, limit, offset]).fetchall()
+        dup = self._flag_ambiguous(db, 'role_id=?', [role_id])
+        by_target = self._rights_of_targets(
+            db, [(role_id, r[0], r[5], r[6], r[7]) for r in rows])
+        for (target_uuid, obj_path, attr_name, attr_tabular, tab_name,
+             sub_index, collection_uuid, flags, count) in rows:
+            rights = by_target.get((role_id, target_uuid, sub_index,
+                                    collection_uuid, flags), [])
+            label = _target_label(
+                obj_path, attr_name, attr_tabular, tab_name, target_uuid,
+                sub_index, collection_uuid,
+                flags if (target_uuid, sub_index, collection_uuid) in dup
+                else None)
+            out.append(f'{label} — записей {count}: ' + _right_labels(rights))
+            out.extend(_rls_lines(rights))
+        out.append('… ' + page_note(total, offset, len(rows), ' (целей)'))
+        return '\n'.join(out)
+
+    def object_rights(self, path, role=None, limit=50, offset=0, db=None):
+        """Явные права ролей на объект, его реквизиты/поля ТЧ и табличные части.
+
+        У права на подобъект `target_object_id` — объект-владелец, поэтому одно
+        условие охватывает и сам объект, и его поля: «кто работает с этим
+        справочником» видно одним запросом. Роли с `parsed=0` в список не
+        попадают (их файл прав не прочитан) — ответ обязан назвать их число,
+        иначе пустой список читается как «доступ запрещён всем».
+        """
+        conn = self.conn(db)
+        if not _rights_tables(conn):
+            return NO_RIGHTS_TABLES
+        path = self.resolve_path(path, db)
+        q = conn.execute
+        row = q('SELECT id, path FROM meta_object WHERE path=?', (path,)).fetchone()
+        if not row:
+            return f'объект не найден: {path}'
+        oid, path = row
+        out = [ru_path(path)]
+        where = ' WHERE r.target_object_id=?'
+        params = [oid]
+        only_role = None
+        role_path = None
+        if role:
+            role_path = self._role_path(role, db)
+            if not role_path:
+                return f'роль не найдена: {role}'
+            only_role = q('SELECT id FROM meta_object WHERE path=?',
+                          (role_path,)).fetchone()[0]
+            where += ' AND r.role_id=?'
+            params.append(only_role)
+        limit, offset = page_limit(limit), page_offset(offset)
+        total = self.count_of(
+            'SELECT COUNT(DISTINCT r.role_id) FROM role_right r' + where,
+            params, db)
+        role_rows = q(
+            'SELECT DISTINCT r.role_id, ro.path FROM role_right r'
+            ' JOIN meta_object ro ON ro.id=r.role_id' + where +
+            ' ORDER BY ro.path LIMIT ? OFFSET ?',
+            params + [limit, offset]).fetchall()
+        if not role_rows:
+            tail = (f' у роли {ru_path(role_path)}' if role_path
+                    else ' ни у одной роли')
+            out.append('явных записей прав на этот объект нет' + tail)
+        by_role = {}
+        ids = [rid for rid, _ in role_rows]
+        if ids:
+            marks = ','.join('?' * len(ids))
+            for row in q(
+                    'SELECT r.role_id, r.target_uuid, o.path, a.name, a.tabular,'
+                    ' t.name, r.sub_index, r.collection_uuid, r.target_flags,'
+                    ' r.right_uuid, r.value, r.rls_text'
+                    ' FROM role_right r'
+                    ' LEFT JOIN meta_object o ON o.id=r.target_object_id'
+                    ' LEFT JOIN meta_attribute a ON a.id=r.target_attr_id'
+                    ' LEFT JOIN meta_tabular t ON t.id=r.target_tabular_id'
+                    f' WHERE r.target_object_id=? AND r.role_id IN ({marks})'
+                    ' ORDER BY r.role_id, o.path, t.name, a.tabular, a.name,'
+                    ' r.sub_index, r.target_uuid, r.target_flags, r.id',
+                    [oid] + ids):
+                by_role.setdefault(row[0], []).append(row[1:])
+        dup = self._flag_ambiguous(db, 'target_object_id=?', [oid])
+        out.append(RIGHTS_NOTE)
+        cap = None if only_role else TARGETS_PER_ROLE
+        for rid, rpath in role_rows:
+            targets = []
+            index = {}
+            for (target_uuid, obj_path, attr_name, attr_tabular, tab_name,
+                 sub_index, collection_uuid, flags, right, value,
+                 rls) in by_role.get(rid, ()):
+                # тот же uuid объекта с иным sub_index или флагами — другая цель
+                key = (target_uuid, sub_index, collection_uuid, flags)
+                if key not in index:
+                    index[key] = len(targets)
+                    targets.append([_target_label(
+                        obj_path, attr_name, attr_tabular, tab_name, target_uuid,
+                        sub_index, collection_uuid,
+                        flags if (target_uuid, sub_index,
+                                  collection_uuid) in dup else None), []])
+                targets[index[key]][1].append((right, value, rls))
+            shown = targets if cap is None else targets[:cap]
+            body = '; '.join(f'{label} ({len(rights)}) — {_right_labels(rights)}'
+                             for label, rights in shown)
+            line = f'{ru_path(rpath)}: ' + (body or '—')
+            if cap is not None and len(targets) > cap:
+                line += f'; … и ещё {len(targets) - cap} целей'
+            out.append(line)
+            for _label, rights in shown:
+                out.extend(_rls_lines(rights))
+        bad = q('SELECT COUNT(*) FROM role_rights_state WHERE parsed=0').fetchone()[0]
+        if bad:
+            roles = q("SELECT COUNT(*) FROM meta_object WHERE type='Role'"
+                      ).fetchone()[0]
+            out.append(f'у {bad} из {roles} ролей права недоступны (файл прав не'
+                       ' прочитан, причина в role_rights_state.error) — их нет'
+                       ' в списке не потому, что они ничего не разрешают')
+        out.append('… ' + page_note(total, offset, len(role_rows), ' (ролей)'))
         return '\n'.join(out)
 
     def module_outline(self, path, code_name='obj', db=None):
@@ -2166,6 +2480,33 @@ TOOLS = [
          _schema({'path': _STR, 'direction': _STR, 'limit': _LIMIT,
                   'offset': _OFFSET, 'db': _DB, 'group': _GROUP}, ('path',)),
          McpServer.refs_of),
+    Tool('role_rights',
+         'Explicit rights of ONE role (from Role.0.c1brace): a line per target — '
+         'the object itself, one of its attributes / tabular-section fields, or '
+         'one of its tabular sections — with the rights set on it and their '
+         'record-level restriction (RLS) text, plus the role RLS templates. '
+         'Storage is SPARSE: a target absent from the answer means the right is '
+         'NOT SET for this role, never "denied". A right is named by the first 8 '
+         'hex chars of its platform uuid and its value is printed exactly as '
+         'stored (1 or -1): the configuration holds no right names, so do not '
+         'present them as "Чтение"/"Запись" — the dictionary is not confirmed. '
+         'Says "данные недоступны" (with the reason) when the rights file could '
+         'not be read, which is NOT the same as an empty list. Pages targets.',
+         _schema({'role': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
+                  'db': _DB, 'group': _GROUP}, ('role',)),
+         McpServer.role_rights),
+    Tool('object_rights',
+         'Which roles carry explicit rights on an OBJECT — its attributes, '
+         'tabular-section fields and tabular sections included, because they '
+         'belong to the same object. One line per role with its targets and '
+         'rights (same sparse rule, same uuid/value caveat as role_rights). Pass '
+         'role to see one role-object pair in full. The answer also names how '
+         'many roles have UNREADABLE rights files: they are missing from the '
+         'list for that reason, not because they deny access. Use it for access '
+         'analysis ("who can work with this catalog"). Pages roles.',
+         _schema({'path': _STR, 'role': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
+                  'db': _DB, 'group': _GROUP}, ('path',)),
+         McpServer.object_rights),
     Tool('module_outline',
          'Table of contents of a 1C module: signatures, comments, #Если '
          "regions, WITHOUT method bodies. code_name: 'obj' (object module), "

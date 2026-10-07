@@ -71,6 +71,31 @@ PRESETS = [
      "JOIN meta_attribute a ON a.id=r.attribute_id "
      "JOIN meta_object v ON v.id=a.object_id LEFT JOIN meta_object o ON o.id=r.object_id "
      "WHERE v.path='{путь}' ORDER BY a.ord, r.ord"),
+    # права ролей: right_uuid — идентификатор права платформы (русского имени
+    # права в конфигурации нет), value — значение как в файле роли
+    ('Права роли',
+     "SELECT ro.name AS role, COALESCE(t.path, 'цель ' || r.target_uuid) AS object, "
+     "COALESCE(a.name, tb.name, '') AS subobject, r.sub_index, "
+     "r.right_uuid, r.value, CASE WHEN r.rls_text IS NULL THEN '' ELSE 'RLS' END AS rls "
+     "FROM role_right r JOIN meta_object ro ON ro.id=r.role_id "
+     "LEFT JOIN meta_object t ON t.id=r.target_object_id "
+     "LEFT JOIN meta_attribute a ON a.id=r.target_attr_id "
+     "LEFT JOIN meta_tabular tb ON tb.id=r.target_tabular_id "
+     "WHERE ro.name LIKE '%{имя}%' ORDER BY object, subobject, r.id LIMIT 100"),
+    ('Права на объект (все роли)',
+     "SELECT ro.name AS role, COALESCE(a.name, tb.name, '') AS subobject, "
+     "r.sub_index, r.right_uuid, r.value, "
+     "CASE WHEN r.rls_text IS NULL THEN '' ELSE 'RLS' END AS rls "
+     "FROM role_right r JOIN meta_object ro ON ro.id=r.role_id "
+     "LEFT JOIN meta_attribute a ON a.id=r.target_attr_id "
+     "LEFT JOIN meta_tabular tb ON tb.id=r.target_tabular_id "
+     "WHERE r.target_object_id=(SELECT id FROM meta_object WHERE path='{путь}') "
+     "ORDER BY ro.name, subobject, r.id LIMIT 100"),
+    ('Состояние прав ролей',
+     "SELECT o.name AS role, s.version, s.parsed, s.targets, s.rights, "
+     "s.rls_templates, COALESCE(s.error, '') AS error "
+     "FROM role_rights_state s JOIN meta_object o ON o.id=s.role_id "
+     "ORDER BY s.parsed, s.rights DESC, o.name LIMIT 100"),
 ]
 
 MAX_CELL = 60

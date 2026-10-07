@@ -19,7 +19,8 @@ from confdb.mcp_server import (McpServer, collect_groups,  # noqa: E402
                                parse_group_spec, resolve_db, resolve_groups,
                                start_http_server)
 
-from test_writer import make_chart_dump, make_dump  # noqa: E402
+from test_writer import _write, make_chart_dump, make_dump  # noqa: E402
+from test_writer_roles import RIGHT_READ, ROLE_RIGHTS, _role_dir  # noqa: E402
 
 
 def _server(tmp_path_factory):
@@ -48,7 +49,8 @@ def test_tools_list(tmp_path_factory):
     resp = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
     names = {t['name'] for t in resp['result']['tools']}
     assert names == {'find_objects', 'object_card', 'object_tree', 'find_field',
-                     'refs_of', 'module_outline', 'get_method',
+                     'refs_of', 'role_rights', 'object_rights',
+                     'module_outline', 'get_method',
                      'find_method_context', 'method_dependencies',
                      'method_result_schema', 'find_methods',
                      'skd_of', 'find_skd', 'xdto_of', 'find_xdto',
@@ -1721,5 +1723,102 @@ def test_configuration_info_of_a_base_without_fingerprint(tmp_path_factory):
     assert '--force' in info
     # в короткую строку db_list нечего писать
     assert 'SHA-256' not in _text(server, 'db_list')
+
+
+def _server_with_role(tmp_path_factory, rights_text=ROLE_RIGHTS):
+    """Сервер на фикстуре с ролью: цель-объект, цель-ТЧ и цель-реквизит."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    _write(os.path.join(_role_dir(dump), 'Role.0.c1brace'), rights_text)
+    db = str(tmp_path_factory.mktemp('db') / 'r.sqlite')
+    write_db(dump, db, source_file='r.cf')
+    return McpServer(db)
+
+
+def test_role_rights_names_targets_of_all_three_kinds(tmp_path_factory):
+    server = _server_with_role(tmp_path_factory)
+    text = _text(server, 'role_rights', role='ТестоваяРоль')
+    assert 'Роль.ТестоваяРоль' in text
+    assert 'целей 4' in text
+    assert 'явных записей прав 5' in text
+    # объект, его табличная часть и его реквизит — разные цели
+    assert 'Справочник.Справочник1 (флаги цели 0/0) — записей 2' in text
+    assert 'Документ.ЗаказПокупателя, табличная часть Товары' in text
+    assert 'Справочник.Справочник1, реквизит СсылкаАтрибут' in text
+    # две цели с одним uuid различимы только флагами записи — флаги показаны
+    assert '(флаги цели 0/0)' in text and '(флаги цели 1/1)' in text
+    # право — это uuid, а не выдуманное имя; значение — как в файле роли
+    assert f'{RIGHT_READ[:8]}=1' in text
+    assert 'имени права в конфигурации нет' in text
+    # адресация подобъекта, текст RLS и шаблоны видны
+    assert 'подобъект №-2' in text
+    assert 'ГДЕ Пользователь = &ТекущийПользователь' in text
+    assert 'Шаблоны RLS: ДляОбъекта(ПолеОбъекта)' in text
+    assert 'всего найдено 4 (целей)' in text
+    server.close_db()
+
+
+def test_role_rights_pages_targets(tmp_path_factory):
+    server = _server_with_role(tmp_path_factory)
+    first = _text(server, 'role_rights', role='ТестоваяРоль', limit=2)
+    assert 'показано 1–2' in first and 'следующий вызов с offset=2' in first
+    second = _text(server, 'role_rights', role='ТестоваяРоль', limit=2, offset=2)
+    assert 'показано 3–4' in second and 'это все результаты' in second
+    # страницы не пересекаются: последние цели не попали в первую
+    assert 'табличная часть Товары' not in first
+    assert 'табличная часть Товары' in second
+    server.close_db()
+
+
+def test_role_rights_tells_unavailable_from_unset(tmp_path_factory):
+    """Нет файла прав — это «данные недоступны», а не «права не заданы»."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    _role_dir(dump)                       # роль есть, Role.0.c1brace — нет
+    db = str(tmp_path_factory.mktemp('db') / 'r.sqlite')
+    write_db(dump, db, source_file='r.cf')
+    server = McpServer(db)
+    text = _text(server, 'role_rights', role='ТестоваяРоль')
+    assert 'данные недоступны' in text
+    assert 'права роли не заданы' not in text
+    # object_rights называет такие роли: иначе пустой список читается как запрет
+    card = _text(server, 'object_rights', path='Catalog/Справочник1')
+    assert 'явных записей прав на этот объект нет' in card
+    assert 'у 1 из 1 ролей права недоступны' in card
+    server.close_db()
+
+
+def test_object_rights_lists_roles_of_object_and_its_fields(tmp_path_factory):
+    server = _server_with_role(tmp_path_factory)
+    text = _text(server, 'object_rights', path='Catalog/Справочник1')
+    assert 'Роль.ТестоваяРоль' in text
+    assert 'реквизит СсылкаАтрибут' in text
+    assert 'всего найдено 1 (ролей)' in text
+    # русский точечный путь роли и фильтр по одной роли
+    one = _text(server, 'object_rights', path='Справочник.Справочник1',
+                role='Роль.ТестоваяРоль')
+    assert 'Роль.ТестоваяРоль' in one and 'реквизит СсылкаАтрибут' in one
+    assert 'роль не найдена: НетТакойРоли' in _text(
+        server, 'object_rights', path='Catalog/Справочник1', role='НетТакойРоли')
+    server.close_db()
+
+
+def test_rights_tools_on_a_base_without_rights_tables(tmp_path_factory):
+    """База до 2026-10-07: внятный ответ, а не ошибка схемы."""
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 'old.sqlite')
+    write_db(dump, db, source_file='old.cf')
+    conn = sqlite3.connect(db)
+    conn.execute('DROP TABLE role_right')
+    conn.execute('DROP TABLE role_rights_state')
+    conn.commit()
+    conn.close()
+    server = McpServer(db)
+    assert 'в базе нет прав ролей' in _text(server, 'role_rights',
+                                            role='ТестоваяРоль')
+    assert 'в базе нет прав ролей' in _text(server, 'object_rights',
+                                            path='Catalog/Справочник1')
+    server.close_db()
 
 
