@@ -46,6 +46,11 @@ CHX_PATH = 'ChartOfCharacteristicType/ВидыСубконто'
 NOCODE_UUID = '1c1c1c1c-0000-0000-0000-0000000000d1'
 DRIVER_UUID = '5a5a5a5a-0000-0000-0000-0000000000e1'
 NOCODE_PATH = 'Catalog/ДрайверыОборудования'
+# собственные uuid подобъектов: по ним цель права роли разрешается в реквизит
+# или табличную часть, а не только в объект метаданных
+ATTR_UUID = 'aaaaaaaa-0000-0000-0000-000000000020'   # реквизит «СсылкаАтрибут»
+TAB_UUID = 'aaaaaaaa-0000-0000-0000-000000000011'    # ТЧ «Товары»
+RES_UUID = '0e0e0e0e-0000-0000-0000-000000000020'    # ресурс «Ресурс1»
 
 # модуль общего назначения с экспортной функцией (запрос многострочным
 # литералом с '|') и закрытой процедурой, создающей таблицу значений
@@ -95,15 +100,21 @@ XDTO_PACKAGE_XML = (
 ).encode('utf-8')
 
 
-def _core(name):
-    return ['3', ['1', '0', 'в отдельном файле'], f'"{name}"',
+def _core(name, uuid='в отдельном файле', marker='3'):
+    """CORE именованной записи: [МАРКЕР, [флаг, флаг, uuid], ИМЯ, СИНОНИМ, ...].
+
+    uuid по умолчанию — не uuid, а строка «в отдельном файле»: так выглядит
+    CORE имени объекта. Маркер '3' у реквизитов справочника/документа и у
+    реквизитов регистра, '0'/'1'/'2' — у измерений и ресурсов регистра.
+    """
+    return [marker, ['1', '0', uuid], f'"{name}"',
             ['1', '"ru"', f'"{name}"'], '""', '0', '0',
             '00000000-0000-0000-0000-000000000000', '0']
 
 
-def _attr(name, typedesc):
+def _attr(name, typedesc, uuid='в отдельном файле', marker='3'):
     """Запись реквизита внутри узла коллекции — как в реальном заголовке."""
-    return ['7', ['27', ['2', _core(name), typedesc]]]
+    return ['7', ['27', ['2', _core(name, uuid, marker), typedesc]]]
 
 
 def _cfg_props(version='"1.2.3.4"', prefix='""'):
@@ -335,7 +346,7 @@ def make_dump(base):
         'name': 'Справочник1', 'comment': '', 'obj_version': '803',
         'header': [
             # простая ссылка через таблицу .10
-            ['2', _core('СсылкаАтрибут'), ['"Pattern"', ['"#"', REF_CAT]]],
+            ['2', _core('СсылкаАтрибут', ATTR_UUID), ['"Pattern"', ['"#"', REF_CAT]]],
             # имя есть в таблице .10, но объекта с таким именем в базе нет
             ['2', _core('ОсиротевшаяСсылка'), ['"Pattern"', ['"#"', REF_ORPHAN]]],
             # ссылка на определяемый тип (раскрывается состав)
@@ -361,7 +372,7 @@ def make_dump(base):
             ['2', _core('НомерЗаказа'), ['"Pattern"', ['"S"', '11', '1']]],
             # запись секции, 1, блок полей табличной части
             ['1', ['11', 'aaaaaaaa-0000-0000-0000-000000000010',
-                   ['0', ['3', ['1', '0', 'aaaaaaaa-0000-0000-0000-000000000011'],
+                   ['0', ['3', ['1', '0', TAB_UUID],
                     '"Товары"', ['1', '"ru"', '"Товары"'], '""', '0', '0',
                     '00000000-0000-0000-0000-000000000000', '0']]],
              '0', ['0'], ['1', '"ru"', '"Товары"']],
@@ -443,7 +454,10 @@ def make_dump(base):
         'name': 'РегистрСведений1', 'comment': '', 'obj_version': '803',
         'header': _register_header(
             ['33'] + ['0'] * 17 + ['4', '1', '0'],
-            [[IR_RESOURCES, '1', _attr('Ресурс1', ['"Pattern"', ['"N"', '15', '3', '1']])],
+            # ресурс регистра: CORE с маркером '1', а не '3', — запись
+            # опознаётся по uuid на месте CORE[1][2]
+            [[IR_RESOURCES, '1', _attr('Ресурс1', ['"Pattern"', ['"N"', '15', '3', '1']],
+                                       uuid=RES_UUID, marker='1')],
              [IR_DIMENSIONS, '1', _attr('Измерение1', ['"Pattern"', ['"#"', REF_CAT]])],
              [IR_FORMS, '0'],
              [IR_ATTRIBUTES, '1', _attr('Реквизит1', ['"Pattern"', ['"S"', '10', '1']])]]),
@@ -534,7 +548,9 @@ def test_write_db(tmp_path):
     assert stats == {'objects': 13, 'modules': 4, 'methods': 3, 'files': 9, 'files_content': 3,
                      'skd': 0, 'attributes': 15, 'refs': 10, 'enum_values': 2,
                      'predefined': 2, 'subconto': 0, 'common_targets': 1, 'tabular': 3,
-                     'xdto_types': 3, 'xdto_properties': 5}
+                     'xdto_types': 3, 'xdto_properties': 5,
+                     'role_rights': 0, 'role_rls_templates': 0,
+                     'role_rights_failed': 0}
 
     conn = sqlite3.connect(db_path)
     q = conn.execute
@@ -607,6 +623,21 @@ def test_write_db(tmp_path):
         'SELECT a.name FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
         " WHERE o.path='Document/ЗаказПокупателя' AND a.tabular='Товары' "
         'ORDER BY a.ord')] == ['ТоварыНоменклатура', 'ТоварыКоличество']
+
+    # uuid подобъектов: по нему цель права роли разрешается в реквизит или ТЧ
+    assert [r[0] for r in q(
+        'SELECT t.uuid FROM meta_tabular t JOIN meta_object o ON o.id=t.object_id'
+        " WHERE o.path='Document/ЗаказПокупателя' ORDER BY t.ord")] == \
+        [TAB_UUID, 'aaaaaaaa-0000-0000-0000-000000000013',
+         'aaaaaaaa-0000-0000-0000-000000000015']
+    assert [r[0] for r in q(
+        'SELECT a.uuid FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
+        " WHERE o.path='Catalog/Справочник1' ORDER BY a.ord")] == \
+        [ATTR_UUID, None, None, None]
+    # ресурс регистра с маркером CORE '1' (а не '3') тоже извлечён и с uuid
+    assert q('SELECT a.uuid FROM meta_attribute a JOIN meta_object o ON o.id=a.object_id'
+             " WHERE o.path='InformationRegister/РегистрСведений1'"
+             " AND a.name='Ресурс1'").fetchall() == [(RES_UUID,)]
 
     # одноимённые поля разных ТЧ и реквизит объекта с именем поля ТЧ — все на
     # месте: дедуп имён действует внутри секции, а не по всему объекту

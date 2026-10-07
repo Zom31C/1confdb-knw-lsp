@@ -17,7 +17,7 @@ import sqlite3
 import xml.sax.saxutils
 from datetime import datetime
 
-from .. import xdto
+from .. import rights, xdto
 from ..bsl_parser import parse_methods
 from ..v8 import helper
 
@@ -302,21 +302,22 @@ VT_FIELDS_KEY = '888744e1-b616-11d4-9436-004095e12fc7'
 
 def _extract_attributes(header, resolver=None, bags=None):
     """Извлекает реквизиты и поля табличных частей: список
-    (name, type_str, links, tabular) в порядке объявления.
+    (name, type_str, links, tabular, uuid) в порядке объявления.
 
     Запись реквизита в заголовке: ["2", CORE, TYPEDESC] (простой тип) или
     ["2", CORE, <uuid>, TYPEDESC, ..] (составной тип — дескриптор в node[3]).
     Поля табличной части — те же записи внутри блока полей секции; tabular —
-    имя табличной части (иначе None).
+    имя табличной части (иначе None). uuid — идентификатор самого поля: по нему
+    цель права роли (role_right.target_uuid) разрешается в реквизит.
 
     Дедуп — только внутри одной секции: имя уникально в пределах табличной
     части, а не объекта, поэтому одноимённые поля разных ТЧ и реквизит объекта
     с именем поля ТЧ — разные записи.
 
     :param bags: список, в который за тот же обход складываются блоки полей
-        табличных частей как (имя, объявленное число полей) — результат
-        совпадает с _section_bags(header), но заголовок обходится один раз
-        (на конфигурации УНФ это 6 млн рекурсивных вызовов на проход).
+        табличных частей как (имя, объявленное число полей, uuid секции) —
+        результат совпадает с _section_bags(header), но заголовок обходится
+        один раз (на конфигурации УНФ это 6 млн рекурсивных вызовов на проход).
     """
     result = []
     seen = set()
@@ -328,19 +329,19 @@ def _extract_attributes(header, resolver=None, bags=None):
             return
         if not isinstance(node, list):
             return
-        name, typedesc = _attr_record(node)
+        name, typedesc, uuid = _attr_record(node)
         if name and (section, name) not in seen:
             seen.add((section, name))
             if resolver:
                 result.append((name, resolver.describe(typedesc),
-                               list(resolver.links), section))
+                               list(resolver.links), section, uuid))
             else:
-                result.append((name, None, [], section))
+                result.append((name, None, [], section, uuid))
         for i, child in enumerate(node):
             if _is_section_bag(node, i):
-                sec_name = _section_name(node[i - 2])
+                sec_name, sec_uuid = _section_record(node[i - 2])
                 if bags is not None and sec_name:
-                    bags.append((sec_name, _bag_count(child)))
+                    bags.append((sec_name, _bag_count(child), sec_uuid))
                 walk(child, sec_name or section)
             else:
                 walk(child, section)
@@ -349,30 +350,61 @@ def _extract_attributes(header, resolver=None, bags=None):
     return result
 
 
+# маркер CORE у реквизитов справочника/документа и у реквизитов регистра
+ATTR_CORE_MARKER = '3'
+
+
+def _record_uuid(core):
+    """uuid именованной записи CORE = [МАРКЕР, [флаг, флаг, uuid], ИМЯ, ...]."""
+    inner = core[1]
+    if (isinstance(inner, list) and len(inner) >= 3
+            and isinstance(inner[2], str) and RE_UUID.match(inner[2])):
+        return inner[2]
+    return None
+
+
 def _attr_record(node):
-    """Имя и дескриптор типа из записи реквизита/поля, иначе (None, None)."""
-    if (len(node) >= 3 and node[0] == '2' and isinstance(node[1], list)
-            and len(node[1]) >= 3 and node[1][0] == '3'
-            and isinstance(node[1][2], str)):
-        if isinstance(node[2], list):
-            return _unquote(node[1][2]), node[2]
-        if len(node) > 3 and isinstance(node[3], list):
-            return _unquote(node[1][2]), node[3]
-        return _unquote(node[1][2]), None
-    return None, None
+    """(имя, дескриптор типа, uuid) из записи реквизита/поля; None — не запись.
+
+    CORE у полей разных коллекций начинается разным маркером: '3' у реквизитов
+    справочника/документа и реквизитов регистра, '0'/'1'/'2' у измерений и
+    ресурсов регистра (замер на УНФ: 33949 записей с маркером '3' и 2090 с
+    другими, все имена — идентификаторы). Запись с чужим маркером принимается
+    только когда на месте uuid: без него отличить поле от похожей структуры
+    нечем.
+    """
+    if not (isinstance(node, list) and len(node) >= 3
+            and node[0] == '2' and isinstance(node[1], list)
+            and len(node[1]) >= 3 and isinstance(node[1][2], str)):
+        return None, None, None
+    core = node[1]
+    uuid = _record_uuid(core)
+    if core[0] != ATTR_CORE_MARKER and not uuid:
+        return None, None, None
+    if isinstance(node[2], list):
+        typedesc = node[2]
+    elif len(node) > 3 and isinstance(node[3], list):
+        typedesc = node[3]
+    else:
+        typedesc = None
+    return _unquote(core[2]), typedesc, uuid
 
 
-def _section_name(rec):
-    """Имя табличной части из записи секции: ищем core ["3",..,ИМЯ,..]."""
+def _section_record(rec):
+    """(имя, uuid) табличной части из записи секции, иначе (None, None).
+
+    CORE имени вложен в запись секции произвольно глубоко —
+    ["1", ["11", uuid, .., ["0", CORE], ..], ..], поэтому обход в ширину.
+    """
     stack = [rec]
     while stack:
         node = stack.pop(0)
         if isinstance(node, list):
-            if (len(node) >= 3 and str(node[0]) == '3'
+            if (len(node) >= 3 and str(node[0]) == ATTR_CORE_MARKER
                     and isinstance(node[2], str) and node[2].startswith('"')):
-                return _unquote(node[2])
+                return _unquote(node[2]), _record_uuid(node)
             stack.extend(node)
-    return None
+    return None, None
 
 
 def _is_section_bag(parent, idx):
@@ -384,7 +416,7 @@ def _is_section_bag(parent, idx):
 
 
 def _section_bags(header):
-    """Блоки полей табличных частей: (имя секции, объявленное число полей).
+    """Блоки полей табличных частей: (имя, объявленное число полей, uuid).
 
     Второй элемент блока — счётчик записей: [VT_FIELDS_KEY, '2', поле, поле].
     Он равен числу извлечённых полей (проверено на всех 1609 блоках базы УНФ
@@ -402,9 +434,9 @@ def _section_bags(header):
             return
         for i, child in enumerate(node):
             if _is_section_bag(node, i):
-                name = _section_name(node[i - 2])
+                name, uuid = _section_record(node[i - 2])
                 if name:
-                    result.append((name, _bag_count(child)))
+                    result.append((name, _bag_count(child), uuid))
             walk(child)
 
     walk(header.get('header'))
@@ -420,13 +452,20 @@ def _bag_count(bag):
     return count if count >= 0 else None
 
 
+def _tabular_rows(bags):
+    """(имя, uuid) табличных частей: без повторов, в порядке объявления."""
+    result = []
+    seen = set()
+    for name, _count, uuid in bags:
+        if name not in seen:
+            seen.add(name)
+            result.append((name, uuid))
+    return result
+
+
 def _tabular_names(bags):
     """Имена табличных частей из блоков полей: без повторов, в порядке объявления."""
-    result = []
-    for name, _count in bags:
-        if name not in result:
-            result.append(name)
-    return result
+    return [name for name, _uuid in _tabular_rows(bags)]
 
 
 def _extract_tabular(header):
@@ -448,7 +487,7 @@ def tabular_field_counts(header_json):
     if not isinstance(header, dict):
         return {}
     counts = {}
-    for name, count in _section_bags(header):
+    for name, count, _uuid in _section_bags(header):
         counts.setdefault(name, count)
     return counts
 
@@ -792,16 +831,20 @@ CREATE TABLE meta_attribute (
     ord INTEGER NOT NULL,
     name TEXT NOT NULL,
     type_str TEXT,
-    tabular TEXT
+    tabular TEXT,
+    uuid TEXT
 );
 CREATE INDEX ix_meta_attribute_object ON meta_attribute(object_id, ord);
+CREATE INDEX ix_meta_attribute_uuid ON meta_attribute(uuid);
 CREATE TABLE meta_tabular (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
     ord INTEGER NOT NULL,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    uuid TEXT
 );
 CREATE INDEX ix_meta_tabular_object ON meta_tabular(object_id, ord);
+CREATE INDEX ix_meta_tabular_uuid ON meta_tabular(uuid);
 CREATE TABLE attribute_ref (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     attribute_id INTEGER NOT NULL REFERENCES meta_attribute(id) ON DELETE CASCADE,
@@ -864,6 +907,41 @@ CREATE TABLE file (
     data BLOB
 );
 CREATE INDEX ix_file_object ON file(object_id);
+CREATE TABLE role_right (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
+    target_uuid TEXT NOT NULL,
+    target_object_id INTEGER REFERENCES meta_object(id) ON DELETE CASCADE,
+    target_attr_id INTEGER REFERENCES meta_attribute(id) ON DELETE CASCADE,
+    target_tabular_id INTEGER REFERENCES meta_tabular(id) ON DELETE CASCADE,
+    sub_index INTEGER,
+    collection_uuid TEXT,
+    right_uuid TEXT NOT NULL,
+    value TEXT NOT NULL,
+    rls_text TEXT
+);
+CREATE INDEX ix_role_right_role ON role_right(role_id);
+CREATE INDEX ix_role_right_target ON role_right(target_uuid);
+CREATE INDEX ix_role_right_object ON role_right(target_object_id);
+CREATE INDEX ix_role_right_attr ON role_right(target_attr_id);
+CREATE INDEX ix_role_right_right ON role_right(right_uuid);
+CREATE TABLE role_rls_template (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    name TEXT,
+    text TEXT
+);
+CREATE INDEX ix_role_rls_template_role ON role_rls_template(role_id, ord);
+CREATE TABLE role_rights_state (
+    role_id INTEGER PRIMARY KEY REFERENCES meta_object(id) ON DELETE CASCADE,
+    version TEXT,
+    parsed INTEGER NOT NULL,
+    targets INTEGER NOT NULL,
+    rights INTEGER NOT NULL,
+    rls_templates INTEGER NOT NULL,
+    error TEXT
+);
 """
 
 TEXT_KINDS = ('bsl', 'html', 'htm', 'txt', 'json', 'xml', 'css', 'js')
@@ -1237,6 +1315,92 @@ def build_fts_index(db_path, workers=1):
     return methods
 
 
+_ROLE_RIGHT_SQL = ('INSERT INTO role_right (role_id, target_uuid,'
+                   ' target_object_id, target_attr_id, target_tabular_id,'
+                   ' sub_index, collection_uuid, right_uuid, value, rls_text)'
+                   ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+_ROLE_STATE_SQL = ('INSERT INTO role_rights_state (role_id, version, parsed,'
+                   ' targets, rights, rls_templates, error)'
+                   ' VALUES (?, ?, ?, ?, ?, ?, ?)')
+
+
+def _right_targets(conn):
+    """Карта uuid цели права -> (объект-владелец, реквизит, табличная часть).
+
+    Цель — объект метаданных, его реквизит/поле ТЧ или его табличная часть,
+    поэтому uuid ищется в трёх таблицах; незаполненные id остаются None.
+    `target_object_id` для реквизита и ТЧ — объект-владелец, так что все права,
+    затрагивающие объект, выбираются одним условием. Замер на УНФ: 16953 цели
+    разрешаются объектом, 12276 — реквизитом, 520 — табличной частью, 258
+    (операции веб-сервисов, методы HTTP-сервисов, специальный маркер
+    de29c81d-…) не опознаны вовсе.
+    """
+    targets = {}
+    for uuid, obj_id in conn.execute(
+            'SELECT uuid, id FROM meta_object WHERE uuid IS NOT NULL'):
+        targets[uuid] = (obj_id, None, None)
+    for uuid, attr_id, obj_id in conn.execute(
+            'SELECT uuid, id, object_id FROM meta_attribute'
+            ' WHERE uuid IS NOT NULL'):
+        targets[uuid] = (obj_id, attr_id, None)
+    for uuid, tab_id, obj_id in conn.execute(
+            'SELECT uuid, id, object_id FROM meta_tabular WHERE uuid IS NOT NULL'):
+        targets[uuid] = (obj_id, None, tab_id)
+    return targets
+
+
+def _write_role_rights(conn, dump_dir, stats):
+    """Права ролей из `Role/<имя>/Role.0.c1brace` — в role_right/role_rls_template.
+
+    Файл прав не входит в поток заголовков и остальной записью не читается,
+    поэтому разбирается отдельно (`confdb.rights`) и уже после объектов: нужны
+    id ролей и карта uuid -> цель (`_right_targets`), чтобы разрешить цели прав.
+    Хранятся только ЯВНЫЕ записи (sparse): отсутствие строки означает «право не
+    задано», а не «запрещено».
+
+    `role_rights_state` различает два случая, которые иначе неотличимы:
+    parsed=0 — данные недоступны (файла нет или он не разобрался, причина в
+    `error`), parsed=1 при rights=0 — права роли действительно не заданы
+    (например, старые версии формата 8/9). Сбой разбора одной роли не прерывает
+    запись всей базы.
+    """
+    targets = _right_targets(conn)
+    right_params = []
+    tmpl_params = []
+    state_params = []
+    roles = conn.execute(
+        "SELECT id, path FROM meta_object WHERE type='Role' ORDER BY id").fetchall()
+    for role_id, path in roles:
+        role_dir = os.path.join(dump_dir, *path.split('/'))
+        try:
+            parsed = rights.parse_role_file(role_dir)
+        except Exception as err:  # noqa: BLE001
+            state_params.append((role_id, None, 0, 0, 0, 0, str(err)[:300]))
+            stats['role_rights_failed'] += 1
+            continue
+        count = 0
+        for target, entry in parsed.entries():
+            obj_id, attr_id, tab_id = targets.get(target.uuid, (None, None, None))
+            right_params.append((role_id, target.uuid, obj_id, attr_id, tab_id,
+                                 target.sub_index, target.collection_uuid,
+                                 entry.right_uuid, entry.value, entry.rls_text))
+            count += 1
+        for ord_no, (name, text) in enumerate(parsed.rls_templates):
+            tmpl_params.append((role_id, ord_no, name, text))
+        state_params.append((role_id, parsed.version, 1, len(parsed.targets),
+                             count, len(parsed.rls_templates), None))
+        stats['role_rights'] += count
+        stats['role_rls_templates'] += len(parsed.rls_templates)
+        if len(right_params) >= 20000:
+            conn.executemany(_ROLE_RIGHT_SQL, right_params)
+            right_params.clear()
+    conn.executemany(_ROLE_RIGHT_SQL, right_params)
+    conn.executemany(
+        'INSERT INTO role_rls_template (role_id, ord, name, text)'
+        ' VALUES (?, ?, ?, ?)', tmpl_params)
+    conn.executemany(_ROLE_STATE_SQL, state_params)
+
+
 def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
              source_size=None, store_blobs=False, workers=1,
              build_fts=True, headers_dir=None):
@@ -1295,7 +1459,8 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
     stats = {'objects': 0, 'modules': 0, 'methods': 0, 'files': 0, 'files_content': 0,
              'skd': 0, 'attributes': 0, 'refs': 0, 'enum_values': 0, 'predefined': 0,
              'subconto': 0,
-             'common_targets': 0, 'tabular': 0, 'xdto_types': 0, 'xdto_properties': 0}
+             'common_targets': 0, 'tabular': 0, 'xdto_types': 0, 'xdto_properties': 0,
+             'role_rights': 0, 'role_rls_templates': 0, 'role_rights_failed': 0}
     try:
         # база пересоздаётся с нуля при каждом запуске: отключаем fsync для скорости,
         # но журнал оставляем rollback (не MEMORY) — прерванная запись должна
@@ -1401,9 +1566,10 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
             attrs = _extract_attributes(info['header'], resolver, bags)
             # табличные части — из того же обхода заголовка (отдельный
             # _section_bags обошёл бы дерево ещё раз)
-            info['tabular'] = _tabular_names(bags)
-            for ord_no, (name, type_str, links, tabular) in enumerate(attrs):
-                attr_params.append((dir_to_id[rel], ord_no, name, type_str, tabular))
+            info['tabular'] = _tabular_rows(bags)
+            for ord_no, (name, type_str, links, tabular, uuid) in enumerate(attrs):
+                attr_params.append((dir_to_id[rel], ord_no, name, type_str,
+                                    tabular, uuid))
                 attr_id = len(attr_params)
                 # связи реквизита с объектами метаданных по ссылочным uuid
                 for l_ord, (l_uuid, l_path) in enumerate(links):
@@ -1411,7 +1577,8 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
                                        dir_to_id.get(l_path) if l_path else None))
         conn.executemany(
             'INSERT INTO meta_attribute'
-            ' (object_id, ord, name, type_str, tabular) VALUES (?, ?, ?, ?, ?)',
+            ' (object_id, ord, name, type_str, tabular, uuid)'
+            ' VALUES (?, ?, ?, ?, ?, ?)',
             attr_params)
         conn.executemany(
             'INSERT INTO attribute_ref (attribute_id, ord, uuid, object_id)'
@@ -1427,8 +1594,8 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
         subconto_params = []
         for rel, info in infos.items():
             obj_id = dir_to_id[rel]
-            for ord_no, name in enumerate(info['tabular']):
-                tab_params.append((obj_id, ord_no, name))
+            for ord_no, (name, uuid) in enumerate(info['tabular']):
+                tab_params.append((obj_id, ord_no, name, uuid))
             if info['stem'] == 'Enum':
                 for ord_no, name in enumerate(_extract_enum_values(info['header'])):
                     enum_params.append((obj_id, ord_no, name))
@@ -1443,7 +1610,8 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
             for subconto in subcontos:
                 subconto_params.append((obj_id,) + subconto)
         conn.executemany(
-            'INSERT INTO meta_tabular (object_id, ord, name) VALUES (?, ?, ?)',
+            'INSERT INTO meta_tabular (object_id, ord, name, uuid)'
+            ' VALUES (?, ?, ?, ?)',
             tab_params)
         conn.executemany(
             'INSERT INTO enum_value (object_id, ord, name) VALUES (?, ?, ?)',
@@ -1628,6 +1796,8 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
               ' VALUES (?, ?, ?, ?, ?, ?)')
         flush(skd_params,
               'INSERT INTO skd_query (object_id, ord, query) VALUES (?, ?, ?)')
+        # права ролей — после объектов: нужны их id и карта uuid -> объект
+        _write_role_rights(conn, dump_dir, stats)
         conn.commit()
     except Exception:
         conn.rollback()

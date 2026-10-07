@@ -179,14 +179,24 @@ def _load(header_json):
 
 
 def _is_attr(node):
-    """Запись реквизита ['2', CORE, TYPEDESC] -> имя, иначе None."""
+    """Запись реквизита ['2', CORE, TYPEDESC] -> имя, иначе None.
+
+    CORE у полей разных коллекций регистра начинается разным маркером: '3' у
+    реквизитов, '0'/'1'/'2' у измерений и ресурсов. Запись с чужим маркером
+    принимается, только когда на месте uuid (CORE[1][2]) — тот же критерий, что
+    в writer._attr_record: без uuid отличить поле от похожей структуры нечем.
+    """
     if not isinstance(node, list) or len(node) < 3 or str(node[0]) != '2':
         return None
     core = node[1]
-    if (isinstance(core, list) and len(core) >= 3 and str(core[0]) == '3'
-            and isinstance(core[2], str)):
-        return unquote(core[2])
-    return None
+    if not (isinstance(core, list) and len(core) >= 3 and isinstance(core[2], str)):
+        return None
+    if str(core[0]) != '3':
+        inner = core[1]
+        if not (isinstance(inner, list) and len(inner) >= 3
+                and is_uuid(inner[2])):
+            return None
+    return unquote(core[2])
 
 
 def _attr_names(node, out=None):
