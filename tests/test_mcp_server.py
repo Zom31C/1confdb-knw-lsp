@@ -1,8 +1,10 @@
 """Тесты MCP-сервера: протокол и инструменты на синтетической базе."""
+import io
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import urllib.request
@@ -13,7 +15,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import confdb.mcp_server as mcp_server  # noqa: E402
 from confdb.db.writer import write_db  # noqa: E402
-from confdb.mcp_server import McpServer, resolve_db, start_http_server  # noqa: E402
+from confdb.mcp_server import (McpServer, collect_groups,  # noqa: E402
+                               parse_group_spec, resolve_db, resolve_groups,
+                               start_http_server)
 
 from test_writer import make_chart_dump, make_dump  # noqa: E402
 
@@ -1288,6 +1292,190 @@ def test_group_header_in_response(tmp_path_factory):
     result = _call(server, 'find_objects', mask='Справочник')
     text = _get_text(result)
     assert 'группа моя группа / база' in text
+
+
+# -- несколько групп одновременно -------------------------------------------
+
+def _grouped_server(tmp_path_factory):
+    """Сервер, запущенный сразу с двумя группами из РАЗНЫХ баз."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    return (McpServer(groups=[('унф', [main_db]), ('бп', [ext_db])]),
+            main_db, ext_db)
+
+
+def test_server_starts_with_several_groups(tmp_path_factory):
+    """Деление на группы доходит до сервера при запуске (--group, TUI)."""
+    server, _main, _ext = _grouped_server(tmp_path_factory)
+    assert server.groups == {'унф': ['основная'], 'бп': ['расширение']}
+    assert server.active_group == 'унф' and server.active == 'основная'
+    listing = _get_text(_call(server, 'db_list'))
+    assert '[в группах: унф]' in listing and '[в группах: бп]' in listing
+    groups = _get_text(_call(server, 'group_list'))
+    assert '* унф' in groups and '  бп' in groups
+
+
+def test_group_queries_stay_separate(tmp_path_factory):
+    """group=<имя> — запрос только к своей группе; без group — активная база."""
+    server, _main, _ext = _grouped_server(tmp_path_factory)
+    # объекта второй группы нет в активной базе: fan-out по всем открытым
+    # базам не происходит
+    miss = _get_text(_call(server, 'find_objects', mask='ДопОбработка'))
+    assert 'ничего не найдено' in miss
+    # явный запрос ко второй группе находит его и называет группу
+    hit = _get_text(_call(server, 'find_objects', mask='ДопОбработка',
+                          group='бп'))
+    assert 'Обработка.ДопОбработка' in hit
+    assert '=== группа бп / база расширение' in hit
+    # имя группы регистронезависимо
+    assert 'ДопОбработка' in _get_text(
+        _call(server, 'find_objects', mask='ДопОбработка', group='БП'))
+    # group='*' — обе группы, каждая под своим заголовком
+    both = _get_text(_call(server, 'find_objects', mask='Справочник1',
+                           group='*'))
+    assert '=== группа унф ===' in both and '=== группа бп ===' in both
+
+
+def test_group_use_switches_the_active_base(tmp_path_factory):
+    server, _main, _ext = _grouped_server(tmp_path_factory)
+    answer = _get_text(_call(server, 'group_use', group='бп'))
+    assert 'активная группа: бп' in answer
+    assert 'активная база: расширение' in answer
+    assert server.active == 'расширение'
+    # без group запрос идёт уже в базу новой активной группы
+    hit = _get_text(_call(server, 'find_objects', mask='ДопОбработка'))
+    assert 'Обработка.ДопОбработка' in hit
+    assert '=== группа бп / база расширение' in hit
+
+
+def test_db_star_header_names_the_group(tmp_path_factory):
+    server, _main, _ext = _grouped_server(tmp_path_factory)
+    text = _get_text(_call(server, 'find_objects', mask='Справочник1', db='*'))
+    assert '=== группа унф / база основная' in text
+    assert '=== группа бп / база расширение' in text
+
+
+def test_groups_and_loose_dbs_together(tmp_path_factory):
+    """Отдельные базы вне групп открываются вместе с группами."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    loose = _make_db(tmp_path_factory, 'внешняя.sqlite')
+    server = McpServer([loose], groups=[('унф', [main_db, ext_db])])
+    assert list(server.dbs) == ['основная', 'расширение', 'внешняя']
+    assert server.active == 'основная' and server.active_group == 'унф'
+    assert server.groups_of('внешняя') == []
+    text = _get_text(_call(server, 'find_objects', mask='Справочник1',
+                           db='внешняя'))
+    assert text.startswith('=== база внешняя')
+
+
+def test_base_of_two_groups_is_named_in_both(tmp_path_factory):
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    server = McpServer(groups=[('а', [main_db]), ('б', [main_db, ext_db])])
+    assert server.groups_of('основная') == ['а', 'б']
+    text = _get_text(_call(server, 'find_objects', mask='Справочник1',
+                           db='основная'))
+    assert text.startswith('=== группы а, б / база основная')
+
+
+def test_add_group_paths_replaces_membership(tmp_path_factory):
+    server = _server(tmp_path_factory)
+    alias = list(server.dbs)[0]
+    path = server.dbs[alias]['path']
+    missing = os.path.join(os.path.dirname(path), 'нет.db')
+    name, aliases, errors = server.add_group_paths('группа', [path, missing])
+    assert (name, aliases) == ('группа', [alias])
+    assert len(errors) == 1 and 'не найден' in errors[0]
+    assert server.active_group == 'группа'
+    # повтор того же имени (регистр не важен) задаёт состав заново, а не плодит
+    # вторую группу; открытая база остаётся открытой
+    name, aliases, errors = server.add_group_paths('ГРУППА', [])
+    assert (name, aliases, errors) == ('группа', [], [])
+    assert list(server.groups) == ['группа'] and alias in server.dbs
+    with pytest.raises(ValueError):
+        server.add_group_paths('   ', [path])
+
+
+def test_drop_group_keeps_a_base_another_group_needs(tmp_path_factory):
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    # один и тот же файл в двух группах — это один алиас
+    server = McpServer(groups=[('а', [main_db]), ('б', [main_db, ext_db])])
+    assert server.groups == {'а': ['основная'], 'б': ['основная', 'расширение']}
+    name, closed = server.drop_group('а')
+    assert (name, closed) == ('а', [])
+    assert 'основная' in server.dbs and server.active_group == 'б'
+    name, closed = server.drop_group('б')
+    assert name == 'б' and sorted(closed) == ['основная', 'расширение']
+    assert server.dbs == {} and server.groups == {}
+    with pytest.raises(ValueError):
+        server.drop_group('в')
+
+
+def test_close_db_removes_it_from_groups(tmp_path_factory):
+    server, main_db, _ext = _grouped_server(tmp_path_factory)
+    server.close_db('основная')
+    assert server.groups['унф'] == []
+    # закрытая база не «воскресает» в группе при повторном открытии файла
+    server.open_db(main_db)
+    assert server.groups['унф'] == []
+
+
+def test_group_specs_from_the_command_line():
+    assert parse_group_spec('УНФ=D:\\a.db;D:\\b.db') == (
+        'УНФ', ['D:\\a.db', 'D:\\b.db'])
+    # путь может содержать '=': имя группы отделяет только ПЕРВЫЙ '='
+    assert parse_group_spec('УНФ=D:\\db=1.sqlite') == (
+        'УНФ', ['D:\\db=1.sqlite'])
+    for bad in ('D:\\a.db', '=D:\\a.db', 'УНФ=', 'УНФ= ; '):
+        with pytest.raises(ValueError):
+            parse_group_spec(bad)
+    # повтор флага с тем же именем (регистр не важен) складывает базы в группу
+    assert collect_groups(['УНФ=D:\\a.db', 'унф=D:\\b.db',
+                           'БП=D:\\c.db']) == [
+        ('УНФ', ['D:\\a.db', 'D:\\b.db']), ('БП', ['D:\\c.db'])]
+    assert collect_groups(None) == []
+
+
+def test_resolve_groups_checks_files(tmp_path_factory):
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    assert resolve_groups([f'унф={main_db}', f'унф={ext_db}']) == [
+        ('унф', [main_db, ext_db])]
+    with pytest.raises(SystemExit):
+        resolve_groups(['унф=D:\\нет\\такой.db'])
+
+
+def test_main_opens_groups_from_cli(tmp_path_factory, monkeypatch, capsys):
+    """--group доходит до сервера: запуск stdio печатает группы в stderr."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
+    assert mcp_server.main(['--group', f'унф={main_db}',
+                            '--group', f'бп={ext_db}']) == 0
+    err = capsys.readouterr().err
+    assert 'группа унф: основная' in err
+    assert 'группа бп: расширение' in err
+    assert '[в группах: унф]' in err
+
+
+def test_main_rejects_a_group_spec_without_a_name(monkeypatch):
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
+    with pytest.raises(SystemExit) as exc:
+        mcp_server.main(['--group', 'D:\\нет-имени.db'])
+    assert exc.value.code == 2
+
+
+def test_startup_banner_in_a_pipe_is_utf8(tmp_path_factory):
+    """MCP-клиент читает stderr из пайпа: баннер баз и групп обязан быть UTF-8.
+
+    Внутри процесса capsys не воспроизводит кодовую страницу пайпа, поэтому
+    проверка настоящая — отдельным процессом и по сырым байтам.
+    """
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    proc = subprocess.run(
+        [sys.executable, '-m', 'confdb.mcp_server',
+         '--group', f'унф={main_db}', '--group', f'бп={ext_db}'],
+        input=b'', capture_output=True)
+    assert proc.returncode == 0
+    err = proc.stderr.decode('utf-8')  # не cp1251 и не cp866
+    assert 'группа унф: основная' in err
+    assert '[в группах: бп]' in err
 
 
 # -- пагинация поисковой выдачи ---------------------------------------------

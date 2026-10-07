@@ -388,9 +388,9 @@ DATABASE FILE: the SQLite file is internal to the server. Do NOT search for it, 
 
 MULTIPLE DATABASES: the server can hold several knowledge bases at once — typically the MAIN configuration plus extensions/data processors (.cfe/.epf extracted into their own .db files). Each open base has an alias. All tools query the ACTIVE base; to query a specific base without switching, pass its alias as the db parameter (e.g. find_objects(mask=…, db='расш_интеграция')). Management tools: db_list (what is open, which is active), db_open (open another base file while the server runs — the path comes from the user), db_use (switch the active base), db_close. An extension usually adds/overrides objects of the main configuration — if something is not found in one base, check the other. Special db value '*': run a tool on every open base at once (the answer is sectioned per base) — one call to compare the main configuration with all extensions.
 
-CONFIGURATION GROUPS: a group bundles related databases (main configuration + extensions + data processors) as a single unit. Use groups to compare different configurations or their versions. Management tools: group_create (create an empty group), group_add_db (add an open database to a group), group_remove_db (remove a database from a group — the database itself stays open), group_list (list all groups with their databases), group_use (switch the active group), group_close (delete a group — databases are NOT closed). When you specify the group parameter in a data tool, it runs on ALL databases in that group (fan-out). Special group value '*': run on every group at once. Priority: group > db > active_group > active database. Response headers identify both the group and the database: '=== группа <имя> / база <алиас> (<путь>) ==='.
+CONFIGURATION GROUPS: a group bundles related databases (main configuration + extensions + data processors) as a single unit. SEVERAL groups can be open at the same time — typically two different configurations, or two releases of the same one; group_list shows them all and marks the active one. To query ONE group separately, pass group=<name> to any data tool: it runs on every database of that group and sections the answer per database. group='*' runs the tool on every group at once, keeping the groups apart in the answer. WITHOUT the group parameter only the ACTIVE base is queried — NOT the whole active group — so when several groups are open always name the group you mean; db='*' ignores the division and mixes every open base, so prefer group='*' for a per-group picture. Priority: explicit group > explicit db > the active base. group_use switches the active group and makes its first base the active one. Management tools: group_create (create an empty group), group_add_db (add an open database to a group), group_remove_db (remove a database from a group — the database itself stays open), group_list (all groups with their databases), group_use (switch the active group), group_close (delete a group — databases are NOT closed). compare_object and extension_diff take explicit aliases (db_left/db_right, extension_db/base_db) and know nothing about groups — pick the aliases with db_list/group_list.
 
-DATABASE IDENTIFIER: every tool response includes a header line identifying the source database: '=== база <алиас> (<путь>) ==='. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
+DATABASE IDENTIFIER: every tool response includes a header line identifying the source database and, when the base belongs to a group, the group: '=== группа <имя> / база <алиас> (<путь>) ===' (a base in several groups prints all of them: '=== группы A, B / база …'). Read it before trusting a result: it says which configuration the answer came from. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
 
 PAGING SEARCH RESULTS: find_objects, find_field, find_methods, find_skd, find_xdto and refs_of return ONE PAGE of their hits — limit is the page size (1..200), offset is how many hits of the SAME search to skip. Every answer ends with a paging line: '… всего найдено N; показано a–b; есть ещё K — следующий вызов с offset=b' (total hit count, the range shown, how many are left and the offset to pass for the next page); when the page holds everything it says 'это все результаты' instead. The order of hits is stable, so consecutive pages never overlap or skip — to read further, call the same tool with the printed offset. Do NOT raise limit to 200 and do not narrow the mask just to fit one answer: page. find_xdto counts matching types and properties as one list (types first, then properties) and names both counts; refs_of pages each of its two lists with the same offset.
 
@@ -416,6 +416,23 @@ RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know 
 All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing."""
 
 
+def _group_items(groups):
+    """Группы к открытию -> [(имя, [пути])]: словарь либо список пар."""
+    if not groups:
+        return []
+    items = groups.items() if hasattr(groups, 'items') else groups
+    result = []
+    for item in items:
+        name, paths = (item if isinstance(item, (tuple, list)) and len(item) == 2
+                       else (None, None))
+        if not name or not str(name).strip():
+            raise ValueError(f'имя группы не может быть пустым: {item!r}')
+        if isinstance(paths, str):
+            paths = [paths]
+        result.append((str(name).strip(), list(paths or ())))
+    return result
+
+
 class McpServer:
     """Обработчик JSON-RPC сообщений MCP поверх баз SQLite (read-only).
 
@@ -424,13 +441,17 @@ class McpServer:
     работают с активной базой либо с явно указанной параметром db.
     """
 
-    def __init__(self, db_paths=None):
+    def __init__(self, db_paths=None, groups=None):
         self.dbs = {}      # алиас -> {'path':…, 'conn':…, 'ctx':…}
         self.active = None
         self.groups = {}   # имя_группы -> [алиас1, алиас2, ...]
         self.active_group = None
         if isinstance(db_paths, str):
             db_paths = [db_paths]
+        # Группы открываются первыми: активными становятся первая группа и её
+        # первая база, а не «одиночная» база из db_paths (CLI --group, TUI).
+        for name, paths in _group_items(groups):
+            self.add_group_paths(name, paths)
         for path in db_paths or ():
             # активна первая указанная база, а не последняя
             self.open_db(path, activate=False)
@@ -528,6 +549,11 @@ class McpServer:
             shard.close()
         if self.active == alias:
             self.active = next(iter(self.dbs), None)
+        # База уходит и из групп: иначе повторное открытие того же файла
+        # (алиас совпадёт) молча вернуло бы её в прежнюю группу
+        for aliases in self.groups.values():
+            while alias in aliases:
+                aliases.remove(alias)
         return alias
 
     def _alias(self, alias=None):
@@ -563,6 +589,67 @@ class McpServer:
         if self.active_group is None:
             self.active_group = name
         return name
+
+    def add_group_paths(self, name, paths, activate=False):
+        """Открывает базы и регистрирует их как группу с указанным составом.
+
+        Так группа появляется при запуске сервера (CLI --group, TUI) и так же
+        в работающий сервер применяется группа из конфига: состав становится
+        равным `paths`, прежние базы группы остаются открытыми, но выходят из
+        неё. Недоступный файл — ошибка в третьем элементе результата, а не
+        обрыв: группу из конфига можно открыть и частично.
+        Возвращает (имя, [алиасы], [ошибки]).
+        """
+        name = str(name).strip() if name else ''
+        if not name:
+            raise ValueError('имя группы не может быть пустым')
+        group = next((g for g in self.groups if g.lower() == name.lower()), None)
+        if group is None:
+            group = self.create_group(name)
+        aliases, errors = [], []
+        for path in paths or ():
+            try:
+                alias = self.open_db(path, activate=False)
+            except ValueError as err:
+                errors.append(str(err))
+                continue
+            if alias not in aliases:
+                aliases.append(alias)
+        self.groups[group] = aliases
+        if activate or self.active_group is None:
+            self.active_group = group
+        if activate and aliases:
+            self.active = aliases[0]
+        elif self.active is None and aliases:
+            self.active = aliases[0]
+        return group, aliases, errors
+
+    def drop_group(self, group_name, close_dbs=True):
+        """Удаляет группу; по умолчанию закрывает базы, которые больше никому не нужны.
+
+        База, входящая ещё в одну группу, остаётся открытой — удаление одной
+        группы не должно рвать другую. Возвращает (имя, [закрытые алиасы]).
+        """
+        group_name = str(group_name).strip() if group_name else ''
+        if not group_name:
+            raise ValueError('имя группы не может быть пустым')
+        group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
+        if group is None:
+            raise ValueError(f'группа не найдена: {group_name}')
+        aliases = list(self.groups[group])
+        self.close_group(group)
+        closed = []
+        if close_dbs:
+            for alias in aliases:
+                if alias in self.dbs and not any(
+                        alias in others for others in self.groups.values()):
+                    self.close_db(alias)
+                    closed.append(alias)
+        return group, closed
+
+    def groups_of(self, alias):
+        """Имена групп, в которые входит база (для заголовков ответов)."""
+        return [name for name, aliases in self.groups.items() if alias in aliases]
 
     def add_db_to_group(self, group_name, db_alias):
         """Добавляет базу в группу. База должна быть открыта."""
@@ -610,7 +697,12 @@ class McpServer:
         return result
 
     def use_group(self, group_name):
-        """Делает группу активной."""
+        """Делает группу активной; активной базой становится её первая база.
+
+        Без параметра group инструменты работают с активной БАЗОЙ, поэтому
+        переключение группы обязано переключать и её: иначе запросы «по
+        умолчанию» после group_use продолжали бы ходить в прежнюю конфигурацию.
+        """
         if not group_name or not str(group_name).strip():
             raise ValueError('имя группы не может быть пустым')
         group_name = str(group_name).strip()
@@ -618,6 +710,9 @@ class McpServer:
         if actual_group is None:
             raise ValueError(f'группа не найдена: {group_name}')
         self.active_group = actual_group
+        opened = [a for a in self.groups[actual_group] if a in self.dbs]
+        if opened:
+            self.active = opened[0]
         return actual_group
 
     def close_group(self, group_name):
@@ -1786,8 +1881,11 @@ class McpServer:
         for alias, info in self.dbs.items():
             nobj, nmod, nmeth = self.db_stats(alias)
             mark = '*' if alias == self.active else ' '
+            groups = self.groups_of(alias)
+            tail = f' [в группах: {", ".join(groups)}]' if groups else ''
             out.append(f'{mark} {alias} — {info["path"]} '
-                       f'(объектов: {nobj}, модулей: {nmod}, методов: {nmeth})')
+                       f'(объектов: {nobj}, модулей: {nmod}, '
+                       f'методов: {nmeth}){tail}')
             name, meta = self.cfg_summary(alias)
             out.append(f'    {name}: {meta} (configuration_info — подробно)')
         return 'Открытые базы (* — активная):\n' + '\n'.join(out)
@@ -1826,19 +1924,28 @@ class McpServer:
     def group_list(self):
         groups = self.list_groups()
         if not groups:
-            return 'нет созданных групп — создайте через group_create'
+            return ('нет созданных групп — создайте через group_create; '
+                    'открытые базы перечисляет db_list')
         out = []
         for g in groups:
             mark = g['mark']
             out.append(f'{mark} {g["name"]} ({len(g["databases"])} баз):')
             for db_info in g['databases']:
                 out.append(f'    {db_info}')
+        out.append('Запрос по одной группе — параметр group=<имя> '
+                   '(инструмент выполнится по всем её базам), по всем группам '
+                   'сразу — group=\'*\'. Без group работает только активная '
+                   'база (* в db_list), а не вся активная группа.')
         return 'Группы баз (* — активная):\n' + '\n'.join(out)
 
     def group_use(self, group):
         group_name = self.use_group(group)
-        dbs = self.groups[group_name]
-        return f'активная группа: {group_name} (баз: {len(dbs)})'
+        dbs = [a for a in self.groups[group_name] if a in self.dbs]
+        line = f'активная группа: {group_name} (баз: {len(dbs)})'
+        if self.active:
+            line += f'; активная база: {self.active}'
+        return line + (f'. Без group инструменты работают только с активной '
+                       f'базой; запрос по всей группе — group={group_name}')
 
     def group_close(self, group):
         group_name = self.close_group(group)
@@ -1891,6 +1998,23 @@ def call_with_retry(fn, *args, **kwargs):
             time.sleep(RETRY_DELAY * (attempt + 1))
 
 
+def _db_header(server, alias, groups=None):
+    """Заголовок секции ответа: '=== группа X / база Y (путь) ==='.
+
+    `groups=None` — назвать группы, в которые база входит: деление на группы
+    должно быть видно и в ответе на запрос к одной базе. `groups=[]` — не
+    называть (секция уже идёт под заголовком группы).
+    """
+    names = server.groups_of(alias) if groups is None else list(groups)
+    if len(names) == 1:
+        prefix = f'группа {names[0]} / '
+    elif names:
+        prefix = f'группы {", ".join(names)} / '
+    else:
+        prefix = ''
+    return f'=== {prefix}база {alias} ({server.dbs[alias]["path"]}) ==='
+
+
 class Tool:
     def __init__(self, name, description, schema, fn):
         self.name = name
@@ -1919,12 +2043,12 @@ class Tool:
                 group_parts = []
                 for alias in db_aliases:
                     if alias in server.dbs:
-                        info = server.dbs[alias]
                         # Убираем group из args, т.к. методы не принимают этот параметр
                         call_args = {k: v for k, v in args.items() if k != 'group'}
                         call_args['db'] = alias
                         part = call_with_retry(self.fn, server, **call_args)
-                        group_parts.append(f'=== база {alias} ({info["path"]}) ===\n{part}')
+                        group_parts.append(
+                            _db_header(server, alias, []) + '\n' + part)
                 if group_parts:
                     parts.append(f'=== группа {group_name} ===\n' + '\n\n'.join(group_parts))
             if not parts:
@@ -1939,12 +2063,12 @@ class Tool:
             parts = []
             for alias in db_aliases:
                 if alias in server.dbs:
-                    info = server.dbs[alias]
                     # Убираем group из args, т.к. методы не принимают этот параметр
                     call_args = {k: v for k, v in args.items() if k != 'group'}
                     call_args['db'] = alias
                     part = call_with_retry(self.fn, server, **call_args)
-                    parts.append(f'=== группа {group} / база {alias} ({info["path"]}) ===\n{part}')
+                    parts.append(
+                        _db_header(server, alias, [group]) + '\n' + part)
             if not parts:
                 raise ValueError(f'группа {group} не содержит открытых баз')
             return '\n\n'.join(parts)
@@ -1952,9 +2076,9 @@ class Tool:
         # db='*' — выполнить инструмент по всем открытым базам сразу
         if db == '*' and 'db' in self.schema.get('properties', {}):
             parts = []
-            for alias, info in server.dbs.items():
+            for alias in server.dbs:
                 part = call_with_retry(self.fn, server, **dict(args, db=alias))
-                parts.append(f'=== база {alias} ({info["path"]}) ===\n{part}')
+                parts.append(_db_header(server, alias) + '\n' + part)
             if not parts:
                 raise ValueError('нет открытых баз — укажите путь в db_open')
             return '\n\n'.join(parts)
@@ -1965,12 +2089,7 @@ class Tool:
         # Если у инструмента есть параметр db — добавляем заголовок с идентификатором базы
         if 'db' in self.schema.get('properties', {}):
             alias = server._alias(args.get('db'))  # разрешает None → активная база
-            info = server.dbs[alias]
-            # Если есть активная группа и база в ней — добавляем имя группы
-            group_prefix = ''
-            if server.active_group and alias in server.groups.get(server.active_group, []):
-                group_prefix = f'группа {server.active_group} / '
-            return f'=== {group_prefix}база {alias} ({info["path"]}) ===\n{result}'
+            return _db_header(server, alias) + '\n' + result
 
         return result
 
@@ -1985,13 +2104,20 @@ _DB = {'type': 'string',
        'description': 'Alias of the knowledge base to query INSTEAD of the '
                       'active one (see db_list). Omit to use the active base. '
                       "Special value '*': run the tool on EVERY open base at "
-                      'once; the answer comes back sectioned per base.'}
+                      'once; the answer comes back sectioned per base — note '
+                      'that it ignores the group division, so use group=* '
+                      'when the bases must stay separated by group.'}
 _GROUP = {'type': 'string',
-          'description': 'Name of the configuration group to query. A group '
-                         'bundles related databases (main config + extensions '
-                         '+ processors). When specified, the tool runs on ALL '
-                         "databases in the group. Special value '*': run on "
-                         'every group at once. Takes priority over db parameter.'}
+          'description': 'Name of the configuration group to query SEPARATELY '
+                         'from the other open groups (group_list names them). '
+                         'A group bundles related databases (main config + '
+                         'extensions + processors). When specified, the tool '
+                         'runs on ALL databases of that group and the answer '
+                         'is sectioned per database, each section headed with '
+                         "the group and the base. Special value '*': run on "
+                         'every group at once, keeping the groups apart. Takes '
+                         'priority over the db parameter; when omitted, only '
+                         'the ACTIVE base is queried (not the whole group).'}
 _LIMIT = {'type': 'integer',
           'description': 'Page size, 1..200. When the search has more hits '
                          'than one page, read the next page with offset '
@@ -2184,7 +2310,9 @@ TOOLS = [
          'List the knowledge bases open on this server: alias, file path, '
          'object/module/method counts, and one line per base with the kind of '
          'the source file (.cf/.cfe/.epf/.erf), its version and compatibility '
-         'mode; * marks the ACTIVE base that the other tools query by default.',
+         'mode, plus the configuration group(s) each base belongs to; * marks '
+         'the ACTIVE base that the other tools query by default. Several '
+         'groups can be open at once — group_list shows the division.',
          _schema({}),
          McpServer.db_list),
     Tool('db_open',
@@ -2222,14 +2350,17 @@ TOOLS = [
          _schema({'group': _STR, 'db': _STR}, ('group', 'db')),
          McpServer.group_remove_db),
     Tool('group_list',
-         'List all configuration groups with their databases. * marks the '
-         'ACTIVE group that other tools query by default when group parameter '
-         'is omitted.',
+         'List all configuration groups with their databases — several groups '
+         'can be open at the same time. * marks the ACTIVE group. Pass '
+         'group=<name> to a data tool to query ONE group separately, or '
+         "group='*' for every group at once; with no group parameter only the "
+         'active BASE is queried, not the whole group.',
          _schema({}),
          McpServer.group_list),
     Tool('group_use',
-         'Switch the ACTIVE configuration group — the one all other tools '
-         'query by default when the group parameter is omitted.',
+         'Switch the ACTIVE configuration group: its first base becomes the '
+         'active base, so tools called without group query that group. To '
+         'query a group WITHOUT switching, pass group=<name> to the tool.',
          _schema({'group': _STR}, ('group',)),
          McpServer.group_use),
     Tool('group_close',
@@ -2398,6 +2529,50 @@ def resolve_dbs(dbs):
     return resolved
 
 
+def parse_group_spec(spec):
+    """'ИМЯ=путь1;путь2' -> ('ИМЯ', ['путь1', 'путь2']).
+
+    Разделитель имени — первый '=', поэтому путь может содержать '=' (в Windows
+    это допустимый символ имени файла), а имя группы — нет. ';' разделяет пути
+    внутри одного флага; повтор флага с тем же именем добавляет базы в ту же
+    группу, так что ';' не обязателен.
+    """
+    text = str(spec)
+    if '=' not in text:
+        raise ValueError(
+            f'нужен вид ИМЯ=ПУТЬ (несколько путей — через ;): {spec}')
+    name, _, rest = text.partition('=')
+    name = name.strip()
+    if not name:
+        raise ValueError(f'пустое имя группы: {spec}')
+    paths = [p.strip().strip('"') for p in rest.split(';')]
+    paths = [p for p in paths if p]
+    if not paths:
+        raise ValueError(f'в группе «{name}» нет ни одного пути к базе')
+    return name, paths
+
+
+def collect_groups(specs):
+    """[флаги --group] -> [(имя, [пути])]; порядок первого вхождения сохраняется."""
+    ordered, index = [], {}
+    for spec in specs or ():
+        name, paths = parse_group_spec(spec)
+        key = name.lower()
+        if key not in index:
+            index[key] = len(ordered)
+            ordered.append((name, []))
+        bucket = ordered[index[key]][1]
+        for path in paths:
+            if path not in bucket:
+                bucket.append(path)
+    return ordered
+
+
+def resolve_groups(specs):
+    """То же, что collect_groups, но с проверкой файлов (SystemExit 2)."""
+    return [(name, resolve_dbs(paths)) for name, paths in collect_groups(specs)]
+
+
 def _find_single_db():
     """last_db из конфига либо автопоиск единственной базы; SystemExit(2)."""
     last = load_config().get('last_db') or ''
@@ -2421,20 +2596,33 @@ def _find_single_db():
 
 
 def _print_dbs(server):
-    """Сообщает открытые базы и алиасы (в stderr — не в поток протокола)."""
+    """Сообщает открытые базы, алиасы и группы (в stderr — не в поток протокола)."""
     for alias, info in server.dbs.items():
         mark = '*' if alias == server.active else ' '
-        print(f' {mark} база {alias}: {info["path"]}', file=sys.stderr)
+        groups = server.groups_of(alias)
+        tail = f' [в группах: {", ".join(groups)}]' if groups else ''
+        print(f' {mark} база {alias}: {info["path"]}{tail}', file=sys.stderr)
+    for name, aliases in server.groups.items():
+        mark = '*' if name == server.active_group else ' '
+        print(f' {mark} группа {name}: {", ".join(aliases) or "(пусто)"}',
+              file=sys.stderr)
 
 
-def serve_http(db_paths, host='127.0.0.1', port=8765):
+def serve_http(db_paths, host='127.0.0.1', port=8765, groups=None):
     if isinstance(db_paths, str):
         db_paths = [db_paths]
+    group_items = _group_items(groups)
+    for name, paths in group_items:
+        for path in paths:
+            if not os.path.isfile(path):
+                print(f'Файл базы не найден: {path} (группа {name})',
+                      file=sys.stderr)
+                return 2
     for path in db_paths:
         if not os.path.isfile(path):
             print(f'Файл базы не найден: {path}', file=sys.stderr)
             return 2
-    server = McpServer(db_paths)
+    server = McpServer(db_paths, groups=group_items)
     _print_dbs(server)
     httpd, real_port = start_http_server(server, host, port)
     print(f'1confdb-knw: слушаю http://{host}:{real_port}/mcp '
@@ -2465,12 +2653,23 @@ def main(argv=None):
             stream.reconfigure(encoding='utf-8')
         except Exception:  # noqa: BLE001
             pass
+    # Список баз и групп при старте печатается в stderr, и клиент читает его из
+    # пайпа тем же UTF-8; в живой консоли (запуск из TUI) оставляем кодовую
+    # страницу терминала, иначе русский текст станет нечитаемым.
+    if not sys.stderr.isatty():
+        try:
+            sys.stderr.reconfigure(encoding='utf-8')
+        except Exception:  # noqa: BLE001
+            pass
     parser = argparse.ArgumentParser(
         prog='1confdb-knw',
         description='MCP-сервер знаний по конфигурации 1С и BSL '
                     '(stdio по умолчанию; --port — HTTP для SSH-туннеля). '
                     'Можно открыть несколько баз сразу (основная конфигурация '
-                    '+ расширения/обработки) — остальные через db_open на ходу.')
+                    '+ расширения/обработки) — остальные через db_open на ходу. '
+                    'Несколько групп конфигураций одновременно — повторяющимся '
+                    '--group ИМЯ=ПУТЬ: группы остаются раздельными и '
+                    'запрашиваются параметром group.')
     parser.add_argument(
         'db', nargs='*', default=None,
         help='пути к базам SQLite (можно несколько); без путей — last_db из '
@@ -2480,11 +2679,25 @@ def main(argv=None):
                         help='адрес для HTTP-режима (по умолчанию 127.0.0.1)')
     parser.add_argument('--port', type=int, default=0,
                         help='порт HTTP-режима (без него — stdio)')
+    parser.add_argument('--group', action='append', default=None,
+                        metavar='ИМЯ=ПУТЬ',
+                        help='группа конфигураций: имя и путь к базе. Повтор '
+                             'флага добавляет базу в ту же группу, несколько '
+                             'путей можно перечислить через ";". Групп может '
+                             'быть несколько — все откроются одновременно '
+                             '(активна первая), а инструменты будут запрашивать '
+                             'их раздельно параметром group')
     args = parser.parse_args(argv)
-    dbs = resolve_dbs(args.db)
+    try:
+        groups = resolve_groups(args.group)
+    except ValueError as err:
+        parser.error(str(err))
+    # Без --group пустой список баз означает автопоиск; с группами базы уже
+    # названы в них, и искать что-то ещё не нужно
+    dbs = resolve_dbs(args.db) if (args.db or not groups) else []
     if args.port:
-        return serve_http(dbs, args.host, args.port)
-    server = McpServer(dbs)
+        return serve_http(dbs, args.host, args.port, groups=groups)
+    server = McpServer(dbs, groups=groups)
     _print_dbs(server)
     for line in sys.stdin:
         line = line.strip()

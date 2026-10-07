@@ -48,6 +48,23 @@ def test_main_mcp_missing_db(tmp_path):
     assert exc.value.code == 2
 
 
+def test_mcp_group_flags():
+    # несколько групп одновременно: флаг повторяется, порядок сохраняется
+    args = build_parser().parse_args(
+        ['1confdb-knw', '--group', 'УНФ=D:\\a.db', '--group', 'УНФ=D:\\b.db',
+         '--group', 'БП=D:\\c.db'])
+    assert args.group == ['УНФ=D:\\a.db', 'УНФ=D:\\b.db', 'БП=D:\\c.db']
+    assert args.db == []
+    assert build_parser().parse_args(['1confdb-knw']).group is None
+
+
+def test_main_mcp_group_is_forwarded(tmp_path):
+    # недостижимая база группы — тот же код возврата, что и у позиционного пути
+    with pytest.raises(SystemExit) as exc:
+        main(['1confdb-knw', '--group', f'унф={tmp_path / "нет.db"}'])
+    assert exc.value.code == 2
+
+
 def test_parser_no_fts_and_fts_command():
     args = build_parser().parse_args(['extract', 'config.cf', '--db', 'o.db', '--no-fts'])
     assert args.no_fts

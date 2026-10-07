@@ -166,6 +166,47 @@ def replace_server_dbs(server, paths):
     return opened, errors
 
 
+def first_db(dbs, groups=()):
+    """База, которая станет активной при таком запуске.
+
+    Группы открываются первыми (McpServer.__init__), поэтому активна первая
+    база первой группы; отдельные базы — только когда групп нет.
+    """
+    for _name, paths in groups or ():
+        if paths:
+            return paths[0]
+    return dbs[0] if dbs else None
+
+
+def group_cli_args(groups):
+    """Флаги --group для запуска сервера: по одному на базу.
+
+    По флагу на базу, а не «ИМЯ=путь1;путь2», потому что ';' — допустимый
+    символ в имени файла Windows; повтор флага сервер складывает в ту же группу.
+    """
+    args = []
+    for name, paths in groups or ():
+        for path in paths:
+            args += ['--group', f'{name}={path}']
+    return args
+
+
+def resolve_launch_groups(config_groups, names):
+    """Выбранные имена групп -> ([(имя, [пути])], [недоступные пути]).
+
+    Группа без доступных баз в набор не попадает; порядок `names` сохраняется
+    (первая группа становится активной).
+    """
+    groups, missing = [], []
+    for name in names:
+        raw = list(config_groups.get(name) or ())
+        paths = [p for p in raw if os.path.isfile(p)]
+        missing += [p for p in raw if not os.path.isfile(p)]
+        if paths:
+            groups.append((name, paths))
+    return groups, missing
+
+
 class Tui:
     def __init__(self):
         config = _load_config()
@@ -505,50 +546,86 @@ class Tui:
     # ---------- MCP-сервер ----------
 
     def _run_mcp(self):
-        dbs, title = self._pick_launch_set()
-        if not dbs:
+        dbs, groups, title, missing = self._pick_launch_set()
+        if not dbs and not groups:
             return
-        self._launch_mcp(dbs, title)
+        self._launch_mcp(dbs, groups, title, missing)
 
     def _pick_launch_set(self):
-        """Что открыть: группа баз либо одна/несколько баз вручную."""
+        """Что открыть: несколько групп сразу и/или отдельные базы вручную.
+
+        Возвращает (базы вне групп, [(имя группы, [пути])], заголовок,
+        [недоступные пути]). Деление на группы доходит до сервера: первая
+        группа становится активной, а LLM запрашивает группы раздельно
+        параметром group.
+        """
+        picked, loose = [], []
         while True:
             _cls()
             print('--- MCP-сервер 1confdb-knw: что открыть ---')
             names = list(self.groups)
             if names:
-                print('Группы баз (создать/изменить — пункт 6 главного меню):')
+                print('Группы баз (создать/изменить — пункт 6 главного меню).')
+                print('Несколько групп открываются одновременно и остаются')
+                print('раздельными — в квадратных скобках номер выбранной.')
                 for i, name in enumerate(names, 1):
+                    mark = str(picked.index(name) + 1) if name in picked else ' '
                     shown = ', '.join(os.path.basename(d)
                                       for d in self.groups[name])
-                    print(f' {i}. {name}: {shown}')
+                    print(f' [{mark}] {i}. {name}: {shown}')
             else:
                 print('Групп баз пока нет — создать можно в пункте 6.')
             print()
-            print(' m. Выбрать базы вручную (одну или несколько)')
-            print(' 0. Назад')
-            choice = input('Выбор: ').strip()
+            if loose:
+                print('Отдельные базы (вне групп):')
+                for i, path in enumerate(loose, 1):
+                    print(f'  {i}. {path}')
+                print()
+            print('Команды: номер — добавить/убрать группу; *N — сделать N-ю')
+            print('выбранной первой (её первая база станет активной);')
+            print('m — отдельные базы вручную; Enter — запустить; 0 — назад')
+            choice = input('> ').strip()
             if choice == '0':
-                return [], ''
+                return [], [], '', []
             if choice == 'm':
-                dbs = self._multi_select(
-                    'Базы для MCP-сервера (первая — основная)',
-                    self._db_pool(), ordered=True)
-                return (dbs or []), 'выбранные базы'
+                picked_loose = self._multi_select(
+                    'Отдельные базы вне групп (первая — основная)',
+                    self._db_pool(), selected=loose, ordered=True)
+                if picked_loose is not None:
+                    loose = picked_loose
+                continue
+            if choice.startswith('*') and choice[1:].isdigit():
+                n = int(choice[1:])
+                if 1 <= n <= len(picked):
+                    picked.insert(0, picked.pop(n - 1))
+                continue
             if choice.isdigit() and 1 <= int(choice) <= len(names):
                 name = names[int(choice) - 1]
-                raw = self.groups[name]
-                dbs = [d for d in raw if os.path.isfile(d)]
-                for d in raw:
-                    if not os.path.isfile(d):
-                        print(f'Не найдена база (пропущена): {d}')
-                if not dbs:
-                    print('В группе нет доступных баз.')
+                if name in picked:
+                    picked.remove(name)
+                else:
+                    picked.append(name)
+                continue
+            if choice == '':
+                groups, missing = resolve_launch_groups(self.groups, picked)
+                if not groups and not loose:
+                    print('Ничего не выбрано: отметьте группу или добавьте '
+                          'базы вручную (m).')
                     input('Нажмите Enter…')
                     continue
-                return dbs, f'группа «{name}»'
+                return loose, groups, self._launch_title(groups, loose), missing
             print('Неизвестный пункт.')
             input('Нажмите Enter…')
+
+    @staticmethod
+    def _launch_title(groups, loose):
+        bits = []
+        if groups:
+            bits.append('группы ' + ', '.join(f'«{n}»' for n, _ in groups))
+        if loose:
+            bits.append('отдельные базы: '
+                        + ', '.join(os.path.basename(p) for p in loose))
+        return '; '.join(bits)
 
     # ---------- группы баз ----------
 
@@ -668,21 +745,35 @@ class Tui:
 
     # ---------- MCP: запуск выбранного набора баз ----------
 
-    def _launch_mcp(self, dbs, title):
+    def _launch_mcp(self, dbs, groups, title, missing=()):
+        main = first_db(dbs, groups)
         while True:
             _cls()
             print(f'--- MCP-сервер: {title} ---')
-            for i, d in enumerate(dbs, 1):
-                print(f' {i}. {d}' + (' (основная)' if i == 1 else ''))
+            for name, paths in groups:
+                print(f' группа «{name}»:')
+                for i, d in enumerate(paths, 1):
+                    print(f'  {i}. {d}' + (' (основная)' if d == main else ''))
+            if dbs:
+                if groups:
+                    print(' отдельные базы (вне групп):')
+                for i, d in enumerate(dbs, 1):
+                    print(f' {i}. {d}' + (' (основная)' if d == main else ''))
+            for path in missing:
+                print(f' пропущена (файл не найден): {path}')
+            print()
+            print(' Группы откроются одновременно и останутся раздельными:')
+            print(' запрос к одной группе — параметр group, ко всем — group="*".')
             print()
             print(' 1. stdio — клиент сам запускает процесс')
-            print(' 2. Сеть (HTTP) + управление базами без перезапуска')
+            print(' 2. Сеть (HTTP) + управление базами и группами без перезапуска')
             print(' 0. Назад')
             choice = input('Выбор: ').strip()
             if choice == '0':
                 return
             if choice == '1':
-                args = ['-m', 'confdb.mcp_server'] + dbs
+                args = (['-m', 'confdb.mcp_server'] + list(dbs)
+                        + group_cli_args(groups))
                 _cls()
                 print('Сервер работает по stdio; остановка — Ctrl+C.')
                 print(f'  {{"command": "{sys.executable}", '
@@ -696,19 +787,19 @@ class Tui:
                 input('Нажмите Enter…')
                 return
             if choice == '2':
-                self._serve_interactive(dbs)
+                self._serve_interactive(dbs, groups)
                 return
             print('Неизвестный пункт.')
             input('Нажмите Enter…')
 
-    def _serve_interactive(self, dbs):
+    def _serve_interactive(self, dbs, groups=()):
         port = _ask('Порт', '8765')
         if not port.isdigit():
             print('Нужно целое число.')
             input('Нажмите Enter…')
             return
         from .mcp_server import McpServer, start_http_server
-        server = McpServer(dbs)
+        server = McpServer(dbs, groups=list(groups))
         try:
             httpd, real_port = start_http_server(server, '127.0.0.1', int(port))
         except OSError as err:
@@ -750,7 +841,7 @@ class Tui:
             print(' 1. Сменить активную базу')
             print(' 2. Открыть ещё базу')
             print(' 3. Закрыть базу')
-            print(' 4. Применить группу из конфига (заменить открытые базы)')
+            print(' 4. Группы из конфига: добавить / заменить все / убрать / активировать')
             print(' 5. Создать группу конфигураций')
             print(' 6. Добавить базу в группу конфигураций')
             print(' 7. Удалить группу конфигураций')
@@ -793,24 +884,7 @@ class Tui:
                         print(f'Ошибка: {err}')
                     input('Нажмите Enter…')
             elif choice == '4':
-                names = list(self.groups)
-                if not names:
-                    print('Групп нет — создать можно в пункте 6 главного меню.')
-                    input('Нажмите Enter…')
-                    continue
-                for i, name in enumerate(names, 1):
-                    print(f'  {i}. {name}')
-                pick = _ask('Номер группы (открытые базы будут заменены)')
-                if pick.isdigit() and 1 <= int(pick) <= len(names):
-                    group = self.groups[names[int(pick) - 1]]
-                    opened, errors = replace_server_dbs(server, group)
-                    for err in errors:
-                        print(f'Ошибка: {err}')
-                    if opened:
-                        print('Открыты базы: ' + ', '.join(opened))
-                    else:
-                        print('Сервер остался без баз — откройте вручную (пункт 2).')
-                    input('Нажмите Enter…')
+                self._config_groups_menu(server)
             elif choice == '5':
                 # Создать группу конфигураций
                 name = _ask('Имя группы конфигураций')
@@ -870,6 +944,124 @@ class Tui:
                         print(f'Группа {group_name} удалена.')
                     except ValueError as err:
                         print(f'Ошибка: {err}')
+                input('Нажмите Enter…')
+            else:
+                print('Неизвестный пункт.')
+                input('Нажмите Enter…')
+
+    # ---------- группы из конфига в запущенном сервере ----------
+
+    @staticmethod
+    def _server_group(server, name):
+        """Имя группы сервера без учёта регистра либо None."""
+        return next((g for g in server.groups
+                     if g.lower() == str(name).lower()), None)
+
+    def _pick_server_group(self, server, what):
+        """Показывает группы сервера и возвращает выбранную (или None)."""
+        if not server.groups:
+            print('В сервере групп нет.')
+            input('Нажмите Enter…')
+            return None
+        group_names = list(server.groups)
+        for i, g in enumerate(group_names, 1):
+            print(f'  {i}. {g}' + (' *' if g == server.active_group else ''))
+        pick = _ask(f'Номер группы, которую {what}')
+        if pick.isdigit() and 1 <= int(pick) <= len(group_names):
+            return group_names[int(pick) - 1]
+        return None
+
+    def _apply_config_group(self, server, name, paths, replace=False):
+        """Группа из конфига -> работающий сервер: добавить либо заменить всё.
+
+        Возвращает (имя группы в сервере, [алиасы], [ошибки]). При замене
+        прежние группы удаляются, а все открытые базы закрываются и
+        открываются заново — набор сервера становится равен группе (это
+        прежнее «применить группу», но с регистрацией группы в сервере).
+        """
+        if replace:
+            for group in list(server.groups):
+                server.close_group(group)
+            replace_server_dbs(server, ())
+            return server.add_group_paths(name, paths, activate=True)
+        return server.add_group_paths(name, paths)
+
+    def _config_groups_menu(self, server):
+        names = list(self.groups)
+        while True:
+            _cls()
+            print('--- Группы из конфига в запущенном сервере ---')
+            if names:
+                print('(* — группа уже открыта в сервере)')
+                for i, name in enumerate(names, 1):
+                    mark = '*' if self._server_group(server, name) else ' '
+                    shown = ', '.join(os.path.basename(d)
+                                      for d in self.groups[name])
+                    print(f' {mark} {i}. {name}: {shown}')
+            else:
+                print(' В конфиге групп нет — создать можно в пункте 6 '
+                      'главного меню.')
+            print()
+            print(server.group_list())
+            print()
+            print(' 1. Добавить группу (её базы откроются, прочие группы останутся)')
+            print(' 2. Заменить все группы и базы сервера одной из конфига')
+            print(' 3. Убрать группу сервера (её базы закроются, если не нужны другим)')
+            print(' 4. Сделать группу сервера активной')
+            print(' 0. Назад')
+            choice = input('Выбор: ').strip()
+            if choice == '0':
+                return
+            if choice in ('1', '2'):
+                if not names:
+                    print('В конфиге групп нет.')
+                    input('Нажмите Enter…')
+                    continue
+                pick = _ask('Номер группы из конфига')
+                if not (pick.isdigit() and 1 <= int(pick) <= len(names)):
+                    continue
+                name = names[int(pick) - 1]
+                try:
+                    group, aliases, errors = self._apply_config_group(
+                        server, name, self.groups[name], replace=(choice == '2'))
+                except ValueError as err:
+                    print(f'Ошибка: {err}')
+                    input('Нажмите Enter…')
+                    continue
+                for err in errors:
+                    print(f'Ошибка: {err}')
+                if aliases:
+                    print(f'Группа {group}: ' + ', '.join(aliases)
+                          + (' (активна)'
+                             if group == server.active_group else ''))
+                else:
+                    print(f'Группа {group} осталась без баз.')
+                input('Нажмите Enter…')
+            elif choice == '3':
+                group = self._pick_server_group(server, 'нужно убрать')
+                if not group:
+                    continue
+                try:
+                    name, closed = server.drop_group(group)
+                except ValueError as err:
+                    print(f'Ошибка: {err}')
+                    input('Нажмите Enter…')
+                    continue
+                print(f'Группа {name} удалена' + (
+                    f'; закрыты базы: {", ".join(closed)}' if closed
+                    else '; базы остались открытыми'))
+                input('Нажмите Enter…')
+            elif choice == '4':
+                group = self._pick_server_group(server, 'нужно сделать активной')
+                if not group:
+                    continue
+                try:
+                    name = server.use_group(group)
+                except ValueError as err:
+                    print(f'Ошибка: {err}')
+                    input('Нажмите Enter…')
+                    continue
+                print(f'Активная группа: {name}; активная база: {server.active}')
                 input('Нажмите Enter…')
             else:
                 print('Неизвестный пункт.')
