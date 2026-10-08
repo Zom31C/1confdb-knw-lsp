@@ -23,6 +23,18 @@ from ..v8 import helper
 
 ROOT_TYPES = ('Configuration', 'ConfigurationExtension', 'ExternalDataProcessor')
 
+# Ревизия схемы базы знаний. Пишется в файл базы (PRAGMA user_version) при
+# создании; сервер отвечает только на базы своей ревизии, а на устаревшую
+# возвращает просьбу пересобрать — подстраиваться под каждую старую колонку
+# он не должен (решение пользователя 2026-10-08).
+# История: 1 — до 2026-10-02; 2 — predefined.parent_ord/uuid и
+# predefined_subconto (2026-10-02); 3 — source.file_size/file_sha256
+# (2026-10-05); 4 — role_right/role_rls_template/role_rights_state,
+# meta_attribute.uuid, meta_tabular.uuid (2026-10-07); 5 —
+# role_right.target_flags (2026-10-07); 6 — сам штамп ревизии (2026-10-08).
+# Базы ревизий 1-5 штампа не имеют: у них user_version = 0.
+SCHEMA_VERSION = 6
+
 RE_UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 
 # Русские имена типов объектов «как в конфигураторе» (ключ — англ. stem).
@@ -1497,6 +1509,8 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
         # страница 16 КБ до создания таблиц: меньше узлов B-дерева на тех же данных
         conn.execute('PRAGMA page_size=16384')
         conn.executescript(SCHEMA)
+        # штамп ревизии схемы: сервер по нему отличает свою базу от устаревшей
+        conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
         conn.execute('BEGIN')
         cur = conn.execute(
             'INSERT INTO source (file, created, file_size, file_sha256) '

@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from confdb.tui import (Tui, _unquote, first_db,  # noqa: E402
                         group_cli_args, load_groups, replace_server_dbs,
-                        resolve_launch_groups)
+                        resolve_launch_groups, schema_tail)
 
 
 def test_unquote_stips_surrounding_quotes():
@@ -300,3 +300,23 @@ def test_apply_config_group_replace_drops_the_rest(tmp_path_factory):
     assert (name, aliases, errors) == ('БП', ['вторая'], [])
     assert list(server.groups) == ['БП'] and list(server.dbs) == ['вторая']
     assert server.active == 'вторая' and server.active_group == 'БП'
+
+
+def test_schema_tail_marks_an_outdated_base(tmp_path_factory):
+    """В списке баз TUI устаревшая помечена до выбора: сервер её не читает."""
+    import sqlite3
+
+    from confdb.db.writer import SCHEMA_VERSION
+    from confdb.mcp_server import McpServer
+
+    fresh = _real_db(tmp_path_factory, 'свежая.sqlite')
+    stale = _real_db(tmp_path_factory, 'старая.sqlite')
+    conn = sqlite3.connect(stale)
+    conn.execute(f'PRAGMA user_version={SCHEMA_VERSION - 1}')
+    conn.commit()
+    conn.close()
+    server = McpServer([fresh, stale])
+    assert schema_tail(server, 'свежая') == ''
+    tail = schema_tail(server, 'старая')
+    assert f'схема {SCHEMA_VERSION - 1} — устарела' in tail
+    assert f'сервер ждёт {SCHEMA_VERSION}' in tail

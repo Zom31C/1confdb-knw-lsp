@@ -43,8 +43,8 @@ from urllib.parse import parse_qs, urlparse
 from . import compare
 from . import header_props
 from .config import load_config
-from .db.writer import FTS_TABLE, TYPE_RU, fts_index_info, fts_shard_paths, \
-    tabular_field_counts
+from .db.writer import FTS_TABLE, SCHEMA_VERSION, TYPE_RU, fts_index_info, \
+    fts_shard_paths, tabular_field_counts
 
 PROTOCOL_VERSION = '2024-11-05'
 
@@ -212,53 +212,13 @@ def _exchange_plan_lines(uuids, known):
     return [f'Состав плана обмена ({total}): ' + (text or 'пуст')]
 
 
-NO_PREDEFINED_TREE = ('иерархия элементов и виды субконто не сохранены: база'
-                      ' собрана раньше, чем появились predefined.parent_ord/uuid'
-                      ' и predefined_subconto (2026-10-02) — пересобрать:'
-                      ' confdb extract <файл> --db <база> --force')
-
-# имена корневого узла дерева предопределённых элементов: сам он элементом не
-# является, а отличавшего его parent_ord в базах до 2026-10-02 нет
-PREDEFINED_ROOTS = ('Счета', 'Характеристики', 'Элементы')
-
-
-def _predefined_columns(conn):
-    """Колонки таблицы `predefined`: пустой набор = таблицы в базе нет."""
-    return {row[1] for row in conn.execute('PRAGMA table_info(predefined)')}
-
-
-def _predefined_label(name, code, display):
-    """'01 Товары — Товары': имя элемента с кодом и представлением."""
-    code = (code or '').strip()
-    label = name if not display or display == name else f'{name} — {display}'
-    return f'{code} {label}' if code else label
-
-
-def _predefined_lines(q, oid, rows, obj_type, limit=60, tree=True):
+def _predefined_lines(q, oid, rows, obj_type, limit=60):
     """Дерево предопределённых элементов с видами субконто счёта.
 
     rows — (ord, parent_ord, name, code, display) в порядке обхода в глубину.
     Корневой узел («Счета», «Элементы») элементом не является: в паспорт он не
     печатается, но остаётся в таблице строкой с parent_ord IS NULL.
-
-    tree=False — база собрана до 2026-10-02: в ней нет ни parent_ord, ни
-    таблицы predefined_subconto, поэтому rows — (ord, name, code, display),
-    элементы печатаются плоским списком и помечаются как неполные. Корневой
-    узел там узнаётся по имени и нулевому ord: отличавшего его parent_ord в
-    старой схеме нет, а в части объектов корень и вовсе не сохранён.
     """
-    noun = 'счета' if obj_type == 'ChartOfAccounts' else 'элементы'
-    if not tree:
-        elements = [row for row in rows
-                    if not (row[0] == 0 and row[1] in PREDEFINED_ROOTS)]
-        lines = [f'Предопределённые {noun} ({len(elements)}):']
-        lines.extend('  ' + _predefined_label(*row[1:])
-                     for row in elements[:limit])
-        if len(elements) > limit:
-            lines.append(f'  … и ещё {len(elements) - limit}'
-                         ' (таблица predefined)')
-        lines.append('  ' + NO_PREDEFINED_TREE)
-        return lines
     subconto = {}
     for owner, kind, flags in q(
             "SELECT p.ord, COALESCE(NULLIF(k.display, ''), k.name, s.uuid), s.flags"
@@ -271,6 +231,7 @@ def _predefined_lines(q, oid, rows, obj_type, limit=60, tree=True):
     for ord_no, parent, name, code, display in rows:
         children.setdefault(parent, []).append((ord_no, name, code, display))
     total = sum(1 for row in rows if row[1] is not None)
+    noun = 'счета' if obj_type == 'ChartOfAccounts' else 'элементы'
     lines = [f'Предопределённые {noun} ({total}):']
     shown = 0
 
@@ -279,8 +240,9 @@ def _predefined_lines(q, oid, rows, obj_type, limit=60, tree=True):
         for ord_no, name, code, display in children.get(parent, []):
             if shown >= limit:
                 return
-            lines.append('  ' * (depth + 1)
-                         + _predefined_label(name, code, display))
+            code = (code or '').strip()
+            label = name if not display or display == name else f'{name} — {display}'
+            lines.append('  ' * (depth + 1) + (f'{code} {label}' if code else label))
             kinds = subconto.get(ord_no)
             if kinds:
                 lines.append('  ' * (depth + 2) + 'субконто: ' + '; '.join(kinds))
@@ -384,25 +346,14 @@ def page_note(total, offset, shown, detail=''):
 
 
 def _source_row(conn):
-    """Строка `source` базы как словарь: file, created, root_uuid, file_sha256, file_size.
-
-    Отпечаток исходника (`extract.file_sha256`) пишется в базу с 2026-10-05, поэтому
-    в старых базах колонок file_sha256/file_size просто нет: их отсутствие — не
-    ошибка схемы, а «отпечаток неизвестен».
-    """
-    cols = {row[1] for row in conn.execute('PRAGMA table_info(source)')}
-    names = [c for c in ('file', 'created', 'root_uuid', 'file_sha256',
-                         'file_size') if c in cols]
-    if not names:
-        return {}
+    """Строка `source` базы как словарь: file, created, root_uuid, file_sha256, file_size."""
     row = conn.execute(
-        f'SELECT {", ".join(names)} FROM source ORDER BY id LIMIT 1').fetchone()
+        'SELECT file, created, root_uuid, file_sha256, file_size'
+        ' FROM source ORDER BY id LIMIT 1').fetchone()
     if not row:
         return {}
-    info = dict(zip(names, row))
-    info.setdefault('file_sha256', None)
-    info.setdefault('file_size', None)
-    return info
+    return dict(zip(('file', 'created', 'root_uuid', 'file_sha256',
+                     'file_size'), row))
 
 
 def sha_line(sha256, size=None):
@@ -436,7 +387,7 @@ COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object betwee
 
 REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
 
-ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. A right is printed as the first 8 hex chars of its platform uuid plus the value exactly as stored (1 or -1): the configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed. Bases built before 2026-10-07 have no rights tables at all and both tools say so instead of failing.
+ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. A right is printed as the first 8 hex chars of its platform uuid plus the value exactly as stored (1 or -1): the configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed.
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
@@ -447,14 +398,16 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 - attribute_ref(attribute_id, ord, uuid, object_id) — which metadata objects a field's type references (one row per member; NULL object = a generic platform type, whose uuid matches no object of this configuration). Use for joins and impact analysis ('who references X').
 - xdto_type(object_id, ord, name, kind, base, base_ns, facets, enum_values) — the types an XDTO package declares: kind is objectType, valueType (a simple/enumeration type) or typeDef (an anonymous type nested in a property); base/base_ns name the base type and the namespace it comes from; facets holds the remaining XML attributes as 'name=value; …' (maxLength, totalDigits, localName…); enum_values lists the allowed values of an enumeration type. xdto_property(type_id, object_id, ord, name, type, type_ns, lower_bound, upper_bound, nillable, form, extra, nested_type_id) — properties: lower_bound=1 = obligatory, upper_bound=-1 = a list, form = Attribute|Element, nested_type_id → an anonymous nested type, extra = the remaining attributes; type_id NULL = a property declared by the package itself, outside any type. xdto_import(object_id, ord, namespace) — the namespaces the package imports. Prefer xdto_of/find_xdto over querying these directly.
 - skd_query(object_id, ord, query) — report queries in the 1C query language (Russian keywords ВЫБРАТЬ/ИЗ/ГДЕ/СОЕДИНЕНИЕ/ОБЪЕДИНИТЬ).
-- enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, parent_ord, uuid, name, code, display) — predefined elements (catalog items, chart-of-accounts accounts, characteristic-chart values) in depth-first order: parent_ord is the ord of the parent, and NULL only for the root node ('Счета'/'Элементы'), which is not an element; uuid identifies the element and is what a subconto kind points at; predefined_subconto(predefined_id, ord, uuid, kind_id, flags) — the subconto kinds of a predefined account: kind_id → the predefined element of the characteristic chart that names the kind, flags = 'Суммовой;Валютный;Количественный'; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source(file, created, root_type/root_name/root_uuid, file_size, file_sha256) — which .cf/.cfe/.epf the base was built from, when, and the SHA-256 of that file: equal digests in two bases mean the very same source file, so nothing has to be re-extracted (NULL in bases built before the digest was added); file.
-- role_right(role_id, target_uuid, target_object_id, target_attr_id, target_tabular_id, sub_index, collection_uuid, target_flags, right_uuid, value, rls_text) — explicit role rights, SPARSE (no row = the right is not set); target_flags keeps the flags of the target record verbatim (their meaning is NOT confirmed — they only tell two targets sharing one uuid apart); role_rls_template(role_id, ord, name, text) — the role RLS templates; role_rights_state(role_id, version, parsed, targets, rights, rls_templates, error) — parsed=0 means the rights file could NOT be read (the reason is in error), which is not the same as a role without rights. Absent in bases built before 2026-10-07. Prefer role_rights / object_rights over querying these.
+- enum_value(object_id, ord, name) — enum values; predefined(object_id, ord, parent_ord, uuid, name, code, display) — predefined elements (catalog items, chart-of-accounts accounts, characteristic-chart values) in depth-first order: parent_ord is the ord of the parent, and NULL only for the root node ('Счета'/'Элементы'), which is not an element; uuid identifies the element and is what a subconto kind points at; predefined_subconto(predefined_id, ord, uuid, kind_id, flags) — the subconto kinds of a predefined account: kind_id → the predefined element of the characteristic chart that names the kind, flags = 'Суммовой;Валютный;Количественный'; common_target(common_id, target_id) — objects a common attribute is attached to; subsystem_content — subsystem composition; source(file, created, root_type/root_name/root_uuid, file_size, file_sha256) — which .cf/.cfe/.epf the base was built from, when, and the SHA-256 of that file: equal digests in two bases mean the very same source file, so nothing has to be re-extracted; file.
+- role_right(role_id, target_uuid, target_object_id, target_attr_id, target_tabular_id, sub_index, collection_uuid, target_flags, right_uuid, value, rls_text) — explicit role rights, SPARSE (no row = the right is not set); target_flags keeps the flags of the target record verbatim (their meaning is NOT confirmed — they only tell two targets sharing one uuid apart); role_rls_template(role_id, ord, name, text) — the role RLS templates; role_rights_state(role_id, version, parsed, targets, rights, rls_templates, error) — parsed=0 means the rights file could NOT be read (the reason is in error), which is not the same as a role without rights. Prefer role_rights / object_rights over querying these.
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
 RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns; 8) role_rights / object_rights for access analysis — what a role is given and which roles carry explicit rights on an object (its fields and tabular sections included). This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
 
-All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing."""
+All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing.
+
+SCHEMA REVISION: every base is stamped with the schema revision it was built with, and this server answers only bases of its own revision — db_list and db_open print it. A base of another revision is NOT read at all: every data tool answers 'база устарела: … --force' (or '… обновите 1confdb-knw' for a base built by a newer extractor). That is a fact about the file, not a fault of the query — do not retry with other tools or with sql, report the revision and the re-extract command to the user."""
 
 
 def _group_items(groups):
@@ -486,17 +439,6 @@ TARGETS_PER_ROLE = 12     # сколько целей объекта печат�
 RIGHTS_NOTE = ('право = первые 8 знаков его uuid (имени права в конфигурации нет),'
                ' значение — как в файле роли (1 или -1), смысл значения'
                ' платформенным словарём не подтверждён')
-
-NO_RIGHTS_TABLES = ('в базе нет прав ролей: она собрана раньше, чем появились'
-                    ' таблицы role_right/role_rights_state (2026-10-07) —'
-                    ' пересобрать: confdb extract <файл> --db <база> --force')
-
-
-def _rights_tables(conn):
-    """Есть ли в базе таблицы прав ролей (пишутся с 2026-10-07)."""
-    return conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-        " AND name IN ('role_right','role_rights_state')").fetchone()[0] == 2
 
 
 def _right_labels(rows):
@@ -648,8 +590,11 @@ class McpServer:
                 pass  # индекса нет — будет fallback на body_has
         if alias is None:
             alias = self._make_alias(path)
+        # ревизия схемы: 0 у баз, собранных извлекателем до появления штампа
+        schema = conn.execute('PRAGMA user_version').fetchone()[0]
         self.dbs[alias] = {'path': path, 'conn': conn, 'ctx': None, 'fts': fts,
-                           'fts_shards': fts_shards, 'fts_conn': None}
+                           'fts_shards': fts_shards, 'fts_conn': None,
+                           'schema': int(schema or 0)}
         if activate or self.active is None:
             self.active = alias
         return alias
@@ -690,6 +635,14 @@ class McpServer:
             'SELECT (SELECT COUNT(*) FROM meta_object), '
             '(SELECT COUNT(*) FROM module), '
             '(SELECT COUNT(*) FROM method)').fetchone()
+
+    def schema_of(self, alias=None):
+        """Ревизия схемы открытой базы (0 = собрана до появления штампа)."""
+        return self.dbs[self._alias(alias)]['schema']
+
+    def outdated(self, alias=None):
+        """Отказ для базы чужой ревизии схемы; None — если база своей ревизии."""
+        return schema_note(self.schema_of(alias))
 
     # -- группы баз ----------------------------------------------------------
     def create_group(self, name):
@@ -1055,17 +1008,10 @@ class McpServer:
                 out.append(f'Табличная часть {sec}: полей не объявлено')
             else:
                 out.append(f'Табличная часть {sec}: полей не извлечено')
-        pcols = _predefined_columns(self.conn(db))
-        if pcols:
-            # в базах до 2026-10-02 нет parent_ord/uuid: паспорт печатается
-            # плоским списком вместо ошибки схемы
-            tree = 'parent_ord' in pcols
-            select = ('ord, parent_ord, name, code, display' if tree
-                      else 'ord, name, code, display')
-            predef = q(f'SELECT {select} FROM predefined '
-                       'WHERE object_id=? ORDER BY ord', (oid,)).fetchall()
-            if predef:
-                out.extend(_predefined_lines(q, oid, predef, row[0], tree=tree))
+        predef = q('SELECT ord, parent_ord, name, code, display FROM predefined '
+                   'WHERE object_id=? ORDER BY ord', (oid,)).fetchall()
+        if predef:
+            out.extend(_predefined_lines(q, oid, predef, row[0]))
         subs = self.event_index(db)['by_source'].get(path)
         if subs:
             # платформа вызывает эти обработчики сама: в коде объекта
@@ -1412,8 +1358,6 @@ class McpServer:
         список, который читается как «роли ничего не разрешено».
         """
         conn = self.conn(db)
-        if not _rights_tables(conn):
-            return NO_RIGHTS_TABLES
         path = self._role_path(role, db)
         if not path:
             return (f'роль не найдена: {role} (список ролей:'
@@ -1488,8 +1432,6 @@ class McpServer:
         иначе пустой список читается как «доступ запрещён всем».
         """
         conn = self.conn(db)
-        if not _rights_tables(conn):
-            return NO_RIGHTS_TABLES
         path = self.resolve_path(path, db)
         q = conn.execute
         row = q('SELECT id, path FROM meta_object WHERE path=?', (path,)).fetchone()
@@ -2244,7 +2186,13 @@ class McpServer:
             tail = f' [в группах: {", ".join(groups)}]' if groups else ''
             out.append(f'{mark} {alias} — {info["path"]} '
                        f'(объектов: {nobj}, модулей: {nmod}, '
-                       f'методов: {nmeth}){tail}')
+                       f'методов: {nmeth}, {schema_mark(info["schema"])}){tail}')
+            note = schema_note(info['schema'])
+            if note:
+                # паспорт конфигурации читает source, состав которой зависит от
+                # ревизии: устаревшая база получает только команду пересборки
+                out.append(f'    {note}')
+                continue
             name, meta = self.cfg_summary(alias)
             out.append(f'    {name}: {meta} (configuration_info — подробно)')
         return 'Открытые базы (* — активная):\n' + '\n'.join(out)
@@ -2252,9 +2200,11 @@ class McpServer:
     def db_open(self, path, alias=None):
         alias = self.open_db(path, alias)
         nobj, nmod, nmeth = self.db_stats(alias)
+        note = self.outdated(alias)
         return (f'база открыта: {alias} — {self.dbs[alias]["path"]} '
-                f'(объектов: {nobj}, модулей: {nmod}, методов: {nmeth}); '
-                'сделана активной')
+                f'(объектов: {nobj}, модулей: {nmod}, методов: {nmeth}, '
+                f'{schema_mark(self.dbs[alias]["schema"])}); сделана активной'
+                + (f'\n{note}' if note else ''))
 
     def db_use(self, alias):
         alias = self._alias(alias)
@@ -2346,6 +2296,41 @@ def error_text(err):
     return f'ошибка [{code}]: {detail}'
 
 
+# Ревизия схемы базы знаний: writer штампует её в PRAGMA user_version, сервер
+# читает базы только своей ревизии. Подстраиваться под каждую старую колонку
+# он не должен (решение пользователя 2026-10-08): устаревшая база получает
+# отказ с командой пересборки, и инструменты не падают ошибкой схемы посреди
+# запроса. Базы, собранные до появления штампа, имеют user_version = 0.
+OUTDATED_DB = ('база устарела: ревизия схемы {have}, сервер работает с {want}'
+               ' — пересобрать: confdb extract <файл> --db <база> --force'
+               ' (миграции нет: новые колонки заполняются только из исходника)')
+UNSTAMPED_DB = ('база собрана извлекателем без штампа ревизии схемы (до'
+                ' 2026-10-08), сервер работает с ревизией {want} — пересобрать:'
+                ' confdb extract <файл> --db <база> --force')
+NEWER_DB = ('база собрана более новым извлекателем: ревизия схемы {have},'
+            ' сервер работает с {want} — обновите 1confdb-knw')
+
+
+def schema_note(have):
+    """Отказ для базы чужой ревизии схемы; None — если ревизия своя."""
+    if have == SCHEMA_VERSION:
+        return None
+    if have > SCHEMA_VERSION:
+        return NEWER_DB.format(have=have, want=SCHEMA_VERSION)
+    if not have:
+        return UNSTAMPED_DB.format(want=SCHEMA_VERSION)
+    return OUTDATED_DB.format(have=have, want=SCHEMA_VERSION)
+
+
+def schema_mark(have):
+    """Короткая отметка ревизии для db_list и TUI: 'схема 6' / 'схема 5 — устарела…'."""
+    if have == SCHEMA_VERSION:
+        return f'схема {have}'
+    label = str(have) if have else 'не отмечена'
+    tail = 'устарела' if have < SCHEMA_VERSION else 'новее сервера'
+    return f'схема {label} — {tail} (сервер ждёт {SCHEMA_VERSION})'
+
+
 def call_with_retry(fn, *args, **kwargs):
     """Вызов инструмента с повтором, если база оказалась занята."""
     for attempt in range(3):
@@ -2392,6 +2377,10 @@ class Tool:
 
         # Инструменты управления группами не используют fan-out
         is_group_management = self.name.startswith('group_')
+        # Инструменты управления базами и группами идут мимо проверки ревизии
+        # схемы: они не читают таблицы конфигурации, а db_list сам печатает
+        # ревизию каждой базы и отметку «устарела»
+        is_management = is_group_management or self.name.startswith('db_')
 
         # group='*' — fan-out по всем группам
         if group == '*' and 'group' in self.schema.get('properties', {}) and not is_group_management:
@@ -2405,7 +2394,9 @@ class Tool:
                         # Убираем group из args, т.к. методы не принимают этот параметр
                         call_args = {k: v for k, v in args.items() if k != 'group'}
                         call_args['db'] = alias
-                        part = call_with_retry(self.fn, server, **call_args)
+                        part = server.outdated(alias)
+                        if part is None:
+                            part = call_with_retry(self.fn, server, **call_args)
                         group_parts.append(
                             _db_header(server, alias, []) + '\n' + part)
                 if group_parts:
@@ -2425,7 +2416,9 @@ class Tool:
                     # Убираем group из args, т.к. методы не принимают этот параметр
                     call_args = {k: v for k, v in args.items() if k != 'group'}
                     call_args['db'] = alias
-                    part = call_with_retry(self.fn, server, **call_args)
+                    part = server.outdated(alias)
+                    if part is None:
+                        part = call_with_retry(self.fn, server, **call_args)
                     parts.append(
                         _db_header(server, alias, [group]) + '\n' + part)
             if not parts:
@@ -2436,17 +2429,34 @@ class Tool:
         if db == '*' and 'db' in self.schema.get('properties', {}):
             parts = []
             for alias in server.dbs:
-                part = call_with_retry(self.fn, server, **dict(args, db=alias))
+                part = server.outdated(alias)
+                if part is None:
+                    part = call_with_retry(self.fn, server,
+                                           **dict(args, db=alias))
                 parts.append(_db_header(server, alias) + '\n' + part)
             if not parts:
                 raise ValueError('нет открытых баз — укажите путь в db_open')
             return '\n\n'.join(parts)
 
         # Обычный запрос к одной базе
+        props = self.schema.get('properties', {})
+        has_db = 'db' in props
+        if not is_management:
+            # ревизия схемы проверяется ДО запроса: база чужой ревизии не
+            # читается вовсе, и ответ велит пересобрать её вместо того чтобы
+            # упасть ошибкой схемы на отсутствующей таблице или колонке
+            for key in ('db', 'db_left', 'db_right', 'extension_db', 'base_db'):
+                if key not in props:
+                    continue
+                alias = server._alias(args.get(key))
+                note = server.outdated(alias)
+                if note:
+                    return (_db_header(server, alias) + '\n' + note) if has_db \
+                        else f'{alias}: {note}'
         result = call_with_retry(self.fn, server, **args)
 
         # Если у инструмента есть параметр db — добавляем заголовок с идентификатором базы
-        if 'db' in self.schema.get('properties', {}):
+        if has_db:
             alias = server._alias(args.get('db'))  # разрешает None → активная база
             return _db_header(server, alias) + '\n' + result
 

@@ -191,6 +191,19 @@ def replace_server_dbs(server, paths):
     return opened, errors
 
 
+def schema_tail(server, alias):
+    """' — схема 5 — устарела (сервер ждёт 6)' для базы чужой ревизии, иначе ''.
+
+    Сервер читает базы только своей ревизии схемы (writer.SCHEMA_VERSION в
+    PRAGMA user_version), поэтому устаревшую видно до того, как её выбрали:
+    запросы к ней отвечают просьбой пересобрать.
+    """
+    if not server.outdated(alias):
+        return ''
+    from .mcp_server import schema_mark
+    return ' — ' + schema_mark(server.dbs[alias]['schema'])
+
+
 def first_db(dbs, groups=()):
     """База, которая станет активной при таком запуске.
 
@@ -881,7 +894,8 @@ class Tui:
                     input('Нажмите Enter…')
                     continue
                 for i, a in enumerate(aliases, 1):
-                    print(f'  {i}. {a}' + (' *' if a == server.active else ''))
+                    print(f'  {i}. {a}' + (' *' if a == server.active else '')
+                          + schema_tail(server, a))
                 pick = _ask('Номер базы, которую сделать активной')
                 if pick.isdigit() and 1 <= int(pick) <= len(aliases):
                     server.active = aliases[int(pick) - 1]
@@ -942,7 +956,7 @@ class Tui:
                 print('Базы:')
                 for i, a in enumerate(aliases, 1):
                     in_group = '✓' if a in server.groups[group_name] else ' '
-                    print(f'  {in_group} {i}. {a}')
+                    print(f'  {in_group} {i}. {a}' + schema_tail(server, a))
                 pick = _ask('Номер базы для добавления в группу')
                 if pick.isdigit() and 1 <= int(pick) <= len(aliases):
                     alias = aliases[int(pick) - 1]

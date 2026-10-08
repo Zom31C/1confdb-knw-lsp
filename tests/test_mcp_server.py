@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import confdb.mcp_server as mcp_server  # noqa: E402
-from confdb.db.writer import write_db  # noqa: E402
+from confdb.db.writer import SCHEMA_VERSION, write_db  # noqa: E402
 from confdb.mcp_server import (McpServer, collect_groups,  # noqa: E402
                                parse_group_spec, resolve_db, resolve_groups,
                                start_http_server)
@@ -35,6 +35,14 @@ def _call(server, tool, **args):
     resp = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                           'params': {'name': tool, 'arguments': args}})
     return resp['result']
+
+
+def _stamp(db, revision):
+    """Перезаписывает ревизию схемы базы: writer штампует её при создании."""
+    conn = sqlite3.connect(db)
+    conn.execute(f'PRAGMA user_version={int(revision)}')
+    conn.commit()
+    conn.close()
 
 
 def test_initialize_has_primer(tmp_path_factory):
@@ -205,43 +213,35 @@ def test_object_card_predefined_accounts(tmp_path_factory):
     assert '  001 ПредЗначение — Предопределенное значение' in card_cat
 
 
-def test_object_card_predefined_on_a_base_without_the_tree(tmp_path_factory):
-    """База до 2026-10-02: нет predefined.parent_ord/uuid и predefined_subconto.
+def test_outdated_base_is_asked_to_rebuild(tmp_path_factory):
+    """База чужой ревизии схемы не читается вовсе: ответ велит пересобрать её.
 
-    Паспорт печатает плоский список элементов и называет причину, а не падает
-    ошибкой схемы; корневой узел элементом не считается и там.
+    writer штампует ревизию в PRAGMA user_version, сервер отвечает только на
+    базы своей ревизии — вместо ошибки схемы на отсутствующей колонке посреди
+    запроса (решение пользователя 2026-10-08).
     """
     dump = str(tmp_path_factory.mktemp('dump'))
     make_dump(dump)
-    make_chart_dump(dump)
     db = str(tmp_path_factory.mktemp('db') / 'old.sqlite')
     write_db(dump, db, source_file='old.cf')
-    conn = sqlite3.connect(db)
-    conn.execute('DROP INDEX ix_predefined_uuid')
-    conn.execute('DROP TABLE predefined_subconto')
-    conn.execute('ALTER TABLE predefined DROP COLUMN parent_ord')
-    conn.execute('ALTER TABLE predefined DROP COLUMN uuid')
-    conn.commit()
-    conn.close()
+    _stamp(db, SCHEMA_VERSION - 1)
     server = McpServer(db)
 
-    card = _call(server, 'object_card',
-                 path='ПланСчетов.ПланСчетов1')['content'][0]['text']
-    assert 'Предопределённые счета (3):' in card
-    # порядок обхода в глубину остался, а вложенность не видна
-    assert ('\n  01 ОсновныеСредства — Основные средства\n'
-            '  01.01 ОСвОрганизации — Основные средства в организации\n'
-            '  41 Товары\n') in card
-    assert '\n  Счета\n' not in card          # корневой узел — не счёт
-    assert 'субконто:' not in card            # видов субконто в старой базе нет
-    assert 'иерархия элементов и виды субконто не сохранены' in card
-    assert '2026-10-02' in card and '--force' in card
+    for tool, args in (('role_rights', {'role': 'ТестоваяРоль'}),
+                       ('object_rights', {'path': 'Справочник.Справочник1'}),
+                       ('object_card', {'path': 'Справочник.Справочник1'}),
+                       ('sql', {'query': 'SELECT COUNT(*) FROM role_rights_state'}),
+                       ('configuration_info', {})):
+        text = _text(server, tool, **args)
+        assert 'база устарела' in text and '--force' in text, text
+        assert 'no such' not in text and 'DB_SCHEMA' not in text, text
 
-    card_cat = _call(server, 'object_card',
-                     path='Справочник.Справочник1')['content'][0]['text']
-    assert 'Предопределённые элементы (1):' in card_cat
-    assert '  001 ПредЗначение — Предопределенное значение' in card_cat
-    assert '\n  Элементы\n' not in card_cat
+    # управление базами работает и вместо паспорта конфигурации называет ревизию
+    listed = _text(server, 'db_list')
+    assert f'схема {SCHEMA_VERSION - 1} — устарела' in listed
+    assert f'сервер ждёт {SCHEMA_VERSION}' in listed
+    assert 'configuration_info — подробно' not in listed
+    assert 'база устарела' in listed
     server.close_db()
 
 
@@ -1843,22 +1843,60 @@ def test_object_rights_lists_roles_of_object_and_its_fields(tmp_path_factory):
     server.close_db()
 
 
-def test_rights_tools_on_a_base_without_rights_tables(tmp_path_factory):
-    """База до 2026-10-07: внятный ответ, а не ошибка схемы."""
+def test_unstamped_and_newer_bases_are_refused_too(tmp_path_factory):
+    """База без штампа ревизии и база более нового извлекателя — разные отказы.
+
+    Базы, собранные до появления штампа (2026-10-08), имеют user_version=0:
+    их ревизию сервер не знает и говорит об этом, вместо того чтобы показать
+    пустые права или упасть на отсутствующей таблице.
+    """
     dump = str(tmp_path_factory.mktemp('dump'))
     make_dump(dump)
-    db = str(tmp_path_factory.mktemp('db') / 'old.sqlite')
-    write_db(dump, db, source_file='old.cf')
-    conn = sqlite3.connect(db)
-    conn.execute('DROP TABLE role_right')
-    conn.execute('DROP TABLE role_rights_state')
-    conn.commit()
-    conn.close()
+    db = str(tmp_path_factory.mktemp('db') / 'nostamp.sqlite')
+    write_db(dump, db, source_file='nostamp.cf')
+    _stamp(db, 0)
     server = McpServer(db)
-    assert 'в базе нет прав ролей' in _text(server, 'role_rights',
-                                            role='ТестоваяРоль')
-    assert 'в базе нет прав ролей' in _text(server, 'object_rights',
-                                            path='Catalog/Справочник1')
+    text = _text(server, 'sql',
+                 query='SELECT COUNT(*) FROM role_rights_state')
+    assert 'без штампа ревизии' in text and '--force' in text, text
+    assert 'no such' not in text and 'DB_SCHEMA' not in text, text
+    server.close_db()
+
+    newer = str(tmp_path_factory.mktemp('db') / 'newer.sqlite')
+    write_db(dump, newer, source_file='newer.cf')
+    _stamp(newer, SCHEMA_VERSION + 1)
+    server = McpServer(newer)
+    text = _text(server, 'find_objects', mask='')
+    assert 'более новым извлекателем' in text, text
+    assert 'обновите 1confdb-knw' in text
+    server.close_db()
+
+
+def test_fanout_sections_an_outdated_base(tmp_path_factory):
+    """Групповой вызов: устаревшая база даёт свою секцию, а не роняет ответ.
+
+    Замечание аудита 2026-10-08: sql(group=…) к role_rights_state возвращал
+    «ошибка [DB_SCHEMA]: no such table» ЦЕЛИКОМ, хотя основная база группы
+    таблицу имела — исключение одной базы уносило секции остальных.
+    """
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    _stamp(ext_db, SCHEMA_VERSION - 1)
+    server = McpServer([main_db, ext_db])
+    _call(server, 'group_create', name='профиль')
+    _call(server, 'group_add_db', group='профиль', db='основная')
+    _call(server, 'group_add_db', group='профиль', db='расширение')
+
+    text = _text(server, 'sql', group='профиль',
+                 query='SELECT COUNT(*) FROM role_rights_state')
+    assert 'no such table' not in text and 'DB_SCHEMA' not in text, text
+    main_part, ext_part = text.split('расширение', 1)
+    assert 'база устарела' not in main_part      # вторая база отвечает штатно
+    assert 'база устарела' in ext_part and '--force' in ext_part
+
+    star = _text(server, 'find_objects', db='*', mask='Справочник')
+    main_part, ext_part = star.split('расширение', 1)
+    assert 'Справочник.Справочник1' in main_part
+    assert 'база устарела' in ext_part
     server.close_db()
 
 

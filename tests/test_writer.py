@@ -3,7 +3,8 @@ import json
 import os
 import sqlite3
 
-from confdb.db.writer import VT_FIELDS_KEY, tabular_field_counts, write_db
+from confdb.db.writer import (SCHEMA_VERSION, VT_FIELDS_KEY, tabular_field_counts,
+                              write_db)
 from confdb.header_props import (AR_DIMENSIONS, AR_RESOURCES, IR_ATTRIBUTES,
                                  IR_DIMENSIONS, IR_FORMS, IR_RESOURCES)
 
@@ -554,6 +555,9 @@ def test_write_db(tmp_path):
 
     conn = sqlite3.connect(db_path)
     q = conn.execute
+
+    # ревизия схемы штампуется в базу: по ней сервер отличает свою базу от устаревшей
+    assert q('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
 
     src = q('SELECT file, root_type, root_name, root_uuid FROM source').fetchone()
     assert src == ('test.cf', 'Configuration', 'ТестКонф', ROOT_UUID)
