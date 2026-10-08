@@ -205,6 +205,46 @@ def test_object_card_predefined_accounts(tmp_path_factory):
     assert '  001 ПредЗначение — Предопределенное значение' in card_cat
 
 
+def test_object_card_predefined_on_a_base_without_the_tree(tmp_path_factory):
+    """База до 2026-10-02: нет predefined.parent_ord/uuid и predefined_subconto.
+
+    Паспорт печатает плоский список элементов и называет причину, а не падает
+    ошибкой схемы; корневой узел элементом не считается и там.
+    """
+    dump = str(tmp_path_factory.mktemp('dump'))
+    make_dump(dump)
+    make_chart_dump(dump)
+    db = str(tmp_path_factory.mktemp('db') / 'old.sqlite')
+    write_db(dump, db, source_file='old.cf')
+    conn = sqlite3.connect(db)
+    conn.execute('DROP INDEX ix_predefined_uuid')
+    conn.execute('DROP TABLE predefined_subconto')
+    conn.execute('ALTER TABLE predefined DROP COLUMN parent_ord')
+    conn.execute('ALTER TABLE predefined DROP COLUMN uuid')
+    conn.commit()
+    conn.close()
+    server = McpServer(db)
+
+    card = _call(server, 'object_card',
+                 path='ПланСчетов.ПланСчетов1')['content'][0]['text']
+    assert 'Предопределённые счета (3):' in card
+    # порядок обхода в глубину остался, а вложенность не видна
+    assert ('\n  01 ОсновныеСредства — Основные средства\n'
+            '  01.01 ОСвОрганизации — Основные средства в организации\n'
+            '  41 Товары\n') in card
+    assert '\n  Счета\n' not in card          # корневой узел — не счёт
+    assert 'субконто:' not in card            # видов субконто в старой базе нет
+    assert 'иерархия элементов и виды субконто не сохранены' in card
+    assert '2026-10-02' in card and '--force' in card
+
+    card_cat = _call(server, 'object_card',
+                     path='Справочник.Справочник1')['content'][0]['text']
+    assert 'Предопределённые элементы (1):' in card_cat
+    assert '  001 ПредЗначение — Предопределенное значение' in card_cat
+    assert '\n  Элементы\n' not in card_cat
+    server.close_db()
+
+
 def test_object_card_sees_unextracted_tabular_fields(tmp_path_factory):
     # секция объявляет поля, но в базе их нет: паспорт называет это пробелом
     # извлечения и не выдаёт за пустую секцию конфигурации

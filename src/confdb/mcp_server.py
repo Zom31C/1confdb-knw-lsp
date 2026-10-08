@@ -212,13 +212,53 @@ def _exchange_plan_lines(uuids, known):
     return [f'Состав плана обмена ({total}): ' + (text or 'пуст')]
 
 
-def _predefined_lines(q, oid, rows, obj_type, limit=60):
+NO_PREDEFINED_TREE = ('иерархия элементов и виды субконто не сохранены: база'
+                      ' собрана раньше, чем появились predefined.parent_ord/uuid'
+                      ' и predefined_subconto (2026-10-02) — пересобрать:'
+                      ' confdb extract <файл> --db <база> --force')
+
+# имена корневого узла дерева предопределённых элементов: сам он элементом не
+# является, а отличавшего его parent_ord в базах до 2026-10-02 нет
+PREDEFINED_ROOTS = ('Счета', 'Характеристики', 'Элементы')
+
+
+def _predefined_columns(conn):
+    """Колонки таблицы `predefined`: пустой набор = таблицы в базе нет."""
+    return {row[1] for row in conn.execute('PRAGMA table_info(predefined)')}
+
+
+def _predefined_label(name, code, display):
+    """'01 Товары — Товары': имя элемента с кодом и представлением."""
+    code = (code or '').strip()
+    label = name if not display or display == name else f'{name} — {display}'
+    return f'{code} {label}' if code else label
+
+
+def _predefined_lines(q, oid, rows, obj_type, limit=60, tree=True):
     """Дерево предопределённых элементов с видами субконто счёта.
 
     rows — (ord, parent_ord, name, code, display) в порядке обхода в глубину.
     Корневой узел («Счета», «Элементы») элементом не является: в паспорт он не
     печатается, но остаётся в таблице строкой с parent_ord IS NULL.
+
+    tree=False — база собрана до 2026-10-02: в ней нет ни parent_ord, ни
+    таблицы predefined_subconto, поэтому rows — (ord, name, code, display),
+    элементы печатаются плоским списком и помечаются как неполные. Корневой
+    узел там узнаётся по имени и нулевому ord: отличавшего его parent_ord в
+    старой схеме нет, а в части объектов корень и вовсе не сохранён.
     """
+    noun = 'счета' if obj_type == 'ChartOfAccounts' else 'элементы'
+    if not tree:
+        elements = [row for row in rows
+                    if not (row[0] == 0 and row[1] in PREDEFINED_ROOTS)]
+        lines = [f'Предопределённые {noun} ({len(elements)}):']
+        lines.extend('  ' + _predefined_label(*row[1:])
+                     for row in elements[:limit])
+        if len(elements) > limit:
+            lines.append(f'  … и ещё {len(elements) - limit}'
+                         ' (таблица predefined)')
+        lines.append('  ' + NO_PREDEFINED_TREE)
+        return lines
     subconto = {}
     for owner, kind, flags in q(
             "SELECT p.ord, COALESCE(NULLIF(k.display, ''), k.name, s.uuid), s.flags"
@@ -231,7 +271,6 @@ def _predefined_lines(q, oid, rows, obj_type, limit=60):
     for ord_no, parent, name, code, display in rows:
         children.setdefault(parent, []).append((ord_no, name, code, display))
     total = sum(1 for row in rows if row[1] is not None)
-    noun = 'счета' if obj_type == 'ChartOfAccounts' else 'элементы'
     lines = [f'Предопределённые {noun} ({total}):']
     shown = 0
 
@@ -240,9 +279,8 @@ def _predefined_lines(q, oid, rows, obj_type, limit=60):
         for ord_no, name, code, display in children.get(parent, []):
             if shown >= limit:
                 return
-            code = (code or '').strip()
-            label = name if not display or display == name else f'{name} — {display}'
-            lines.append('  ' * (depth + 1) + (f'{code} {label}' if code else label))
+            lines.append('  ' * (depth + 1)
+                         + _predefined_label(name, code, display))
             kinds = subconto.get(ord_no)
             if kinds:
                 lines.append('  ' * (depth + 2) + 'субконто: ' + '; '.join(kinds))
@@ -1017,10 +1055,17 @@ class McpServer:
                 out.append(f'Табличная часть {sec}: полей не объявлено')
             else:
                 out.append(f'Табличная часть {sec}: полей не извлечено')
-        predef = q('SELECT ord, parent_ord, name, code, display FROM predefined '
-                   'WHERE object_id=? ORDER BY ord', (oid,)).fetchall()
-        if predef:
-            out.extend(_predefined_lines(q, oid, predef, row[0]))
+        pcols = _predefined_columns(self.conn(db))
+        if pcols:
+            # в базах до 2026-10-02 нет parent_ord/uuid: паспорт печатается
+            # плоским списком вместо ошибки схемы
+            tree = 'parent_ord' in pcols
+            select = ('ord, parent_ord, name, code, display' if tree
+                      else 'ord, name, code, display')
+            predef = q(f'SELECT {select} FROM predefined '
+                       'WHERE object_id=? ORDER BY ord', (oid,)).fetchall()
+            if predef:
+                out.extend(_predefined_lines(q, oid, predef, row[0], tree=tree))
         subs = self.event_index(db)['by_source'].get(path)
         if subs:
             # платформа вызывает эти обработчики сама: в коде объекта
