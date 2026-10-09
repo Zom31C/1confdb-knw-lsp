@@ -389,7 +389,7 @@ COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object betwee
 
 REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
 
-ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. THREE UUID SPACES — never merge them into one dictionary: (1) right_uuid is the PLATFORM RIGHT KIND (one of 66 across the entire 1C platform, e.g. '287b74b8…' = 'Чтение' — but the name is NOT confirmed, only the uuid; printed as 'право 287b74b8=1'); (2) target_uuid is the TARGET OBJECT in this configuration (the object/attribute/tabular section the right applies to; printed as a Russian path like 'Справочник.Номенклатура' or 'цель uuid …' when unresolved); (3) role uuid (role_id in role_right) is the ROLE ITSELF as a metadata object (the row in meta_object where type='Role'). The configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed. FIVE STATES of a right record — never collapse them: (1) extracted and interpreted — a row in role_right with a resolved target and a known value; (2) extracted partially — the file was read, but the target uuid did not resolve (shown as 'цель не распознана' with a reason: marker de29c81d / dedup fields / subitem without table); (3) data present but meaning unconfirmed — right uuid and value stored, but the platform dictionary of 66 right kinds is NOT filled, so names shown as uuid with caveat; (4) data unavailable — parsed=0 in role_rights_state, file could not be read (error in role_rights_state.error); (5) no explicit record — sparse storage, absence means NOT SET. NEVER conclude 'access denied' from absence: the role may carry the right on a different target, or inherit from another role, or the file may be unreadable.
+ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. THREE UUID SPACES — never merge them into one dictionary: (1) right_uuid is the PLATFORM RIGHT KIND (one of 66 across the entire 1C platform, e.g. '287b74b8…' = 'Чтение' — but the name is NOT confirmed, only the uuid; printed as 'право 287b74b8=1'); (2) target_uuid is the TARGET OBJECT in this configuration (the object/attribute/tabular section the right applies to; printed as a Russian path like 'Справочник.Номенклатура' or 'цель uuid …' when unresolved); (3) role uuid (role_id in role_right) is the ROLE ITSELF as a metadata object (the row in meta_object where type='Role'). The configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed. FIVE STATES of a right record — never collapse them: (1) extracted and interpreted — a row in role_right with a resolved target and a known value; (2) extracted partially — the file was read, but the target uuid did not resolve (shown as 'цель не распознана' with a reason: marker de29c81d / dedup fields / subitem without table); (3) data present but meaning unconfirmed — right uuid and value stored, but the platform dictionary of 66 right kinds is NOT filled, so names shown as uuid with caveat; (4) data unavailable — parsed=0 in role_rights_state, file could not be read (error in role_rights_state.error); (5) no explicit record — sparse storage, absence means NOT SET. NEVER conclude 'access denied' from absence: the role may carry the right on a different target, or inherit from another role, or the file may be unreadable. LONG TEXTS: RLS texts are truncated to 600 chars by default; pass full=True to role_rights/object_rights to get full RLS texts and (for object_rights) lift the 12-targets-per-role cap — the short answer names how many are truncated/hidden and says 'передайте full=True для полного текста'.
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
@@ -493,14 +493,17 @@ def _target_label(obj_path, attr_name, attr_tabular, tab_name, target_uuid,
     return f'{label} (флаги цели {flags})' if flags else label
 
 
-def _rls_lines(rows):
-    """Тексты ограничений доступа (RLS) из записей права — по строке на право."""
+def _rls_lines(rows, full=False):
+    """Тексты ограничений доступа (RLS) из записей права — по строке на право.
+
+    full=True — не обрезать длинные тексты (для инструмента с параметром full).
+    """
     out = []
     for right, _value, rls in rows:
         if not rls:
             continue
         text = ' '.join(str(rls).split())
-        if len(text) > RLS_TEXT_LIMIT:
+        if not full and len(text) > RLS_TEXT_LIMIT:
             text = text[:RLS_TEXT_LIMIT] + '… (обрезано)'
         out.append(f'    RLS для права {right[:RIGHT_UUID_PREFIX]}: {text}')
     return out
@@ -1427,13 +1430,14 @@ class McpServer:
             params).fetchall()
         return {tuple(row) for row in rows}
 
-    def role_rights(self, role, limit=50, offset=0, db=None):
+    def role_rights(self, role, limit=50, offset=0, db=None, full=False):
         """Явные права роли: строка на цель (объект, его реквизит/поле или ТЧ).
 
         Хранятся только ЯВНЫЕ записи, поэтому цели нет в списке — значит право
         на неё ролью не задано, а не запрещено. `parsed=0` — файл прав не
         прочитан: ответ обязан сказать «данные недоступны», а не показать пустой
         список, который читается как «роли ничего не разрешено».
+        full=True — не обрезать RLS-тексты (по умолчанию обрезаются до 600 симв.).
         """
         conn = self.conn(db)
         path = self._role_path(role, db)
@@ -1516,7 +1520,7 @@ class McpServer:
                 flags if (target_uuid, sub_index, collection_uuid) in dup
                 else None)
             out.append(f'{label} — записей {count}: ' + _right_labels(rights))
-            out.extend(_rls_lines(rights))
+            out.extend(_rls_lines(rights, full=full))
         t_total, t_resolved, t_de29, t_sub = stats
         t_unresolved = t_total - (t_resolved or 0)
         rls_total, rls_trunc = rls_stats
@@ -1529,6 +1533,8 @@ class McpServer:
         tail += f'; RLS: всего {rls_total or 0}'
         if rls_trunc:
             tail += f', обрезано {rls_trunc}'
+            if not full:
+                tail += ' (передайте full=True для полного текста)'
         tail += f'; показано {offset + 1}–{offset + len(rows)}'
         if offset + len(rows) < t_total:
             tail += (f'; есть ещё {t_total - offset - len(rows)}'
@@ -1538,7 +1544,7 @@ class McpServer:
         out.append(tail)
         return '\n'.join(out)
 
-    def object_rights(self, path, role=None, limit=50, offset=0, db=None):
+    def object_rights(self, path, role=None, limit=50, offset=0, db=None, full=False):
         """Явные права ролей на объект, его реквизиты/поля ТЧ и табличные части.
 
         У права на подобъект `target_object_id` — объект-владелец, поэтому одно
@@ -1546,6 +1552,7 @@ class McpServer:
         справочником» видно одним запросом. Роли с `parsed=0` в список не
         попадают (их файл прав не прочитан) — ответ обязан назвать их число,
         иначе пустой список читается как «доступ запрещён всем».
+        full=True — не обрезать RLS-тексты и не ограничивать число целей на роль.
         """
         conn = self.conn(db)
         path = self.resolve_path(path, db)
@@ -1599,7 +1606,7 @@ class McpServer:
                 by_role.setdefault(row[0], []).append(row[1:])
         dup = self._flag_ambiguous(db, 'target_object_id=?', [oid])
         out.append(RIGHTS_NOTE)
-        cap = None if only_role else TARGETS_PER_ROLE
+        cap = None if (only_role or full) else TARGETS_PER_ROLE
         for rid, rpath in role_rows:
             targets = []
             index = {}
@@ -1624,7 +1631,7 @@ class McpServer:
                 line += f'; … и ещё {len(targets) - cap} целей'
             out.append(line)
             for _label, rights in shown:
-                out.extend(_rls_lines(rights))
+                out.extend(_rls_lines(rights, full=full))
         bad = q('SELECT COUNT(*) FROM role_rights_state WHERE parsed=0').fetchone()[0]
         if bad:
             roles = q("SELECT COUNT(*) FROM meta_object WHERE type='Role'"
@@ -2714,6 +2721,7 @@ def _schema(props, required=()):
 
 _STR = {'type': 'string'}
 _INT = {'type': 'integer'}
+_BOOL = {'type': 'boolean'}
 _DB = {'type': 'string',
        'description': 'Alias of the knowledge base to query INSTEAD of the '
                       'active one (see db_list). Omit to use the active base. '
@@ -2793,7 +2801,7 @@ TOOLS = [
          'Says "данные недоступны" (with the reason) when the rights file could '
          'not be read, which is NOT the same as an empty list. Pages targets.',
          _schema({'role': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
-                  'db': _DB, 'group': _GROUP}, ('role',)),
+                  'db': _DB, 'group': _GROUP, 'full': _BOOL}, ('role',)),
          McpServer.role_rights),
     Tool('object_rights',
          'Which roles carry explicit rights on an OBJECT — its attributes, '
@@ -2805,7 +2813,7 @@ TOOLS = [
          'list for that reason, not because they deny access. Use it for access '
          'analysis ("who can work with this catalog"). Pages roles.',
          _schema({'path': _STR, 'role': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
-                  'db': _DB, 'group': _GROUP}, ('path',)),
+                  'db': _DB, 'group': _GROUP, 'full': _BOOL}, ('path',)),
          McpServer.object_rights),
     Tool('module_outline',
          'Table of contents of a 1C module: signatures, comments, #Если '
