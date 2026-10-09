@@ -379,6 +379,7 @@ DATABASE FILE: the SQLite file is internal to the server. Do NOT search for it, 
 MULTIPLE DATABASES: the server can hold several knowledge bases at once — typically the MAIN configuration plus extensions/data processors (.cfe/.epf extracted into their own .db files). Each open base has an alias. All tools query the ACTIVE base; to query a specific base without switching, pass its alias as the db parameter (e.g. find_objects(mask=…, db='расш_интеграция')). Management tools: db_list (what is open, which is active), db_open (open another base file while the server runs — the path comes from the user), db_use (switch the active base), db_close. An extension usually adds/overrides objects of the main configuration — if something is not found in one base, check the other. Special db value '*': run a tool on every open base at once (the answer is sectioned per base) — one call to compare the main configuration with all extensions.
 
 CONFIGURATION GROUPS: a group bundles related databases (main configuration + extensions + data processors) as a single unit. SEVERAL groups can be open at the same time — typically two different configurations, or two releases of the same one; group_list shows them all and marks the active one. To query ONE group separately, pass group=<name> to any data tool: it runs on every database of that group and sections the answer per database. group='*' runs the tool on every group at once, keeping the groups apart in the answer. WITHOUT the group parameter only the ACTIVE base is queried — NOT the whole active group — so when several groups are open always name the group you mean; db='*' ignores the division and mixes every open base, so prefer group='*' for a per-group picture. Priority: explicit group > explicit db > the active base. group_use switches the active group and makes its first base the active one. Management tools: group_create (create an empty group), group_add_db (add an open database to a group), group_remove_db (remove a database from a group — the database itself stays open), group_list (all groups with their databases), group_use (switch the active group), group_close (delete a group — databases are NOT closed). compare_object and extension_diff take explicit aliases (db_left/db_right, extension_db/base_db) and know nothing about groups — pick the aliases with db_list/group_list.
+A base that cannot answer does NOT sink a fan-out call (group=<name>, group='*', db='*'): its own section carries 'ошибка [КАТЕГОРИЯ]: …' — DB_LOCKED is transient, the same call may pass on a retry — while the other bases answer normally, and the answer ends with 'баз с ошибкой N из M: <aliases>' so a partial answer is never read as a complete one. The call is marked isError only when EVERY base refused; then the per-base sections are still there to show what broke where.
 
 DATABASE IDENTIFIER: every tool response includes a header line identifying the source database and, when the base belongs to a group, the group: '=== группа <имя> / база <алиас> (<путь>) ===' (a base in several groups prints all of them: '=== группы A, B / база …'). Read it before trusting a result: it says which configuration the answer came from. This lets you compare configurations (e.g. standard vs customized) or understand which base contains a method (main configuration vs extension). Use db='*' to query all bases at once and compare results side-by-side.
 
@@ -914,6 +915,12 @@ class McpServer:
                 text = tool.run(self, **args)
                 return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
                     'content': [{'type': 'text', 'text': text}]}}
+            except FanoutError as err:
+                # групповой вызов, в котором отказали все базы: секции видны,
+                # но это отказ вызова — частичного ответа здесь нет
+                return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
+                    'content': [{'type': 'text', 'text': str(err)}],
+                    'isError': True}}
             except Exception as err:  # noqa: BLE001 — ошибка инструмента, не сервера
                 return {'jsonrpc': '2.0', 'id': msg_id, 'result': {
                     'content': [{'type': 'text', 'text': error_text(err)}],
@@ -2401,6 +2408,58 @@ def _db_header(server, alias, groups=None):
     return f'=== {prefix}база {alias} ({server.dbs[alias]["path"]}) ==='
 
 
+def _failure_note(err):
+    """Отметка об отказе базы внутри её секции: категория + что делать.
+
+    Занятая база помечается транзитной: тот же запрос может пройти повторно.
+    """
+    note = error_text(err)
+    if isinstance(err, sqlite3.OperationalError) and LOCKED_RE.search(str(err)):
+        note += ' — база была занята, запрос можно повторить'
+    return note
+
+
+class FanoutError(Exception):
+    """Групповой вызов, в котором отказали ВСЕ базы: текст секций + isError."""
+
+
+def _fanout_call(server, fn, alias, call_args, groups, state):
+    """Секция одной базы группового вызова; отказ базы не прерывает обход.
+
+    `state` — alias -> «база отказала»: по нему итог считает отказавшие базы.
+    База может входить в несколько групп и тогда вызывается не один раз —
+    состояние записывается одно, и отказ перевешивает удачный ответ.
+    """
+    try:
+        part = server.outdated(alias)
+        if part is None:
+            part = call_with_retry(fn, server, **call_args)
+        failed = False
+    except Exception as err:  # noqa: BLE001 — отказ базы, не сервера
+        part = _failure_note(err)
+        failed = True
+    state[alias] = state.get(alias, False) or failed
+    return _db_header(server, alias, groups) + '\n' + part
+
+
+def _fanout_answer(parts, state):
+    """Секции группового вызова + итоговая строка о числе отказавших баз.
+
+    Частичный ответ остаётся обычным текстом: помеченный isError, клиент
+    выбросил бы его вместе с годными секциями остальных баз. Строка «баз с
+    ошибкой N из M» не даёт принять частичный ответ за полный, а когда
+    отказали все базы, ответ всё-таки становится ошибкой вызова.
+    """
+    failed = [alias for alias, bad in state.items() if bad]
+    if not failed:
+        return '\n\n'.join(parts)
+    text = '\n\n'.join(parts + [
+        f'баз с ошибкой {len(failed)} из {len(state)}: ' + ', '.join(failed)])
+    if len(failed) == len(state):
+        raise FanoutError(text)
+    return text
+
+
 class Tool:
     def __init__(self, name, description, schema, fn):
         self.name = name
@@ -2429,6 +2488,7 @@ class Tool:
             if not server.groups:
                 raise ValueError('нет созданных групп — создайте через group_create')
             parts = []
+            state = {}
             for group_name, db_aliases in server.groups.items():
                 group_parts = []
                 for alias in db_aliases:
@@ -2436,16 +2496,13 @@ class Tool:
                         # Убираем group из args, т.к. методы не принимают этот параметр
                         call_args = {k: v for k, v in args.items() if k != 'group'}
                         call_args['db'] = alias
-                        part = server.outdated(alias)
-                        if part is None:
-                            part = call_with_retry(self.fn, server, **call_args)
-                        group_parts.append(
-                            _db_header(server, alias, []) + '\n' + part)
+                        group_parts.append(_fanout_call(
+                            server, self.fn, alias, call_args, [], state))
                 if group_parts:
                     parts.append(f'=== группа {group_name} ===\n' + '\n\n'.join(group_parts))
             if not parts:
                 raise ValueError('группы не содержат открытых баз')
-            return '\n\n'.join(parts)
+            return _fanout_answer(parts, state)
 
         # Конкретная группа — fan-out по её базам
         if group and 'group' in self.schema.get('properties', {}) and not is_group_management:
@@ -2453,32 +2510,28 @@ class Tool:
             if not db_aliases:
                 raise ValueError(f'группа {group} пуста — добавьте базы через group_add_db')
             parts = []
+            state = {}
             for alias in db_aliases:
                 if alias in server.dbs:
                     # Убираем group из args, т.к. методы не принимают этот параметр
                     call_args = {k: v for k, v in args.items() if k != 'group'}
                     call_args['db'] = alias
-                    part = server.outdated(alias)
-                    if part is None:
-                        part = call_with_retry(self.fn, server, **call_args)
-                    parts.append(
-                        _db_header(server, alias, [group]) + '\n' + part)
+                    parts.append(_fanout_call(server, self.fn, alias, call_args,
+                                              [group], state))
             if not parts:
                 raise ValueError(f'группа {group} не содержит открытых баз')
-            return '\n\n'.join(parts)
+            return _fanout_answer(parts, state)
 
         # db='*' — выполнить инструмент по всем открытым базам сразу
         if db == '*' and 'db' in self.schema.get('properties', {}):
             parts = []
+            state = {}
             for alias in server.dbs:
-                part = server.outdated(alias)
-                if part is None:
-                    part = call_with_retry(self.fn, server,
-                                           **dict(args, db=alias))
-                parts.append(_db_header(server, alias) + '\n' + part)
+                parts.append(_fanout_call(server, self.fn, alias,
+                                          dict(args, db=alias), None, state))
             if not parts:
                 raise ValueError('нет открытых баз — укажите путь в db_open')
-            return '\n\n'.join(parts)
+            return _fanout_answer(parts, state)
 
         # Обычный запрос к одной базе
         props = self.schema.get('properties', {})

@@ -1901,6 +1901,115 @@ def test_fanout_sections_an_outdated_base(tmp_path_factory):
     server.close_db()
 
 
+def _drop_table(db, table):
+    """Убирает таблицу из базы, не трогая штамп ревизии схемы.
+
+    Так получается база, которая проходит гейт ревизий, но отказывает на
+    запросе: отказ одной базы в групповом вызове обязан остаться её секцией.
+    """
+    conn = sqlite3.connect(db)
+    conn.execute(f'DROP TABLE {table}')
+    conn.commit()
+    conn.close()
+
+
+_ROLE_COUNT = 'SELECT COUNT(*) FROM role_rights_state'
+
+
+def _group_with_a_broken_base(tmp_path_factory):
+    """Группа «профиль» из двух баз: у «расширения» нет role_rights_state."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    _drop_table(ext_db, 'role_rights_state')
+    return _profile_group(main_db, ext_db)
+
+
+def _profile_group(main_db, ext_db):
+    server = McpServer([main_db, ext_db])
+    _call(server, 'group_create', name='профиль')
+    _call(server, 'group_add_db', group='профиль', db='основная')
+    _call(server, 'group_add_db', group='профиль', db='расширение')
+    return server
+
+
+def _assert_partial(text, result):
+    """Общее для ветвей fan-out: частичный ответ — не ошибка, отказ в секции."""
+    assert not result.get('isError'), text       # частичный ответ — не отказ
+    main_part, ext_part = text.split('расширение', 1)
+    assert 'COUNT(*)' in main_part               # основная база ответила
+    assert 'no such table' not in main_part, text
+    assert 'ошибка [DB_SCHEMA]' in ext_part and 'no such table' in ext_part
+    assert 'баз с ошибкой 1 из 2: расширение' in text
+
+
+def test_fanout_sections_a_failing_base(tmp_path_factory):
+    """Отказ одной базы не уносит секции остальных: групповой вызов частичный.
+
+    Замечание аудита 2026-10-08: исключение первой же базы выбрасывалось из
+    Tool.run наружу, и клиент получал isError вместо ответа — годные секции
+    других баз пропадали вместе с ним.
+    """
+    server = _group_with_a_broken_base(tmp_path_factory)
+    result = _call(server, 'sql', group='профиль', query=_ROLE_COUNT)
+    _assert_partial(_get_text(result), result)
+    server.close_db()
+
+
+def test_fanout_db_star_sections_a_failing_base(tmp_path_factory):
+    """db='*': отказ базы тоже остаётся её секцией (ветвь без групп)."""
+    server = _group_with_a_broken_base(tmp_path_factory)
+    result = _call(server, 'sql', db='*', query=_ROLE_COUNT)
+    _assert_partial(_get_text(result), result)
+    server.close_db()
+
+
+def test_fanout_group_star_sections_a_failing_base(tmp_path_factory):
+    """group='*': секции идут под заголовком группы, отказ — в своей секции."""
+    server = _group_with_a_broken_base(tmp_path_factory)
+    result = _call(server, 'sql', group='*', query=_ROLE_COUNT)
+    text = _get_text(result)
+    _assert_partial(text, result)
+    assert '=== группа профиль ===' in text
+    server.close_db()
+
+
+def test_fanout_all_bases_failed_is_an_error(tmp_path_factory):
+    """Отказали ВСЕ базы — это отказ вызова: isError, но секции на месте."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    for db in (main_db, ext_db):
+        _drop_table(db, 'role_rights_state')
+    server = _profile_group(main_db, ext_db)
+
+    result = _call(server, 'sql', group='профиль', query=_ROLE_COUNT)
+    text = _get_text(result)
+    assert result.get('isError'), text
+    assert 'баз с ошибкой 2 из 2: основная, расширение' in text
+    assert text.count('ошибка [DB_SCHEMA]') == 2   # видно, что сломалось в каждой
+    server.close_db()
+
+
+def test_fanout_without_failures_has_no_error_line(tmp_path_factory):
+    """Ни одна база не отказала — итоговой строки об ошибках нет вовсе."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    server = _profile_group(main_db, ext_db)
+    for args in ({'group': 'профиль'}, {'group': '*'}, {'db': '*'}):
+        result = _call(server, 'sql', query=_ROLE_COUNT, **args)
+        text = _get_text(result)
+        assert not result.get('isError'), text
+        assert 'баз с ошибкой' not in text, text
+        assert text.count('COUNT(*)') == 2, text   # обе базы ответили
+    server.close_db()
+
+
+def test_failure_note_marks_a_locked_base_as_transient():
+    """Занятая база помечена транзитной: тот же запрос может пройти повторно."""
+    locked = mcp_server._failure_note(
+        sqlite3.OperationalError('database is locked'))
+    assert '[DB_LOCKED]' in locked and 'можно повторить' in locked
+    schema = mcp_server._failure_note(
+        sqlite3.OperationalError('no such table: role_rights_state'))
+    assert '[DB_SCHEMA]' in schema and 'можно повторить' not in schema
+
+
 # -- потоки: соединения шардов FTS, общее соединение, temp._fts_hits ---------
 
 
