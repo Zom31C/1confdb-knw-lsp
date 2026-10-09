@@ -389,7 +389,7 @@ COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object betwee
 
 REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
 
-ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. A right is printed as the first 8 hex chars of its platform uuid plus the value exactly as stored (1 or -1): the configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed.
+ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. THREE UUID SPACES — never merge them into one dictionary: (1) right_uuid is the PLATFORM RIGHT KIND (one of 66 across the entire 1C platform, e.g. '287b74b8…' = 'Чтение' — but the name is NOT confirmed, only the uuid; printed as 'право 287b74b8=1'); (2) target_uuid is the TARGET OBJECT in this configuration (the object/attribute/tabular section the right applies to; printed as a Russian path like 'Справочник.Номенклатура' or 'цель uuid …' when unresolved); (3) role uuid (role_id in role_right) is the ROLE ITSELF as a metadata object (the row in meta_object where type='Role'). The configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed.
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
@@ -444,8 +444,12 @@ RIGHTS_NOTE = ('право = первые 8 знаков его uuid (имени
 
 
 def _right_labels(rows):
-    """'287b74b8=1; aa6448f2=-1' — из записей (uuid права, значение, RLS)."""
-    return '; '.join(f'{right[:RIGHT_UUID_PREFIX]}={value}'
+    """'право 287b74b8=1; право aa6448f2=-1' — из записей (uuid права, значение, RLS).
+
+    Префикс 'право' отделяет uuid вида права (platform right, 66 штук) от uuid цели
+    и uuid роли — три разных пространства, см. PRIMER ROLE RIGHTS.
+    """
+    return '; '.join(f'право {right[:RIGHT_UUID_PREFIX]}={value}'
                      for right, value, _rls in rows)
 
 
@@ -453,12 +457,13 @@ def _target_label(obj_path, attr_name, attr_tabular, tab_name, target_uuid,
                   sub_index, collection_uuid, flags=None):
     """Кем приходится цель права: объект, его реквизит/поле ТЧ или его ТЧ.
 
-    Неразрешённый uuid печатается как есть: ни объектом, ни реквизитом, ни
-    табличной частью этой базы он не является, а выдумывать сущность нельзя —
-    смысл адресации «объект + отрицательный номер внутри коллекции» и у
-    специального маркера `de29c81d-…` не подтверждён. `flags` — флаги записи
-    цели из файла роли: они добавляются только когда без них две цели
-    неотличимы, потому что их смысл тоже не подтверждён.
+    Неразрешённый uuid печатается с префиксом 'цель uuid' — чтобы отличать от
+    uuid права (вид права) и uuid роли (объект метаданных). Ни объектом, ни
+    реквизитом, ни табличной частью этой базы он не является, а выдумывать
+    сущность нельзя — смысл адресации «объект + отрицательный номер внутри
+    коллекции» и у специального маркера `de29c81d-…` не подтверждён. `flags` —
+    флаги записи цели из файла роли: они добавляются только когда без них две
+    цели неотличимы, потому что их смысл тоже не подтверждён.
     """
     if attr_name:
         base = ru_path(obj_path)
@@ -469,7 +474,7 @@ def _target_label(obj_path, attr_name, attr_tabular, tab_name, target_uuid,
     elif obj_path:
         label = ru_path(obj_path)
     else:
-        label = f'цель не распознана (uuid {target_uuid})'
+        label = f'цель не распознана (цель uuid {target_uuid})'
     if sub_index is not None:
         tail = f'подобъект №{sub_index}'
         if collection_uuid:
