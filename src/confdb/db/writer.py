@@ -17,7 +17,7 @@ import sqlite3
 import xml.sax.saxutils
 from datetime import datetime
 
-from .. import rights, xdto
+from .. import __version__, rights, xdto
 from ..bsl_parser import parse_methods
 from ..v8 import helper
 
@@ -31,9 +31,10 @@ ROOT_TYPES = ('Configuration', 'ConfigurationExtension', 'ExternalDataProcessor'
 # predefined_subconto (2026-10-02); 3 — source.file_size/file_sha256
 # (2026-10-05); 4 — role_right/role_rls_template/role_rights_state,
 # meta_attribute.uuid, meta_tabular.uuid (2026-10-07); 5 —
-# role_right.target_flags (2026-10-07); 6 — сам штамп ревизии (2026-10-08).
-# Базы ревизий 1-5 штампа не имеют: у них user_version = 0.
-SCHEMA_VERSION = 6
+# role_right.target_flags (2026-10-07); 6 — сам штамп ревизии (2026-10-08);
+# 7 — source.extractor_version (версия извлекателя, 2026-10-09).
+# Базы ревизий 1-6 штампа извлекателя не имеют.
+SCHEMA_VERSION = 7
 
 RE_UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 
@@ -748,7 +749,8 @@ CREATE TABLE source (
     root_name TEXT,
     root_uuid TEXT,
     file_size INTEGER,
-    file_sha256 TEXT
+    file_sha256 TEXT,
+    extractor_version TEXT
 );
 CREATE TABLE meta_object (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1513,10 +1515,10 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
         conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
         conn.execute('BEGIN')
         cur = conn.execute(
-            'INSERT INTO source (file, created, file_size, file_sha256) '
-            'VALUES (?, ?, ?, ?)',
+            'INSERT INTO source (file, created, file_size, file_sha256, extractor_version) '
+            'VALUES (?, ?, ?, ?, ?)',
             (source_file or '', datetime.now().isoformat(timespec='seconds'),
-             source_size, source_sha256)
+             source_size, source_sha256, __version__)
         )
         source_id = cur.lastrowid
 

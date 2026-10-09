@@ -559,6 +559,11 @@ def test_write_db(tmp_path):
     # ревизия схемы штампуется в базу: по ней сервер отличает свою базу от устаревшей
     assert q('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
 
+    # версия извлекателя пишется в source.extractor_version (ревизия 7, 2026-10-09)
+    from confdb import __version__
+    ext_ver = q('SELECT extractor_version FROM source').fetchone()[0]
+    assert ext_ver == __version__
+
     src = q('SELECT file, root_type, root_name, root_uuid FROM source').fetchone()
     assert src == ('test.cf', 'Configuration', 'ТестКонф', ROOT_UUID)
 
