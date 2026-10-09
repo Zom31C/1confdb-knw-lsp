@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 
 import pytest
@@ -1898,5 +1899,221 @@ def test_fanout_sections_an_outdated_base(tmp_path_factory):
     assert 'Справочник.Справочник1' in main_part
     assert 'база устарела' in ext_part
     server.close_db()
+
+
+# -- потоки: соединения шардов FTS, общее соединение, temp._fts_hits ---------
+
+
+def _call_ok(server, tool, **args):
+    """Текст успешного ответа: ошибка инструмента (isError) проваливает тест."""
+    result = _call(server, tool, **args)
+    text = _get_text(result)
+    assert not result.get('isError'), text
+    return text
+
+
+def _in_thread(fn):
+    """Выполняет fn() в отдельном потоке и возвращает его результат.
+
+    Исключение потока пробрасывается сюда: вызов из чужого потока обязан
+    работать так же, как из главного, а не падать или отвечать isError.
+    """
+    out = {}
+
+    def worker():
+        try:
+            out['value'] = fn()
+        except BaseException as err:  # noqa: BLE001 — ошибку забирает тест
+            out['error'] = err
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(60)
+    assert not thread.is_alive(), 'вызов в потоке не завершился'
+    if 'error' in out:
+        raise out['error']
+    return out['value']
+
+
+def _server_with_shards(tmp_path_factory):
+    """Сервер над базой с приставными шарами FTS — штатный результат extract."""
+    server = _server(tmp_path_factory)
+    assert server.dbs[server.active]['fts_shards']
+    return server
+
+
+_NEEDLE = 'Справочник.Справочник1'
+_NEEDLES = (_NEEDLE, 'ТаблицаЗначений')   # разные иглы — разные методы
+
+
+def test_text_search_survives_a_thread_switch(tmp_path_factory):
+    """Соединения шардов кэшируются в сервере — смена потока их не ломает.
+
+    Шарды открываются лениво в первом вызвавшем потоке и остаются в
+    info['fts_conn'], а HTTP-транспорт (ThreadingHTTPServer) и TUI вызывают
+    сервер из своих. Без check_same_thread=False второй поток получал
+    sqlite3.ProgrammingError «SQLite objects created in a thread…».
+    """
+    server = _server_with_shards(tmp_path_factory)
+    try:
+        main = _call_ok(server, 'find_methods', text=_NEEDLE)
+        assert 'ОбщийМодуль1' in main
+        assert server.dbs[server.active]['fts_conn']  # соединения в кэше
+        other = _in_thread(
+            lambda: _call_ok(server, 'find_methods', text=_NEEDLE))
+        assert other.splitlines() == main.splitlines()
+        # и обратно: кэш, созданный в чужом потоке, служит главному
+        assert _call_ok(server, 'find_methods',
+                        text=_NEEDLE).splitlines() == main.splitlines()
+    finally:
+        server.close_db()
+
+
+def test_parallel_text_searches_keep_their_own_hits(tmp_path_factory):
+    """temp._fts_hits одна на соединение — параллельные поиски не мешают друг другу.
+
+    Два потока одновременно ищут свои иглы и обязаны получить ровно свою
+    выдачу. Без сериализации вызовов один поиск пересоздаёт таблицу совпадений
+    под другим — замер на этой базе: 18 сбоев из 40 раундов, типичный ответ
+    «ошибка [DB_SCHEMA]: no such table: temp._fts_hits». Раундов десять, чтобы
+    снятую блокировку тест ловил почти наверняка.
+    """
+    server = _server_with_shards(tmp_path_factory)
+    try:
+        expected = {n: _call_ok(server, 'find_methods', text=n)
+                    for n in _NEEDLES}
+        assert 'Экспортная' in expected[_NEEDLE]
+        assert 'Закрытая' in expected['ТаблицаЗначений']
+        assert expected[_NEEDLE] != expected['ТаблицаЗначений']
+
+        for _round in range(10):
+            results, errors = {}, []
+            gate = threading.Barrier(len(_NEEDLES))
+
+            def search(needle):
+                try:
+                    gate.wait(30)
+                    results[needle] = _call_ok(server, 'find_methods',
+                                               text=needle)
+                except BaseException as err:  # noqa: BLE001
+                    errors.append(err)
+
+            threads = [threading.Thread(target=search, args=(n,), daemon=True)
+                       for n in _NEEDLES]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+                assert not thread.is_alive(), 'поиск в потоке не завершился'
+            assert not errors, errors
+            assert results == expected
+    finally:
+        server.close_db()
+
+
+def test_tool_calls_are_serialized(tmp_path_factory):
+    """Инвариант «один вызов инструмента за раз» — общий для stdio, HTTP и TUI.
+
+    Пока сервер занят (долгий запрос одного клиента), вызов из другого потока
+    ждёт, а не входит: соединения баз и шардов, кэш подсчёта и temp._fts_hits
+    на сервер общие. Блокировка взята напрямую, поэтому тест снимает защиту
+    детерминированно — без неё первый же вызов прошёл бы сразу.
+    """
+    server = _server(tmp_path_factory)
+    busy = threading.Event()
+
+    def long_request():
+        with server._lock:          # «долгий запрос» другого клиента
+            busy.set()
+            time.sleep(0.4)
+
+    holder = threading.Thread(target=long_request, daemon=True)
+    holder.start()
+    assert busy.wait(5), 'блокировка сервера не занята'
+
+    done = threading.Event()
+
+    def call():
+        _call_ok(server, 'find_methods', text=_NEEDLE)
+        done.set()
+
+    started = time.monotonic()
+    caller = threading.Thread(target=call, daemon=True)
+    caller.start()
+    assert not done.wait(0.1), 'вызов прошёл, хотя сервер занят другим потоком'
+    holder.join(5)
+    assert done.wait(5), 'вызов не дождался освобождения сервера'
+    assert time.monotonic() - started >= 0.3
+    caller.join(5)
+    server.close_db()
+
+
+def test_text_search_survives_switching_bases(tmp_path_factory):
+    """Кэш шардов принадлежит своей базе: db_open/db_use/db_close его не путают."""
+    main_db = _make_db(tmp_path_factory, 'основная.sqlite')
+    ext_db = _make_db(tmp_path_factory, 'расширение.sqlite')
+    server = McpServer(main_db)
+    try:
+        first = _call_ok(server, 'find_methods', text=_NEEDLE)
+        _call_ok(server, 'db_open', path=ext_db)
+        assert server.dbs['расширение']['fts_shards']
+        # поиск в неактивной базе по явному db — свои шарды
+        assert 'ОбщийМодуль1' in _call_ok(server, 'find_methods',
+                                          text=_NEEDLE, db='расширение')
+        _call_ok(server, 'db_use', alias='расширение')
+        assert 'ОбщийМодуль1' in _in_thread(
+            lambda: _call_ok(server, 'find_methods', text=_NEEDLE))
+        _call_ok(server, 'db_close', alias='расширение')
+        # первая база цела: та же выдача, что до всех переключений
+        assert _in_thread(lambda: _call_ok(
+            server, 'find_methods', text=_NEEDLE)).splitlines() \
+            == first.splitlines()
+        assert server.dbs['основная']['fts_conn']
+    finally:
+        server.close_db()
+
+
+def test_http_parallel_text_searches(tmp_path_factory):
+    """HTTP: ThreadingHTTPServer даёт поток на запрос — поиск по телам в каждом.
+
+    Два POST /mcp с разными иглами уходят одновременно; ответ каждого обязан
+    совпадать с тем, что даёт прямой вызов того же инструмента.
+    """
+    server = _server_with_shards(tmp_path_factory)
+    httpd, port = start_http_server(server, '127.0.0.1', 0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        expected = {n: _call_ok(server, 'find_methods', text=n)
+                    for n in _NEEDLES}
+        results, errors = {}, []
+        gate = threading.Barrier(len(_NEEDLES))
+
+        def post(msg_id, needle):
+            try:
+                gate.wait(30)
+                status, body = _post(port, {
+                    'jsonrpc': '2.0', 'id': msg_id, 'method': 'tools/call',
+                    'params': {'name': 'find_methods',
+                               'arguments': {'text': needle}}})
+                assert status == 200, status
+                result = json.loads(body)['result']
+                assert not result.get('isError'), result
+                results[needle] = result['content'][0]['text']
+            except BaseException as err:  # noqa: BLE001
+                errors.append(err)
+
+        threads = [threading.Thread(target=post, args=(i, n), daemon=True)
+                   for i, n in enumerate(_NEEDLES)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+            assert not thread.is_alive(), 'HTTP-запрос не завершился'
+        assert not errors, errors
+        assert results == expected
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        server.close_db()
 
 

@@ -27,6 +27,7 @@
 активная база переключается инструментом db_use.
 """
 import argparse
+import functools
 import glob
 import json
 import os
@@ -489,6 +490,22 @@ def _rls_lines(rows):
     return out
 
 
+def _synchronized(fn):
+    """Метод McpServer под общей блокировкой сервера.
+
+    Инвариант «один вызов за раз» нужен не только HTTP-транспорту: соединения
+    баз и шардов FTS общие на сервер, а поиск по телам ещё и пересоздаёт
+    temp._fts_hits основного соединения. Точки входа (handle — stdio и HTTP,
+    open_db/close_db/db_list — прямые вызовы TUI и CLI) берут одну и ту же
+    RLock, поэтому вложенные вызовы того же потока не блокируются.
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class McpServer:
     """Обработчик JSON-RPC сообщений MCP поверх баз SQLite (read-only).
 
@@ -502,6 +519,8 @@ class McpServer:
         self.active = None
         self.groups = {}   # имя_группы -> [алиас1, алиас2, ...]
         self.active_group = None
+        # сериализация вызовов: см. _synchronized
+        self._lock = threading.RLock()
         if isinstance(db_paths, str):
             db_paths = [db_paths]
         # Группы открываются первыми: активными становятся первая группа и её
@@ -521,6 +540,7 @@ class McpServer:
             alias = f'{base}_{num}'
         return alias
 
+    @_synchronized
     def open_db(self, path, alias=None, activate=True):
         """Открывает базу и возвращает её алиас.
 
@@ -599,13 +619,18 @@ class McpServer:
             self.active = alias
         return alias
 
+    @_synchronized
     def close_db(self, alias=None):
         """Закрывает базу (по умолчанию активную); возвращает её алиас."""
         alias = self._alias(alias)
         info = self.dbs.pop(alias)
         info['conn'].close()
+        # шарды закрываются под той же блокировкой, что и открываются:
+        # иначе поток, ещё держащий кэш, получил бы «Cannot operate on a
+        # closed database»
         for shard in info.get('fts_conn') or ():
             shard.close()
+        info['fts_conn'] = None
         if self.active == alias:
             self.active = next(iter(self.dbs), None)
         # База уходит и из групп: иначе повторное открытие того же файла
@@ -860,6 +885,7 @@ class McpServer:
             oid, path = row
         return path
 
+    @_synchronized
     def handle(self, msg):
         method = msg.get('method')
         msg_id = msg.get('id')
@@ -1811,17 +1837,26 @@ class McpServer:
         return '\n'.join(out)
 
     def _fts_shard_conns(self, info):
-        """Соединения приставных шардов индекса (read-only) — лениво и с кэшем."""
-        conns = info.get('fts_conn')
-        if conns is None:
-            conns = []
-            for path in info.get('fts_shards') or ():
-                shard = sqlite3.connect(
-                    'file:' + path.replace(os.sep, '/') + '?mode=ro', uri=True)
-                shard.execute('PRAGMA cache_size=-8192')
-                conns.append(shard)
-            info['fts_conn'] = conns
-        return conns
+        """Соединения приставных шардов индекса (read-only) — лениво и с кэшем.
+
+        Кэш живёт в info и переживает вызов, а вызывают сервер из разных
+        потоков (HTTP-обработчик на каждый запрос, TUI из своего), поэтому
+        соединения открываются с check_same_thread=False, как основное, и
+        ленивая инициализация идёт под блокировкой сервера: два параллельных
+        поиска не должны открыть шарды дважды и потерять одни из соединений.
+        """
+        with self._lock:
+            conns = info.get('fts_conn')
+            if conns is None:
+                conns = []
+                for path in info.get('fts_shards') or ():
+                    shard = sqlite3.connect(
+                        'file:' + path.replace(os.sep, '/') + '?mode=ro',
+                        uri=True, check_same_thread=False)
+                    shard.execute('PRAGMA cache_size=-8192')
+                    conns.append(shard)
+                info['fts_conn'] = conns
+            return conns
 
     def _fts_filter(self, info, conn, text):
         """Условие «тело содержит text» по FTS-индексу: (фрагмент SQL, параметры).
@@ -1835,6 +1870,12 @@ class McpServer:
         мульти-базовом режиме их набирается больше. Поэтому выдачи шардов
         объединяются во временной таблице основного соединения — TEMP-схема
         доступна и при mode=ro, а rowid во всех шардах это method.id.
+
+        Таблица temp._fts_hits ОДНА на соединение и пересоздаётся на каждом
+        поиске: два одновременных поиска перезаписали бы совпадения друг
+        друга. От этого защищает сериализация вызовов (_synchronized на
+        handle) — инвариант «один вызов инструмента за раз» на сервер,
+        поэтому имя таблицы не уникализируется на вызов или поток.
         """
         needle = f'"{text}"'
         table = info.get('fts')
@@ -2175,6 +2216,7 @@ class McpServer:
             bits.append(f'SHA-256 {props["source_sha256"][:16]}…')
         return props.get('name') or '?', '; '.join(bits)
 
+    @_synchronized
     def db_list(self):
         if not self.dbs:
             return 'нет открытых баз — откройте через db_open'
@@ -2767,7 +2809,14 @@ TOOLS = [
 
 
 def make_handler(server):
-    """HTTP-обработчик MCP: Streamable HTTP (POST /mcp) и legacy SSE (/sse)."""
+    """HTTP-обработчик MCP: Streamable HTTP (POST /mcp) и legacy SSE (/sse).
+
+    state['lock'] охраняет ТОЛЬКО словарь сессий — его меняют поток SSE и
+    POST /messages. Вызовы сервера сериализует McpServer.handle своей RLock:
+    блокировка общая для stdio, HTTP и прямых вызовов из TUI, поэтому второй
+    здесь не нужно (она лишь не пускала бы параллельные запросы в очередь
+    раньше, чем их встретил сервер).
+    """
     state = {'lock': threading.Lock(), 'sessions': {}}
 
     class Handler(BaseHTTPRequestHandler):
@@ -2814,7 +2863,8 @@ def make_handler(server):
             # (POST /mcp) по спецификации игнорируют неизвестные события
             sid = uuid.uuid4().hex
             events = queue.Queue()
-            state['sessions'][sid] = events
+            with state['lock']:
+                state['sessions'][sid] = events
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Cache-Control', 'no-cache')
@@ -2841,7 +2891,8 @@ def make_handler(server):
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
             finally:
-                state['sessions'].pop(sid, None)
+                with state['lock']:
+                    state['sessions'].pop(sid, None)
 
         def do_POST(self):
             path = urlparse(self.path)
@@ -2850,14 +2901,14 @@ def make_handler(server):
             msg = self._read_msg()
             if msg is None:
                 return self._send(400, {'error': 'body must be a JSON-RPC message'})
-            with state['lock']:
-                resp = server.handle(msg)
+            resp = server.handle(msg)
             if path.path == '/mcp':
                 if resp is None:
                     return self._send(202)
                 return self._send(200, resp)
             sid = parse_qs(path.query).get('session_id', [''])[0]
-            events = state['sessions'].get(sid)
+            with state['lock']:
+                events = state['sessions'].get(sid)
             if events is None:
                 return self._send(404, {'error': 'unknown session_id'})
             if resp is not None:
