@@ -366,6 +366,52 @@ def sha_line(sha256, size=None):
     return f'SHA-256 исходника: {sha256}{tail}'
 
 
+def _db_meta(server, db=None):
+    """Метаданные текущей базы для JSON-конверта: ревизия, исходник, алиас."""
+    alias = server._alias(db)
+    info = server.dbs[alias]
+    conn = info['conn']
+    schema_rev = info.get('schema', 0)
+    src = _source_row(conn)
+    # группа, в которой состоит база (если несколько — первая)
+    group = None
+    for gname, aliases in server.groups.items():
+        if alias in aliases:
+            group = gname
+            break
+    return {
+        'alias': alias,
+        'path': info['path'],
+        'group': group,
+        'schema_revision': schema_rev,
+        'extractor_version': src.get('extractor_version'),
+        'source': {
+            'file_sha256': src.get('file_sha256') or '',
+            'extracted_at': src.get('created'),
+        },
+    }
+
+
+def _json_envelope(tool_name, meta, data, status='ok',
+                   completeness=None, limits=None):
+    """Единый конверт JSON-ответа инструмента прав ролей."""
+    return {
+        'tool': tool_name,
+        'db': {
+            'alias': meta['alias'],
+            'path': meta['path'],
+            'group': meta['group'],
+        },
+        'schema_revision': meta['schema_revision'],
+        'extractor_version': meta['extractor_version'],
+        'source': meta['source'],
+        'status': status,
+        'completeness': completeness or {},
+        'limits': limits or [],
+        'data': data,
+    }
+
+
 PRIMER = """1confdb-knw: MCP server over one or several knowledge bases of a 1C:Enterprise 8 configuration — metadata, BSL code and SKD queries, extracted from binary .cf/.cfe/.epf files into SQLite. 1C is a Russian business-automation platform; a configuration contains metadata objects, their fields, modules of 1C-language code (Russian keywords) and SKD report queries. All object/field names are in Russian.
 
 GLOSSARY: Catalog=справочник (directory), Document=документ, InformationRegister/AccumulationRegister=регистры, Enum=перечисление, DataProcessor=обработка, Report=отчет, DefinedType=определяемый тип, CommonAttribute=общий реквизит, CommonModule=общий модуль. Tabular section (табличная часть) = row table of an object (e.g. Документ.ЗаказПокупателя has section Запасы with fields Номенклатура, Цена…).
@@ -392,6 +438,8 @@ REGISTERS: object_card of a РегистрСведений/РегистрНак�
 ROLE RIGHTS: role_rights(role) lists the EXPLICIT rights one role carries — a line per target (the object itself, one of its attributes / tabular-section fields, or one of its tabular sections) with the rights set on it and the record-level restriction (RLS) text; object_rights(path) turns it around and lists the roles that carry explicit rights on that object, its fields and sections included (pass role to see one role-object pair in full). Storage is SPARSE: a target or a role absent from the answer means the right is NOT SET, never 'denied' — and roles whose rights file could not be read are counted out loud instead of being silently missing. THREE UUID SPACES — never merge them into one dictionary: (1) right_uuid is the PLATFORM RIGHT KIND (one of 66 across the entire 1C platform, e.g. '287b74b8…' = 'Чтение' — but the name is NOT confirmed, only the uuid; printed as 'право 287b74b8=1'); (2) target_uuid is the TARGET OBJECT in this configuration (the object/attribute/tabular section the right applies to; printed as a Russian path like 'Справочник.Номенклатура' or 'цель uuid …' when unresolved); (3) role uuid (role_id in role_right) is the ROLE ITSELF as a metadata object (the row in meta_object where type='Role'). The configuration holds NO right names and no value dictionary, so never render them as 'Чтение'/'Запись' or as allowed/forbidden — say that the name is not confirmed. FIVE STATES of a right record — never collapse them: (1) extracted and interpreted — a row in role_right with a resolved target and a known value; (2) extracted partially — the file was read, but the target uuid did not resolve (shown as 'цель не распознана' with a reason: marker de29c81d / dedup fields / subitem without table); (3) data present but meaning unconfirmed — right uuid and value stored, but the platform dictionary of 66 right kinds is NOT filled, so names shown as uuid with caveat; (4) data unavailable — parsed=0 in role_rights_state, file could not be read (error in role_rights_state.error); (5) no explicit record — sparse storage, absence means NOT SET. NEVER conclude 'access denied' from absence: the role may carry the right on a different target, or inherit from another role, or the file may be unreadable. LONG TEXTS: RLS texts are truncated to 600 chars by default; pass full=True to role_rights/object_rights to get full RLS texts and (for object_rights) lift the 12-targets-per-role cap — the short answer names how many are truncated/hidden and says 'передайте full=True для полного текста'.
 
 EFFECTIVE RIGHTS: effective_rights(roles=[…], path=?) combines EXPLICIT rights of several roles — one row per (target, right) with the list of source roles. Storage is SPARSE: absence of a record means the right is NOT SET for all listed roles, never 'denied'. Roles with parsed=0 (unreadable rights file) are counted as incomplete input; the answer always says 'вывод неполон: возможны динамические проверки (ПривилегированныйРежим, ПравоДоступа)' — privileged mode, programmatic access checks and UI visibility are beyond static analysis. role_diff(roles_a, roles_b) shows which (target, right) pairs exist only in set A, only in set B, or in both — useful for 'what will be lost if I narrow the role?' or 'what does this extension role add?'. Neither tool implements role inheritance: 1C has no role inheritance mechanism, so the union is purely set-theoretic over explicit records.
+
+JSON FORMAT: tools role_rights, object_rights, effective_rights accept parameter format='text'|'json' (default 'text'). With format='json' they return a structured envelope: {tool, db: {alias, path, group}, schema_revision, extractor_version, source: {file_sha256, extracted_at}, status: 'ok'|'incomplete'|'error', completeness: {total, shown, ...}, limits: [...], data: {...}}. The envelope carries the source fingerprint (SHA-256) and extraction date for reproducibility — you can verify the answer was built from the same .cf file. Status 'incomplete' means some roles were unreadable (parsed=0) or targets unresolved; 'error' means the role/object was not found. Other tools still return text only — JSON format will be extended gradually if needed.
 
 DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Catalog/Имя', but string literals in the Russian dotted form ('Справочник.Имя') are auto-converted — either form works in WHERE path = …):
 - meta_object(id, path, type, type_ru, name, uuid, comment, parent_id, ord). path like 'Catalog/Номенклатура'; type = English stem (Catalog, Document, InformationRegister, Enum, CommonModule, DefinedType…); type_ru = Russian label as in the configurator.
@@ -1432,7 +1480,8 @@ class McpServer:
             params).fetchall()
         return {tuple(row) for row in rows}
 
-    def role_rights(self, role, limit=50, offset=0, db=None, full=False):
+    def role_rights(self, role, limit=50, offset=0, db=None, full=False,
+                    format='text'):
         """Явные права роли: строка на цель (объект, его реквизит/поле или ТЧ).
 
         Хранятся только ЯВНЫЕ записи, поэтому цели нет в списке — значит право
@@ -1440,30 +1489,64 @@ class McpServer:
         прочитан: ответ обязан сказать «данные недоступны», а не показать пустой
         список, который читается как «роли ничего не разрешено».
         full=True — не обрезать RLS-тексты (по умолчанию обрезаются до 600 симв.).
+        format='json' — структурированный JSON-ответ вместо текста.
         """
         conn = self.conn(db)
         path = self._role_path(role, db)
         if not path:
+            if format == 'json':
+                meta = _db_meta(self, db)
+                env = _json_envelope(
+                    'role_rights', meta,
+                    {'error': f'роль не найдена: {role}'},
+                    status='error')
+                return json.dumps(env, ensure_ascii=False, indent=2)
             return (f'роль не найдена: {role} (список ролей:'
                     ' find_objects(mask="", type="Role"))')
         q = conn.execute
         role_id = q('SELECT id FROM meta_object WHERE path=?', (path,)).fetchone()[0]
         state = self._role_state(db, role_id)
         out = [ru_path(path)]
+        # для JSON-режима собираем состояние роли отдельно
+        json_status = 'ok'
+        json_limits = []
+        json_completeness = {}
         if state is None:
             out.append('состояние извлечения прав этой роли не сохранено —'
                        ' список ниже может быть неполным')
+            json_status = 'incomplete'
+            json_limits.append('состояние извлечения прав не сохранено')
         else:
-            version, parsed, targets, rights, templates, error = state
+            version, parsed, targets, rights_count, templates, error = state
             out[0] += (f': формат версии {version or "?"}, целей {targets},'
-                       f' явных записей прав {rights}, шаблонов RLS {templates}')
+                       f' явных записей прав {rights_count}, шаблонов RLS {templates}')
+            json_completeness['targets_total'] = targets
+            json_completeness['rights_total'] = rights_count
+            json_completeness['rls_templates'] = templates
             if not parsed:
                 out.append(f'данные недоступны: {error or "причина не сохранена"}'
                            ' — это НЕ «права не заданы»: файл прав не прочитан')
+                if format == 'json':
+                    meta = _db_meta(self, db)
+                    env = _json_envelope(
+                        'role_rights', meta,
+                        {'targets': [], 'error': error or 'причина не сохранена',
+                         'role': ru_path(path)},
+                        status='incomplete',
+                        completeness=json_completeness,
+                        limits=['данные недоступны: файл прав не прочитан'])
+                    return json.dumps(env, ensure_ascii=False, indent=2)
                 return '\n'.join(out)
-            if not rights:
+            if not rights_count:
                 out.append('явных записей прав нет: права роли не заданы'
                            ' (факт конфигурации, а не сбой извлечения)')
+                if format == 'json':
+                    meta = _db_meta(self, db)
+                    env = _json_envelope(
+                        'role_rights', meta,
+                        {'targets': [], 'role': ru_path(path)},
+                        status='ok', completeness=json_completeness)
+                    return json.dumps(env, ensure_ascii=False, indent=2)
                 return '\n'.join(out)
             if templates:
                 names = [r[0] for r in q(
@@ -1512,6 +1595,8 @@ class McpServer:
         dup = self._flag_ambiguous(db, 'role_id=?', [role_id])
         by_target = self._rights_of_targets(
             db, [(role_id, r[0], r[5], r[6], r[7]) for r in rows])
+        # для JSON: собираем данные по целям
+        json_targets = []
         for (target_uuid, obj_path, attr_name, attr_tabular, tab_name,
              sub_index, collection_uuid, flags, count) in rows:
             rights = by_target.get((role_id, target_uuid, sub_index,
@@ -1523,6 +1608,23 @@ class McpServer:
                 else None)
             out.append(f'{label} — записей {count}: ' + _right_labels(rights))
             out.extend(_rls_lines(rights, full=full))
+            # JSON-представление цели
+            json_rights = []
+            for right_uuid, value, rls in rights:
+                rls_text = rls or None
+                if rls_text and not full and len(rls_text) > RLS_TEXT_LIMIT:
+                    rls_text = rls_text[:RLS_TEXT_LIMIT] + '… (обрезано)'
+                json_rights.append({
+                    'right_uuid': right_uuid,
+                    'value': value,
+                    'rls_text': rls_text,
+                })
+            json_targets.append({
+                'target': label,
+                'target_uuid': target_uuid,
+                'rights_count': count,
+                'rights': json_rights,
+            })
         t_total, t_resolved, t_de29, t_sub = stats
         t_unresolved = t_total - (t_resolved or 0)
         rls_total, rls_trunc = rls_stats
@@ -1544,9 +1646,36 @@ class McpServer:
         else:
             tail += '; это все результаты'
         out.append(tail)
+        if format == 'json':
+            json_completeness.update({
+                'total': t_total,
+                'shown': len(rows),
+                'resolved': t_resolved or 0,
+                'unresolved': t_unresolved,
+                'de29_marker': t_de29 or 0,
+                'subobjects': t_sub or 0,
+                'rls_total': rls_total or 0,
+                'rls_truncated': rls_trunc or 0,
+            })
+            if rls_trunc and not full:
+                json_limits.append(
+                    'RLS-тексты обрезаны до 600 симв.; передайте full=True')
+            if offset + len(rows) < t_total:
+                json_limits.append(
+                    f'страница {offset + 1}–{offset + len(rows)} из {t_total};'
+                    f' следующий offset={offset + len(rows)}')
+            meta = _db_meta(self, db)
+            env = _json_envelope(
+                'role_rights', meta,
+                {'role': ru_path(path), 'targets': json_targets},
+                status=json_status,
+                completeness=json_completeness,
+                limits=json_limits)
+            return json.dumps(env, ensure_ascii=False, indent=2)
         return '\n'.join(out)
 
-    def object_rights(self, path, role=None, limit=50, offset=0, db=None, full=False):
+    def object_rights(self, path, role=None, limit=50, offset=0, db=None,
+                      full=False, format='text'):
         """Явные права ролей на объект, его реквизиты/поля ТЧ и табличные части.
 
         У права на подобъект `target_object_id` — объект-владелец, поэтому одно
@@ -1555,12 +1684,20 @@ class McpServer:
         попадают (их файл прав не прочитан) — ответ обязан назвать их число,
         иначе пустой список читается как «доступ запрещён всем».
         full=True — не обрезать RLS-тексты и не ограничивать число целей на роль.
+        format='json' — структурированный JSON-ответ вместо текста.
         """
         conn = self.conn(db)
         path = self.resolve_path(path, db)
         q = conn.execute
         row = q('SELECT id, path FROM meta_object WHERE path=?', (path,)).fetchone()
         if not row:
+            if format == 'json':
+                meta = _db_meta(self, db)
+                env = _json_envelope(
+                    'object_rights', meta,
+                    {'error': f'объект не найден: {path}'},
+                    status='error')
+                return json.dumps(env, ensure_ascii=False, indent=2)
             return f'объект не найден: {path}'
         oid, path = row
         out = [ru_path(path)]
@@ -1571,6 +1708,13 @@ class McpServer:
         if role:
             role_path = self._role_path(role, db)
             if not role_path:
+                if format == 'json':
+                    meta = _db_meta(self, db)
+                    env = _json_envelope(
+                        'object_rights', meta,
+                        {'error': f'роль не найдена: {role}'},
+                        status='error')
+                    return json.dumps(env, ensure_ascii=False, indent=2)
                 return f'роль не найдена: {role}'
             only_role = q('SELECT id FROM meta_object WHERE path=?',
                           (role_path,)).fetchone()[0]
@@ -1609,6 +1753,8 @@ class McpServer:
         dup = self._flag_ambiguous(db, 'target_object_id=?', [oid])
         out.append(RIGHTS_NOTE)
         cap = None if (only_role or full) else TARGETS_PER_ROLE
+        # для JSON: собираем данные по ролям
+        json_roles = []
         for rid, rpath in role_rows:
             targets = []
             index = {}
@@ -1634,15 +1780,35 @@ class McpServer:
             out.append(line)
             for _label, rights in shown:
                 out.extend(_rls_lines(rights, full=full))
+            # JSON-представление роли
+            json_rights = []
+            for lbl, rights_list in targets:
+                for right_uuid, value, rls in rights_list:
+                    rls_text = rls or None
+                    if rls_text and not full and len(rls_text) > RLS_TEXT_LIMIT:
+                        rls_text = rls_text[:RLS_TEXT_LIMIT] + '… (обрезано)'
+                    json_rights.append({
+                        'target': lbl,
+                        'right_uuid': right_uuid,
+                        'value': value,
+                        'rls_text': rls_text,
+                    })
+            json_roles.append({
+                'role': ru_path(rpath),
+                'targets_count': len(targets),
+                'rights': json_rights,
+            })
         bad = q('SELECT COUNT(*) FROM role_rights_state WHERE parsed=0').fetchone()[0]
+        json_unreadable = 0
+        json_limits = []
         if bad:
-            roles = q("SELECT COUNT(*) FROM meta_object WHERE type='Role'"
-                      ).fetchone()[0]
+            roles_total = q("SELECT COUNT(*) FROM meta_object WHERE type='Role'"
+                            ).fetchone()[0]
             bad_names = [ru_path(r[0]) for r in q(
                 "SELECT ro.path FROM role_rights_state rrs"
                 " JOIN meta_object ro ON ro.id=rrs.role_id"
                 " WHERE rrs.parsed=0 ORDER BY ro.path LIMIT 5").fetchall()]
-            tail = (f'у {bad} из {roles} ролей права недоступны (файл прав не'
+            tail = (f'у {bad} из {roles_total} ролей права недоступны (файл прав не'
                     ' прочитан, причина в role_rights_state.error) — их нет'
                     ' в списке не потому, что они ничего не разрешают')
             if bad_names:
@@ -1650,6 +1816,9 @@ class McpServer:
                 if bad > 5:
                     tail += f' (и ещё {bad - 5})'
             out.append(tail)
+            json_unreadable = bad
+            json_limits.append(
+                f'у {bad} из {roles_total} ролей права недоступны')
         # счётчики целей этого объекта (разрешённые / не распознанные)
         tgt_stats = q(
             'SELECT COUNT(*), SUM(CASE WHEN obj_id IS NOT NULL THEN 1 ELSE 0 END)'
@@ -1672,9 +1841,31 @@ class McpServer:
         else:
             tail += '; это все результаты'
         out.append(tail)
+        if format == 'json':
+            completeness = {
+                'total_roles': total,
+                'shown_roles': len(role_rows),
+                'targets_total': t_total,
+                'targets_resolved': t_resolved or 0,
+                'targets_unresolved': t_unresolved,
+                'unreadable_roles': json_unreadable,
+            }
+            if offset + len(role_rows) < total:
+                json_limits.append(
+                    f'страница {offset + 1}–{offset + len(role_rows)} из'
+                    f' {total}; следующий offset={offset + len(role_rows)}')
+            meta = _db_meta(self, db)
+            env = _json_envelope(
+                'object_rights', meta,
+                {'object': ru_path(path), 'roles': json_roles},
+                status='ok',
+                completeness=completeness,
+                limits=json_limits)
+            return json.dumps(env, ensure_ascii=False, indent=2)
         return '\n'.join(out)
 
-    def effective_rights(self, roles, path=None, limit=50, offset=0, db=None, full=False):
+    def effective_rights(self, roles, path=None, limit=50, offset=0, db=None,
+                         full=False, format='text'):
         """Сводные права НЕСКОЛЬКИХ ролей: одна строка на (цель, право), роли-источники.
 
         Группирует записи role_right по цели и виду права, собирая список ролей,
@@ -1682,8 +1873,16 @@ class McpServer:
         «право не задано», а не «запрещено». Роли с parsed=0 (файл прав не
         прочитан) считаются неполнотой входных данных.
         full=True — не обрезать RLS-тексты (по умолчанию обрезаются до 600 симв.).
+        format='json' — структурированный JSON-ответ вместо текста.
         """
         if not isinstance(roles, (list, tuple)) or not roles:
+            if format == 'json':
+                meta = _db_meta(self, db)
+                env = _json_envelope(
+                    'effective_rights', meta,
+                    {'error': 'roles: требуется непустой список имён ролей'},
+                    status='error')
+                return json.dumps(env, ensure_ascii=False, indent=2)
             return 'roles: требуется непустой список имён ролей'
         conn = self.conn(db)
         q = conn.execute
@@ -1709,6 +1908,14 @@ class McpServer:
                 unreadable.append(rpath)
         if not role_ids:
             tail = f'; не найдено ролей: {", ".join(missing)}' if missing else ''
+            if format == 'json':
+                meta = _db_meta(self, db)
+                env = _json_envelope(
+                    'effective_rights', meta,
+                    {'error': f'ни одна роль не найдена{tail}',
+                     'missing_roles': missing},
+                    status='error')
+                return json.dumps(env, ensure_ascii=False, indent=2)
             return f'ни одна роль не найдена{tail}'
         # фильтр по объекту, если path задан
         where = ''
@@ -1718,6 +1925,13 @@ class McpServer:
             path = self.resolve_path(path, db)
             row = q('SELECT id FROM meta_object WHERE path=?', (path,)).fetchone()
             if not row:
+                if format == 'json':
+                    meta = _db_meta(self, db)
+                    env = _json_envelope(
+                        'effective_rights', meta,
+                        {'error': f'объект не найден: {path}'},
+                        status='error')
+                    return json.dumps(env, ensure_ascii=False, indent=2)
                 return f'объект не найден: {path}'
             target_oid = row[0]
             where = ' WHERE r.target_object_id=?'
@@ -1788,6 +2002,8 @@ class McpServer:
             header += f'; не найдено: {", ".join(missing)}'
         out.append(header)
         out.append(RIGHTS_NOTE)
+        # для JSON: собираем записи
+        json_entries = []
         for key in page_keys:
             target_uuid, target_object_id, target_attr_id, target_tabular_id, \
                 sub_index, collection_uuid, right_uuid, value = key
@@ -1805,6 +2021,22 @@ class McpServer:
             # RLS
             if info['rls_texts']:
                 out.extend(_rls_lines(info['rls_texts'], full=full))
+            # JSON-представление записи
+            rls_texts = []
+            for _right, _val, rls in info['rls_texts']:
+                text = ' '.join(str(rls).split())
+                if not full and len(text) > RLS_TEXT_LIMIT:
+                    text = text[:RLS_TEXT_LIMIT] + '… (обрезано)'
+                rls_texts.append(text)
+            json_entries.append({
+                'target': label,
+                'target_uuid': target_uuid,
+                'right_uuid': right_uuid,
+                'value': value,
+                'role_ids': sorted(ru_path(role_labels.get(rid, f'role_id={rid}'))
+                                   for rid in info['role_ids']),
+                'rls_texts': rls_texts or None,
+            })
         # неполнота
         tail = (f'— всего целей {total}; показано {offset + 1}–{offset + len(page_keys)}')
         if offset + len(page_keys) < total:
@@ -1816,6 +2048,35 @@ class McpServer:
                  f' (из {len(roles)} запрошенных)')
         tail += '; вывод неполон: возможны динамические проверки (ПривилегированныйРежим, ПравоДоступа)'
         out.append(tail)
+        if format == 'json':
+            json_limits = []
+            json_limits.append(
+                'вывод неполон: возможны динамические проверки'
+                ' (ПривилегированныйРежим, ПравоДоступа)')
+            if offset + len(page_keys) < total:
+                json_limits.append(
+                    f'страница {offset + 1}–{offset + len(page_keys)} из'
+                    f' {total}; следующий offset={offset + len(page_keys)}')
+            completeness = {
+                'total_entries': total,
+                'shown_entries': len(page_keys),
+                'roles_requested': len(roles),
+                'roles_found': len(role_ids),
+                'roles_missing': len(missing),
+                'roles_unreadable': len(unreadable),
+            }
+            meta = _db_meta(self, db)
+            status = 'ok'
+            if missing or unreadable:
+                status = 'incomplete'
+            env = _json_envelope(
+                'effective_rights', meta,
+                {'object': ru_path(path) if path else None,
+                 'entries': json_entries},
+                status=status,
+                completeness=completeness,
+                limits=json_limits)
+            return json.dumps(env, ensure_ascii=False, indent=2)
         return '\n'.join(out)
 
     def role_diff(self, roles_a, roles_b, limit=50, offset=0, db=None, full=False):
@@ -3061,6 +3322,10 @@ _OFFSET = {'type': 'integer',
                           'ends with the total hit count, the range shown and '
                           'the offset to pass for the next page; the order of '
                           'hits is stable, so pages never overlap or skip.'}
+_FORMAT = {'type': 'string', 'enum': ['text', 'json'],
+           'description': 'Output format: "text" (default, human-readable) '
+                          'or "json" (structured JSON envelope with db metadata,'
+                          ' completeness counters and pagination limits).'}
 
 TOOLS = [
     Tool('find_objects',
@@ -3112,7 +3377,8 @@ TOOLS = [
          'Says "данные недоступны" (with the reason) when the rights file could '
          'not be read, which is NOT the same as an empty list. Pages targets.',
          _schema({'role': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
-                  'db': _DB, 'group': _GROUP, 'full': _BOOL}, ('role',)),
+                  'db': _DB, 'group': _GROUP, 'full': _BOOL,
+                  'format': _FORMAT}, ('role',)),
          McpServer.role_rights),
     Tool('object_rights',
          'Which roles carry explicit rights on an OBJECT — its attributes, '
@@ -3124,7 +3390,8 @@ TOOLS = [
          'list for that reason, not because they deny access. Use it for access '
          'analysis ("who can work with this catalog"). Pages roles.',
          _schema({'path': _STR, 'role': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
-                  'db': _DB, 'group': _GROUP, 'full': _BOOL}, ('path',)),
+                  'db': _DB, 'group': _GROUP, 'full': _BOOL,
+                  'format': _FORMAT}, ('path',)),
          McpServer.object_rights),
     Tool('effective_rights',
          'Effective (combined) rights of SEVERAL roles on an object or across '
@@ -3140,7 +3407,7 @@ TOOLS = [
          'reflected.',
          _schema({'roles': {'type': 'array', 'items': _STR}, 'path': _STR,
                   'limit': _LIMIT, 'offset': _OFFSET, 'db': _DB, 'group': _GROUP,
-                  'full': _BOOL}, ('roles',)),
+                  'full': _BOOL, 'format': _FORMAT}, ('roles',)),
          McpServer.effective_rights),
     Tool('role_diff',
          'Diff of TWO role sets: which (target, right) pairs exist only in set A, '
