@@ -34,7 +34,10 @@ ROOT_TYPES = ('Configuration', 'ConfigurationExtension', 'ExternalDataProcessor'
 # role_right.target_flags (2026-10-07); 6 — сам штамп ревизии (2026-10-08);
 # 7 — source.extractor_version (версия извлекателя, 2026-10-09).
 # Базы ревизий 1-6 штампа извлекателя не имеют.
-SCHEMA_VERSION = 7
+# 8 — meta_subobject (заглушка для будущих подобъектов: операции веб-сервисов,
+# методы HTTP-сервисов, формы, команды) и target_subobject_id в role_right
+# (2026-10-10).
+SCHEMA_VERSION = 8
 
 RE_UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 
@@ -486,6 +489,15 @@ def _extract_tabular(header):
     return _tabular_names(_section_bags(header))
 
 
+def _extract_subobjects(header, object_id):
+    """Подобъекты (операции веб-сервисов, методы HTTP-сервисов, формы, команды).
+
+    Заглушка: извлечение не реализовано, таблица meta_subobject пустая.
+    Будет реализовано после исследования структуры header_json.
+    """
+    return []
+
+
 def tabular_field_counts(header_json):
     """{имя табличной части: объявленное число полей} из meta_object.header_json.
 
@@ -859,6 +871,17 @@ CREATE TABLE meta_tabular (
 );
 CREATE INDEX ix_meta_tabular_object ON meta_tabular(object_id, ord);
 CREATE INDEX ix_meta_tabular_uuid ON meta_tabular(uuid);
+CREATE TABLE meta_subobject (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_id INTEGER NOT NULL REFERENCES meta_object(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    ord INTEGER NOT NULL,
+    uuid TEXT NOT NULL,
+    name TEXT
+);
+CREATE INDEX ix_meta_subobject_object ON meta_subobject(object_id, ord);
+CREATE UNIQUE INDEX ix_meta_subobject_uuid ON meta_subobject(uuid);
+CREATE INDEX ix_meta_subobject_kind ON meta_subobject(kind);
 CREATE TABLE attribute_ref (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     attribute_id INTEGER NOT NULL REFERENCES meta_attribute(id) ON DELETE CASCADE,
@@ -928,6 +951,7 @@ CREATE TABLE role_right (
     target_object_id INTEGER REFERENCES meta_object(id) ON DELETE CASCADE,
     target_attr_id INTEGER REFERENCES meta_attribute(id) ON DELETE CASCADE,
     target_tabular_id INTEGER REFERENCES meta_tabular(id) ON DELETE CASCADE,
+    target_subobject_id INTEGER REFERENCES meta_subobject(id) ON DELETE CASCADE,
     sub_index INTEGER,
     collection_uuid TEXT,
     target_flags TEXT,
@@ -1332,9 +1356,10 @@ def build_fts_index(db_path, workers=1):
 
 _ROLE_RIGHT_SQL = ('INSERT INTO role_right (role_id, target_uuid,'
                    ' target_object_id, target_attr_id, target_tabular_id,'
+                   ' target_subobject_id,'
                    ' sub_index, collection_uuid, target_flags,'
                    ' right_uuid, value, rls_text)'
-                   ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                   ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
 _ROLE_STATE_SQL = ('INSERT INTO role_rights_state (role_id, version, parsed,'
                    ' targets, rights, rls_templates, error)'
                    ' VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -1364,27 +1389,34 @@ def _target_flags(target):
 
 
 def _right_targets(conn):
-    """Карта uuid цели права -> (объект-владелец, реквизит, табличная часть).
+    """Карта uuid цели права -> (объект-владелец, реквизит, ТЧ, подобъект).
 
-    Цель — объект метаданных, его реквизит/поле ТЧ или его табличная часть,
-    поэтому uuid ищется в трёх таблицах; незаполненные id остаются None.
-    `target_object_id` для реквизита и ТЧ — объект-владелец, так что все права,
-    затрагивающие объект, выбираются одним условием. Замер на УНФ: 16953 цели
-    разрешаются объектом, 12276 — реквизитом, 520 — табличной частью, 258
+    Цель — объект метаданных, его реквизит/поле ТЧ, его табличная часть или
+    подобъект (операция веб-сервиса, метод HTTP-сервиса, форма, команда),
+    поэтому uuid ищется в четырёх таблицах; незаполненные id остаются None.
+    `target_object_id` для реквизита, ТЧ и подобъекта — объект-владелец, так
+    что все права, затрагивающие объект, выбираются одним условием. Замер на
+    УНФ: 16953 цели разрешаются объектом, 12276 — реквизитом, 520 — табличной
+    частью, подобъекты — заглушка (таблица meta_subobject пока пустая), 258
     (операции веб-сервисов, методы HTTP-сервисов, специальный маркер
     de29c81d-…) не опознаны вовсе.
     """
     targets = {}
     for uuid, obj_id in conn.execute(
             'SELECT uuid, id FROM meta_object WHERE uuid IS NOT NULL'):
-        targets[uuid] = (obj_id, None, None)
+        targets[uuid] = (obj_id, None, None, None)
     for uuid, attr_id, obj_id in conn.execute(
             'SELECT uuid, id, object_id FROM meta_attribute'
             ' WHERE uuid IS NOT NULL'):
-        targets[uuid] = (obj_id, attr_id, None)
+        targets[uuid] = (obj_id, attr_id, None, None)
     for uuid, tab_id, obj_id in conn.execute(
             'SELECT uuid, id, object_id FROM meta_tabular WHERE uuid IS NOT NULL'):
-        targets[uuid] = (obj_id, None, tab_id)
+        targets[uuid] = (obj_id, None, tab_id, None)
+    # Подобъекты (операции веб-сервисов, методы HTTP-сервисов, формы, команды):
+    # таблица-заглушка, извлечение будет реализовано позже
+    for uuid, sub_id, obj_id in conn.execute(
+            'SELECT uuid, id, object_id FROM meta_subobject WHERE uuid IS NOT NULL'):
+        targets[uuid] = (obj_id, None, None, sub_id)
     return targets
 
 
@@ -1419,8 +1451,10 @@ def _write_role_rights(conn, dump_dir, stats):
             continue
         count = 0
         for target, entry in parsed.entries():
-            obj_id, attr_id, tab_id = targets.get(target.uuid, (None, None, None))
+            obj_id, attr_id, tab_id, sub_id = targets.get(
+                target.uuid, (None, None, None, None))
             right_params.append((role_id, target.uuid, obj_id, attr_id, tab_id,
+                                 sub_id,
                                  target.sub_index, target.collection_uuid,
                                  _target_flags(target), entry.right_uuid,
                                  entry.value, entry.rls_text))
@@ -1628,16 +1662,23 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
         stats['attributes'] += len(attr_params)
         stats['refs'] += len(ref_params)
 
-        # значения перечислений, предопределённые, привязки общих реквизитов
+        # значения перечислений, предопределённые, привязки общих реквизитов,
+        # подобъекты (заглушка — таблица meta_subobject пока пустая)
         tab_params = []
         enum_params = []
         common_params = []
         predef_params = []
         subconto_params = []
+        subobject_params = []
         for rel, info in infos.items():
             obj_id = dir_to_id[rel]
             for ord_no, (name, uuid) in enumerate(info['tabular']):
                 tab_params.append((obj_id, ord_no, name, uuid))
+            # подобъекты: заглушка, извлечение будет реализовано позже
+            for kind, sub_name, sub_uuid in _extract_subobjects(
+                    info['header'], obj_id):
+                subobject_params.append(
+                    (obj_id, kind, len(subobject_params), sub_uuid, sub_name))
             if info['stem'] == 'Enum':
                 for ord_no, name in enumerate(_extract_enum_values(info['header'])):
                     enum_params.append((obj_id, ord_no, name))
@@ -1655,6 +1696,11 @@ def write_db(dump_dir, db_path, *, source_file=None, source_sha256=None,
             'INSERT INTO meta_tabular (object_id, ord, name, uuid)'
             ' VALUES (?, ?, ?, ?)',
             tab_params)
+        if subobject_params:
+            conn.executemany(
+                'INSERT INTO meta_subobject (object_id, kind, ord, uuid, name)'
+                ' VALUES (?, ?, ?, ?, ?)',
+                subobject_params)
         conn.executemany(
             'INSERT INTO enum_value (object_id, ord, name) VALUES (?, ?, ?)',
             enum_params)
