@@ -331,7 +331,7 @@ class Tui:
             print(title)
             for i, path in enumerate(entries, 1):
                 print(f' {i}. {path}')
-            print(' p. Указать путь вручную (или просто наберите путь)')
+            print(' Номер — из списка; буквы/слеш/двоеточие — путь вручную')
             if allow_empty:
                 print(f' e. Пусто ({empty_hint})')
             print(' 0. Отмена')
@@ -342,8 +342,6 @@ class Tui:
                 return None
             if choice == 'e' and allow_empty:
                 return ''
-            if choice == 'p':
-                return _ask_path('Путь')
             if choice.isdigit():
                 if 1 <= int(choice) <= len(entries):
                     return entries[int(choice) - 1]
@@ -374,7 +372,7 @@ class Tui:
             print(title)
             for i, path in enumerate(entries, 1):
                 print(f' {i}. {path}')
-            print(' p. Указать путь вручную (или просто наберите путь)')
+            print(' Номер — из списка; буквы/слеш/двоеточие — путь вручную')
             print(' k. Добавить каталог с базами (его файлы появятся в списке)')
             if allow_empty:
                 print(f' e. Пусто ({empty_hint})')
@@ -386,8 +384,6 @@ class Tui:
                 return None
             if choice == 'e' and allow_empty:
                 return ''
-            if choice == 'p':
-                return _ask_path('Путь к базе')
             if choice == 'k':
                 directory = _ask_path('Каталог с базами')
                 if directory and os.path.isdir(directory):
@@ -428,6 +424,10 @@ class Tui:
                                          _cf_candidates(), self.recent_src)
                 if picked:
                     self.src = picked
+                    # База по умолчанию — рядом с исходником, имя из его имени.
+                    # Пересчитываем всегда при смене файла: если пользователь
+                    # менял базу вручную, он задаст её в пункте 2.
+                    self.db = _out_defaults(self.src)[0]
             elif choice == '2':
                 candidates = [_out_defaults(self.src)[0]] if self.src else []
                 picked = self._pick_db('База SQLite', candidates=candidates,
