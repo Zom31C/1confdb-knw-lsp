@@ -417,7 +417,8 @@ class _Parser:
             joins.append((join_kind, source, on_expr))
 
     def _try_join(self):
-        """Соединение внутри необязательной области {…}; True — если было."""
+        """Соединение внутри необязательной области {…}; True — если было.
+        Поддерживает вложенные соединения (соединение при соединении без ПО)."""
         tok = self.peek()
         if tok[0] == 'id' and tok[1].upper() in _JOINS:
             self.next()
@@ -428,9 +429,21 @@ class _Parser:
         else:
             return False
         self.parse_source()
+        # Обработка вложенных соединений: если после источника идёт ещё одно
+        # соединение (без ПО между ними), обрабатываем его рекурсивно.
+        while self._peek_is_join():
+            self._try_join()
         self.expect_kw('ПО')
         self.parse_expr()
         return True
+
+    def _peek_is_join(self):
+        """True, если следующий токен — начало соединения (ЛЕВОЕ/ПРАВОЕ/.../СОЕДИНЕНИЕ)."""
+        tok = self.peek()
+        if tok[0] != 'id':
+            return False
+        upper = tok[1].upper()
+        return upper in _JOINS or upper == 'СОЕДИНЕНИЕ'
 
     def parse_source(self):
         tok = self.peek()
@@ -1055,7 +1068,22 @@ def _check_field(parts, ctx, scope, errors, unverified=None):
     if head in scope:
         info = scope[head]
     elif len(scope) == 1:
-        info = next(iter(scope.values()))
+        single_info = next(iter(scope.values()))
+        if single_info[0] == 'obj' and single_info[1]:
+            # Fallback для единственного источника: применяется только если
+            # head — это краткое имя объекта (последний сегмент пути) или
+            # известное поле объекта (bare field name). Иначе head — это
+            # алиас колонки из временной таблицы или неизвестное имя.
+            path = single_info[1]
+            short_name = path.rsplit('/', 1)[-1] if '/' in path else path
+            if head == short_name:
+                info = single_info
+            elif len(parts) == 1 and ctx.has_field(path, head):
+                info = single_info
+            else:
+                return  # алиас колонки или неизвестное имя — не проверяем
+        else:
+            info = single_info  # derived, param, open — применить fallback
     else:
         return  # поле без алиаса при нескольких источниках — не проверяем
     rest = parts[1:]
