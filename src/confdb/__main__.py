@@ -55,26 +55,12 @@ def build_parser():
                    help='число процессов сборки = число файлов-шардов индекса '
                         '(по умолчанию — результат "confdb bench" или 1)')
 
-    q = subparsers.add_parser(
-        'check-queries',
-        help='проверить тексты запросов в модулях и сохранить нарушения '
-             'в таблицу query_violation (для LSP-диагностики)')
-    q.add_argument('db', help='путь к базе SQLite')
-
     b = subparsers.add_parser(
         'bench',
         help='бенчмарк: подбор числа процессов под железо (результат в конфиг)')
     b.add_argument('src', help='путь к файлу .cf/.cfe/.epf')
     b.add_argument('--sample', metavar='N', type=int, default=1000,
                    help='размер сэмпла объектов верхнего уровня (по умолчанию 1000)')
-
-    l = subparsers.add_parser(
-        'prep-lsp',
-        help='подготовить дамп для BSL Language Server (*.bsl → UTF-8 без BOM, LF)')
-    l.add_argument('dump', help='каталог дампа (результат extract --dump)')
-    l.add_argument('--into', metavar='DIR',
-                   help='скопировать дамп в отдельный каталог с конвертацией '
-                        '(по умолчанию — править на месте)')
 
     m = subparsers.add_parser(
         '1confdb-knw',
@@ -84,12 +70,6 @@ def build_parser():
                    help='пути к базам SQLite (можно несколько: основная '
                         'конфигурация + расширения/обработки); без путей — '
                         'last_db из конфига или автопоиск *.db/*.sqlite')
-    m.add_argument('--lsp-workspace', metavar='DIR', default=None,
-                   help='каталог дампа для инструментов bsl_* (BSL Language Server)')
-    m.add_argument('--bsl-jar', metavar='JAR', default=None,
-                   help='путь к jar BSL Language Server')
-    m.add_argument('--java', metavar='EXE', default=None,
-                   help='путь к java (по умолчанию JAVA_HOME или PATH)')
     m.add_argument('--host', default='127.0.0.1',
                    help='адрес для HTTP-режима (по умолчанию 127.0.0.1)')
     m.add_argument('--port', type=int, default=0,
@@ -168,16 +148,6 @@ def main(argv=None):
     if args.cmd == 'fts':
         return run_fts(args.db, args.workers)
 
-    if args.cmd == 'check-queries':
-        from .query_check import check_db
-        if not os.path.isfile(args.db):
-            print(f'Файл базы не найден: {args.db}', file=sys.stderr)
-            return 2
-        stats = check_db(args.db)
-        print(f'Тел модулей/методов с запросами: {stats["bodies"]}, '
-              f'нарушений сохранено: {stats["violations"]}')
-        return 0
-
     if args.cmd == '1confdb-knw':
         from .mcp_server import main as mcp_main
         argv = list(args.db or ())
@@ -185,29 +155,11 @@ def main(argv=None):
             argv += ['--host', args.host, '--port', str(args.port)]
         for spec in args.group or ():
             argv += ['--group', spec]
-        if args.lsp_workspace:
-            argv += ['--lsp-workspace', args.lsp_workspace]
-        if args.bsl_jar:
-            argv += ['--bsl-jar', args.bsl_jar]
-        if args.java:
-            argv += ['--java', args.java]
         return mcp_main(argv)
 
     if args.cmd == 'bench':
         from .bench import bench as run_bench
         run_bench(args.src, sample=args.sample)
-        return 0
-
-    if args.cmd == 'prep-lsp':
-        from .lsp_prep import prep_dump
-        try:
-            stats = prep_dump(args.dump, dst_dir=args.into)
-        except (FileNotFoundError, ValueError) as err:
-            print(f'Ошибка: {err}', file=sys.stderr)
-            return 2
-        print(f'Файлов .bsl: {stats["files"]}, '
-              f'переписано: {stats["converted"]}, '
-              f'уже в нужном формате/пропущено: {stats["skipped"]}')
         return 0
 
     if args.workers is None:

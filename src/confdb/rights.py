@@ -29,8 +29,45 @@ import re
 from dataclasses import dataclass, field
 
 # uuid права -> русское имя как в редакторе прав конфигуратора.
-# Пусто сознательно: имена берутся только из подтверждённого источника.
-RIGHT_NAMES = {}
+# Заполнено из Rights.xml конфигурации SmallBusinessKz (35 из 66 UUID).
+# Оставшиеся 31 UUID отображаются с пометкой "имя не подтверждено".
+RIGHT_NAMES = {
+    '013a262e-165f-4815-bdae-7a1bed6a68e4': 'Delete',
+    '1b762bf9-df7f-4255-bbe6-f7578f41368d': 'Edit',
+    '1c87578f-9e09-4ec0-a991-5629c87b1588': 'Edit',
+    '1d306db2-d97e-4b57-9b6f-951a009228ce': 'Get',
+    '21b4742a-d335-4234-bf0f-a3074a0e31ac': 'InputByString',
+    '24abfe06-289a-48c5-8bb4-032c733e45c5': 'Read',
+    '287b74b8-3a66-4a76-ba27-4f1f6a93770e': 'EditDataHistoryVersionComment',
+    '33200740-82b0-4de7-8556-d3fb25ca4328': 'InteractiveClearDeletionMark',
+    '408c56c0-e210-4e2e-8e82-610050a08a39': 'InteractiveClearDeletionMark',
+    '479a42c0-c3e9-4ae7-bf4a-75cebc14fec4': 'Read',
+    '499e8968-ca89-43f0-9955-8756058b1b53': 'Set',
+    '4d0d77ec-8511-430d-bd77-8407f27bc8f4': 'InteractiveClearDeletionMark',
+    '5b3ea0e2-fdb9-41f6-bf6c-25747906b4cb': 'ReadDataHistory',
+    '5d167fcc-b11f-403a-9a37-1eda64c19df1': 'InteractiveInsert',
+    '64319ca1-f3d8-472e-82ce-5da233e6daaa': 'SwitchToDataHistoryVersion',
+    '65e5f92c-40ff-4130-9652-c0e7612d0609': 'InteractiveDeleteMarkedPredefinedData',
+    '798cf688-ad74-44fe-a464-236b49e910e0': 'InteractiveSetDeletionMark',
+    '8497054a-ffd1-4ca7-bdfe-340b9ddc050a': 'Update',
+    '9342b152-a7ae-4c79-9b7b-f4f028a36479': 'UpdateDataHistory',
+    'a679c969-8ea1-4b8b-9e61-8a414ba448f4': 'UpdateDataHistorySettings',
+    'aa6448f2-be0f-42ea-ba26-1af7f52b5b65': 'Edit',
+    'b0c0cbfc-f2cc-4b80-8460-5d5d7a599d9d': 'InteractiveSetDeletionMark',
+    'b162ff57-0296-483e-9af8-dc37576802cb': 'View',
+    'b53db6ed-6e5b-4035-8d24-f10083d646ed': 'ReadDataHistoryOfMissingData',
+    'b5f861d3-d9c5-45ec-98bf-0ed4d489a351': 'View',
+    'b7bab52d-c1b1-4bd8-8276-02db08d42352': 'View',
+    'c0028105-4cc1-41ca-aef1-bfbd8fc8f8c4': 'UpdateDataHistory',
+    'c4ab1331-e58d-4a46-ad2e-fe6d80b72aa4': 'ViewDataHistory',
+    'c6de80da-a4f7-4ce9-bbeb-0b00ea564ec1': 'View',
+    'd76b72ba-5388-4b7f-af64-1b351f63a1e1': 'View',
+    'e060de25-bffd-42fd-bb09-f3a788d65760': 'UndoPosting',
+    'e7f9daf9-eac2-4ada-9c26-c380858f3589': 'UpdateDataHistoryVersionComment',
+    'f55a8f7f-2c65-404f-b530-093d9006adba': 'Update',
+    'fa6dbe86-856a-4ac4-b8ac-bce99f8b8b22': 'View',
+    'fb88c756-91c9-4351-9cdf-e027879886c6': 'ViewDataHistory',
+}
 
 UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
                      r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
