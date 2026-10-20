@@ -55,7 +55,7 @@ def _xdto_snapshot(conn, oid):
         return {}
     props = {}
     for row in rows:
-        props.setdefault(row[0], []).append(row[1:])
+        props.setdefault(row[0], []).append(row[2:])
 
     def signature(tid):
         parts = []

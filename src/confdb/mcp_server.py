@@ -1267,7 +1267,8 @@ class McpServer:
         return '\n'.join(out)
 
     # -- сравнение двух баз --------------------------------------------------
-    def compare_object(self, path, db_left, db_right, path_right=None):
+    def compare_object(self, path, db_left, db_right, path_right=None,
+                       limit=100, offset=0):
         """Различия одного объекта в двух базах знаний."""
         left_alias = self._alias(db_left)
         right_alias = self._alias(db_right)
@@ -1301,9 +1302,40 @@ class McpServer:
             f'{len(left["modules"])} / {len(right["modules"])}, запросов СКД '
             f'{len(left["skd"])} / {len(right["skd"])}')
         lines = compare.diff_snapshots(left, right, left_alias, right_alias,
-                                       fmt_type=ru_type_str)
+                                       fmt_type=ru_type_str,
+                                       limit=int(limit), offset=int(offset))
         head.append('Различий нет: метаданные и код объекта совпадают'
                     if not lines else 'Различия:')
+        return '\n'.join(head + lines)
+
+    def method_diff(self, path, code_name, name, db_left, db_right, context=3):
+        """Построчное сравнение одного метода в двух базах (игнорирует комментарии и пробелы)."""
+        left_alias = self._alias(db_left)
+        right_alias = self._alias(db_right)
+        left_path = self.resolve_path(path, left_alias)
+        right_path = self.resolve_path(path, right_alias)
+        # получить тело метода из левой базы
+        left_row = self._method_row(left_path, code_name, name, left_alias)
+        right_row = self._method_row(right_path, code_name, name, right_alias)
+        head = [f'Сравнение метода: {name}',
+                f'  {left_alias}: {left_path} ({code_name})',
+                f'  {right_alias}: {right_path} ({code_name})']
+        if not left_row and not right_row:
+            head.append('метод не найден ни в одной базе')
+            return '\n'.join(head)
+        if not left_row:
+            head.append(f'метод есть только в {right_alias}')
+            return '\n'.join(head)
+        if not right_row:
+            head.append(f'метод есть только в {left_alias}')
+            return '\n'.join(head)
+        left_body = left_row[5] or ''
+        right_body = right_row[5] or ''
+        if left_body == right_body:
+            head.append('Тела методов идентичны (с точностью до комментариев и пробелов)')
+            return '\n'.join(head)
+        lines = compare.method_diff(left_body, right_body, context=int(context))
+        head.append(f'Различия (контекст {context} строк):')
         return '\n'.join(head + lines)
 
     def extension_diff(self, extension_db, base_db, limit=30):
@@ -1337,6 +1369,41 @@ class McpServer:
             self.conn(ext_alias), self.conn(base_alias), fmt=ru_path,
             prefix=ext.get('name_prefix'), limit=int(limit),
             fmt_type=ru_type_str))
+        return '\n'.join(out)
+
+    def config_diff(self, db_left, db_right, limit=50, offset=0):
+        """Верхнеуровневое сравнение двух конфигураций (сводка различий)."""
+        left_alias = self._alias(db_left)
+        right_alias = self._alias(db_right)
+        result = compare.config_diff(
+            self.conn(left_alias), self.conn(right_alias),
+            left_alias, right_alias,
+            limit=int(limit), offset=int(offset))
+        out = [f'Сравнение конфигураций: {left_alias} ↔ {right_alias}',
+               f'  {left_alias}: {self.dbs[left_alias]["path"]}',
+               f'  {right_alias}: {self.dbs[right_alias]["path"]}',
+               '',
+               f'Объекты: {result["summary"]["objects"]}',
+               f'Реквизиты: {result["summary"]["attrs"]}',
+               f'Модули: {result["summary"]["modules"]}',
+               f'Методы: {result["summary"]["methods"]}',
+               f'СКД: {result["summary"]["skd"]}',
+               f'Только в {left_alias}: {result["summary"]["only_left"]}',
+               f'Только в {right_alias}: {result["summary"]["only_right"]}',
+               f'Изменённых объектов: {result["summary"]["changed"]}',
+               '']
+        if result['changed_objects']:
+            out.append('Изменённые объекты (по количеству модулей):')
+            for obj in result['changed_objects']:
+                out.append(f'  {obj["path"]} ({obj["type_ru"]}): '
+                           f'модулей {obj["modules_diff"]:+d}')
+            if result['total_changed'] > len(result['changed_objects']):
+                remaining = result['total_changed'] - len(result['changed_objects'])
+                out.append(f'… показано {len(result["changed_objects"])} из '
+                           f'{result["total_changed"]}; есть ещё {remaining} — '
+                           f'следующий вызов с offset={result["offset"] + result["limit"]}')
+        else:
+            out.append('Изменённых объектов не найдено')
         return '\n'.join(out)
 
     def object_tree(self, path='', depth=2, db=None):
@@ -3899,8 +3966,25 @@ TOOLS = [
          'path_right is needed only when the object is named differently in '
          'the right base.',
          _schema({'path': _STR, 'db_left': _STR, 'db_right': _STR,
-                  'path_right': _STR}, ('path', 'db_left', 'db_right')),
+                  'path_right': _STR, 'limit': _INT, 'offset': _INT},
+                 ('path', 'db_left', 'db_right')),
          McpServer.compare_object),
+    Tool('method_diff',
+         'Построчное сравнение ОДНОГО МЕТОДА в двух базах. Игнорирует комментарии '
+         'и пробелы (как git -w). Показывает изменённые строки с контекстом и номерами. '
+         'Используйте после compare_object для детального анализа изменённого метода.',
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
+                  'db_left': _STR, 'db_right': _STR, 'context': _INT},
+                 ('path', 'code_name', 'name', 'db_left', 'db_right')),
+         McpServer.method_diff),
+    Tool('config_diff',
+         'Верхнеуровневое сравнение ДВУХ КОНФИГУРАЦИЙ (сводка различий). '
+         'Показывает количество объектов, реквизитов, модулей, методов, СКД в каждой базе. '
+         'Находит объекты с изменённым количеством модулей (быстро, ~1 сек на 40k объектов). '
+         'Для детального анализа объекта используйте compare_object, для метода — method_diff.',
+         _schema({'db_left': _STR, 'db_right': _STR, 'limit': _INT, 'offset': _INT},
+                 ('db_left', 'db_right')),
+         McpServer.config_diff),
     Tool('extension_diff',
          'What an EXTENSION does relative to the main configuration, in one '
          'call: new objects (marked with the extension name prefix), borrowed '
