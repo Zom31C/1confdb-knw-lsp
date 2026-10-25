@@ -465,7 +465,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
-RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects), compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns; 8) role_rights / object_rights for access analysis — what a role is given and which roles carry explicit rights on an object (its fields and tabular sections included); effective_rights(roles=[…]) to combine several roles and see which role carries each right; role_diff(roles_a, roles_b) to see what one set has that another lacks; role_impact(role) or role_impact(roles_before, roles_after) to assess what methods, SKD queries, and programmatic checks lose a right when a role is narrowed — shows layers (static rights, RLS, programmatic checks as heuristic, UI visibility out of scope) and names the boundary of static analysis (privileged mode, dynamic calls). This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
+RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects); when several releases or extensions are open at once, pass scope=[aliases] — the exact combination of bases where missing dependencies may be resolved — and expect={alias: sha256-prefix from configuration_info} to pin snapshots: a dependency found only OUTSIDE the scope is reported as such, never silently borrowed from another release; compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns; 8) role_rights / object_rights for access analysis — what a role is given and which roles carry explicit rights on an object (its fields and tabular sections included); effective_rights(roles=[…]) to combine several roles and see which role carries each right; role_diff(roles_a, roles_b) to see what one set has that another lacks; role_impact(role) or role_impact(roles_before, roles_after) to assess what methods, SKD queries, and programmatic checks lose a right when a role is narrowed — shows layers (static rights, RLS, programmatic checks as heuristic, UI visibility out of scope) and names the boundary of static analysis (privileged mode, dynamic calls). This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
 
 All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing.
 
@@ -2797,29 +2797,111 @@ class McpServer:
         alias = self._alias(db)
         return [a for a in self.dbs if a != alias]
 
-    def foreign_manager(self, db, manager, name):
-        """(алиас, путь) — объект метаданных, найденный в другой открытой базе."""
-        for alias in self.other_aliases(db):
+    def _expected_sha(self, expect, alias):
+        """Ожидаемый отпечаток базы из expect={алиас: sha256}; None, если не задан."""
+        for key, value in (expect or {}).items():
+            if str(key).lower() == str(alias).lower():
+                return str(value)
+        return None
+
+    def _sha_note(self, alias, want):
+        """Причина несоответствия ожидаемому снимку; None — отпечаток совпал.
+
+        Отпечаток — source.file_sha256 (хранится при извлечении, заново не
+        вычисляется); сравнение префиксное, регистр не важен.
+        """
+        stored = _source_row(self.conn(alias)).get('file_sha256') or ''
+        if not stored:
+            return ('отпечаток исходника не сохранён (база собрана раньше '
+                    'появления отпечатков) — ожидаемый снимок не подтвердить')
+        if not stored.lower().startswith(str(want).lower()):
+            return (f'снимок не соответствует ожидаемому: ожидали {want}, '
+                    f'отпечаток базы {stored}')
+        return None
+
+    def resolve_scope(self, db=None, scope=None, expect=None):
+        """Область разрешения зависимостей (feedback п.4).
+
+        Комбинацию основной конфигурации и расширений задаёт scope (список
+        алиасов); None — все открытые базы рядом, как раньше. expect
+        ({алиас: file_sha256 или префикс}) закрепляет снимки: база с другим
+        отпечатком исключается из области с явной причиной, а для запрошенной
+        базы — ошибка запроса (иначе ответ был бы про другой релиз).
+
+        Возвращает (in_scope, outside, rejected): чужие базы области, открытые
+        ВНЕ области, исключённые [(алиас, причина)].
+        """
+        alias = self._alias(db)
+        expect = expect or {}
+        for key in expect:
+            if not any(a.lower() == str(key).lower() for a in self.dbs):
+                raise UserError(
+                    f'ожидаемый снимок задан для неоткрытой базы «{key}» '
+                    '(открыты: ' + ', '.join(self.dbs) + ')')
+        want = self._expected_sha(expect, alias)
+        if want is not None:
+            note = self._sha_note(alias, want)
+            if note:
+                raise UserError(f'база «{alias}»: {note}')
+        if scope is None:
+            candidates = [a for a in self.dbs if a != alias]
+        else:
+            candidates = []
+            for item in scope:
+                actual = next((a for a in self.dbs
+                               if a.lower() == str(item).lower()), None)
+                if actual is None:
+                    raise UserError(
+                        f'в области разрешения нет базы «{item}» — открыты: '
+                        + ', '.join(self.dbs))
+                if actual != alias and actual not in candidates:
+                    candidates.append(actual)
+        in_scope, rejected = [], []
+        for a in candidates:
+            want = self._expected_sha(expect, a)
+            note = self._sha_note(a, want) if want is not None else None
+            if note:
+                rejected.append((a, note))
+            else:
+                in_scope.append(a)
+        outside = [a for a in self.dbs
+                   if a != alias and a not in in_scope
+                   and a not in [r[0] for r in rejected]]
+        return in_scope, outside, rejected
+
+    def foreign_manager(self, db, manager, name, aliases=None):
+        """[(алиас, путь)] — объекты метаданных, найденные в базах области.
+
+        aliases=None — все остальные открытые базы (прежнее поведение);
+        список — только базы области разрешения; находок может быть
+        несколько, неоднозначность показывает вызывающий код.
+        """
+        hits = []
+        for alias in (self.other_aliases(db) if aliases is None else aliases):
             target = self.bsl_ctx(alias).resolve_manager(manager, name)
             if target is not None:
-                return alias, target
-        return None, None
+                hits.append((alias, target))
+        return hits
 
-    def foreign_module(self, db, module, method):
-        """Пометка о общем модуле, который живёт в другой открытой базе."""
-        for alias in self.other_aliases(db):
+    def foreign_module(self, db, module, method, aliases=None):
+        """[(алиас, пометка)] — общие модули, найденные в базах области."""
+        hits = []
+        for alias in (self.other_aliases(db) if aliases is None else aliases):
             ctx = self.bsl_ctx(alias)
             found = ctx.common_module(module)
             if found is None:
                 continue
             row = ctx.common_method(found['name'], method)
             if row is None:
-                return (f'общий модуль есть в базе «{alias}», но метода '
-                        f'{method} в нём нет')
+                hits.append((alias,
+                             f'общий модуль есть в базе «{alias}», но метода '
+                             f'{method} в нём нет'))
+                continue
             state = ('Экспорт' if row[0]
                      else 'не Экспорт — вызов извне не работает')
-            return f'общий модуль в базе «{alias}»: {method} — {state}'
-        return None
+            hits.append((alias,
+                         f'общий модуль в базе «{alias}»: {method} — {state}'))
+        return hits
 
     def get_method(self, path, code_name, name, db=None):
         row = self._method_row(path, code_name, name, db)
@@ -2891,13 +2973,22 @@ class McpServer:
                                  detail=' вхождений'))
         return '\n'.join(out)
 
-    def method_dependencies(self, path, code_name, name, db=None):
-        """Что использует метод: общие модули, метаданные, запросы, параметры."""
+    def method_dependencies(self, path, code_name, name, db=None,
+                            scope=None, expect=None):
+        """Что использует метод: общие модули, метаданные, запросы, параметры.
+
+        scope — область разрешения недостающих зависимостей (список алиасов:
+        комбинация основной конфигурации и расширений); expect — ожидаемые
+        отпечатки исходников {алиас: sha256 или префикс} (feedback п.4):
+        зависимость из старого релиза не «восстанавливается», если база вне
+        области или её снимок не совпал.
+        """
         from .bsl_analyzer import analyze, caller_context, split_params
         row = self._method_row(path, code_name, name, db)
         if not row:
             return (f'метод не найден: {self.resolve_path(path, db)} '
                     f'({code_name}) :: {name}')
+        in_scope, outside, rejected = self.resolve_scope(db, scope, expect)
         kind, mname, sig, dirs, _desc, body, exp, mod_ctx, start = row
         params = split_params(sig)
         ctx = self.bsl_ctx(db)
@@ -2908,6 +2999,16 @@ class McpServer:
         out.append(f'Контекст: {dirs or "директив нет"}'
                    + (f'; контекст модуля: {mod_ctx}' if mod_ctx else ''))
         out.append(f'Параметры: {", ".join(params) if params else "нет"}')
+        if scope is None:
+            area = ('эта база + все открытые рядом (передайте scope=[алиасы], '
+                    'чтобы задать область явно)'
+                    if self.other_aliases(db) else 'только эта база')
+        else:
+            area = 'эта база' + (''.join(f' + «{a}»' for a in in_scope)
+                                 if in_scope else ' (других баз в области нет)')
+        out.append(f'Область разрешения зависимостей: {area}')
+        for r_alias, reason in rejected:
+            out.append(f'  база «{r_alias}» ИСКЛЮЧЕНА из области: {reason}')
 
         out.append('\nОбщие модули и их методы:')
         if not report['modules']:
@@ -2922,13 +3023,30 @@ class McpServer:
             if target:
                 shown = ru_path(target)
             else:
-                alias, other = self.foreign_manager(db, manager, obj)
-                if other:
+                hits = self.foreign_manager(db, manager, obj,
+                                            aliases=in_scope)
+                if len(hits) > 1:
+                    shown = ('НЕОДНОЗНАЧНО: найдено в нескольких базах области '
+                             '(' + ', '.join(f'«{a}»' for a, _ in hits)
+                             + ') — сузьте scope')
+                elif hits:
+                    f_alias, other = hits[0]
                     shown = ('в этой базе НЕТ — есть в базе '
-                             f'«{alias}»: ' + ru_path(other))
+                             f'«{f_alias}»: ' + ru_path(other))
                 else:
-                    shown = 'НЕ НАЙДЕНО в этой базе' + (
-                        ' и в открытых рядом' if self.other_aliases(db) else '')
+                    out_hits = (self.foreign_manager(db, manager, obj,
+                                                     aliases=outside)
+                                if outside else [])
+                    if out_hits:
+                        shown = ('НЕ НАЙДЕНО в области разрешения; есть только '
+                                 f'ВНЕ области в базе «{out_hits[0][0]}» — '
+                                 'для этой комбинации не используется')
+                    else:
+                        shown = 'НЕ НАЙДЕНО в этой базе' + (
+                            ' и в открытых рядом'
+                            if scope is None and self.other_aliases(db)
+                            else (' и в базах области'
+                                  if scope is not None else ''))
             out.append(f'  строка {start + line - 1}: {manager}.{obj} -> {shown}')
 
         out.append('\nЗапросы в коде:')
@@ -2968,16 +3086,32 @@ class McpServer:
         if report['unknown']:
             foreign, unresolved = [], []
             for left, right, line in report['unknown'][:20]:
-                note = self.foreign_module(db, left, right)
+                hits = self.foreign_module(db, left, right, aliases=in_scope)
                 item = f'  строка {start + line - 1}: {left}.{right}'
-                if note:
-                    foreign.append(f'{item} — {note}')
+                if len(hits) > 1:
+                    foreign.append(
+                        f'{item} — НЕОДНОЗНАЧНО: общий модуль есть в базах '
+                        + ', '.join(f'«{a}»' for a, _ in hits)
+                        + ' (сузьте scope)')
+                elif hits:
+                    foreign.append(f'{item} — {hits[0][1]}')
                 else:
-                    unresolved.append(item)
+                    out_hits = (self.foreign_module(db, left, right,
+                                                    aliases=outside)
+                                if outside else [])
+                    if out_hits:
+                        foreign.append(
+                            f'{item} — в области разрешения НЕТ; есть только '
+                            'вне области: ' + out_hits[0][1])
+                    else:
+                        unresolved.append(item)
             if foreign:
                 out.append('\nЗависимости из другой открытой базы (в этой их нет '
                            '— так расширение или внешняя обработка обращается '
-                           'к основной конфигурации):')
+                           'к основной конфигурации):'
+                           if scope is None else
+                           '\nЗависимости, не найденные в этой базе (область '
+                           'разрешения и находки вне её):')
                 out.extend(foreign)
             if unresolved:
                 out.append('\nНе разрешено (не общий модуль, не менеджер '
@@ -3975,13 +4109,22 @@ TOOLS = [
          'calls (and whether those methods exist and are Экспорт), the '
          'metadata it touches (Справочники.Х, Документы.Х…), the tables and '
          'fields of the queries inside it (each query is validated), and what '
-         'could not be resolved. When another knowledge base is open — a main '
-         'configuration next to an extension or an external data processor — '
-         'references missing from this base are looked up in the others too, '
-         'and the answer names the base each one was found in instead of just '
-         'saying "not found". Use it before porting a customization to '
+         'could not be resolved. When other knowledge bases are open, '
+         'references missing from this base are looked up there too and the '
+         'answer names the base each one was found in. Pass scope=[aliases] '
+         'to pin the RESOLUTION AREA to an explicit combination (main '
+         'configuration + extensions, e.g. one release): a dependency found '
+         'ONLY outside the scope is reported as such and never counts as '
+         'available, a hit in several scope bases is reported as ambiguous. '
+         'Pass expect={alias: file_sha256 or prefix} (ids from '
+         'configuration_info) to pin exact snapshots: a base whose stored '
+         'fingerprint differs is refused (queried base) or excluded from the '
+         'area (scope base). Use it before porting a customization to '
          'another configuration — it lists everything the code needs there.',
-         _schema({'path': _STR, 'code_name': _STR, 'name': _STR, 'db': _DB, 'group': _GROUP},
+         _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
+                  'scope': {'type': 'array', 'items': _STR},
+                  'expect': {'type': 'object'},
+                  'db': _DB, 'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.method_dependencies),
     Tool('method_result_schema',

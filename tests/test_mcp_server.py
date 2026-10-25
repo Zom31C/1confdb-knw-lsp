@@ -839,6 +839,70 @@ def test_method_dependencies_single_base_has_no_foreign_sections(tmp_path_factor
     assert 'и в открытых рядом' not in out
 
 
+def test_method_dependencies_scope_keeps_outside_base_out(tmp_path_factory):
+    """Приёмка feedback п.4: зависимость не «восстанавливается» из старой
+    базы, открытой рядом, если та вне явной области разрешения."""
+    main_db, ext_db = _ext_with_foreign_calls(tmp_path_factory)
+    server = McpServer([main_db, ext_db])
+    out = _call(server, 'method_dependencies', db='расширение',
+                path='DataProcessor/ДопОбработка', code_name='obj',
+                name='Обработать', scope=[])['content'][0]['text']
+    assert 'Область разрешения зависимостей: эта база (других баз в области нет)' in out
+    # прежнее разрешение «есть в соседней базе» больше не выдаётся
+    assert 'в этой базе НЕТ — есть в базе' not in out
+    assert 'Зависимости из другой открытой базы' not in out
+    # находки ВНЕ области названы явно, а не просто «не найдено»
+    assert 'НЕ НАЙДЕНО в области разрешения; есть только ВНЕ области ' \
+           'в базе «основная»' in out
+    assert 'в области разрешения НЕТ; есть только вне области' in out
+    # явная область с той же базой — снова разрешает
+    out2 = _call(server, 'method_dependencies', db='расширение',
+                 path='DataProcessor/ДопОбработка', code_name='obj',
+                 name='Обработать', scope=['основная'])['content'][0]['text']
+    assert 'Область разрешения зависимостей: эта база + «основная»' in out2
+    assert 'в этой базе НЕТ — есть в базе «основная»' in out2
+    # неизвестная база в scope — ошибка запроса, а не тихий игнор
+    bad = _call(server, 'method_dependencies', db='расширение',
+                path='DataProcessor/ДопОбработка', code_name='obj',
+                name='Обработать', scope=['неттакой'])
+    assert bad.get('isError')
+    assert 'в области разрешения нет базы «неттакой»' in bad['content'][0]['text']
+
+
+def test_method_dependencies_expect_pins_snapshot(tmp_path_factory):
+    """expect закрепляет снимки: несовпавший отпечаток исключает базу."""
+    main_db, ext_db = _ext_with_foreign_calls(tmp_path_factory)
+    conn = sqlite3.connect(main_db)
+    conn.execute("UPDATE source SET file_sha256='abcd1234" + '0' * 56 + "'")
+    conn.commit()
+    conn.close()
+    server = McpServer([main_db, ext_db])
+    common = dict(path='DataProcessor/ДопОбработка', code_name='obj',
+                  name='Обработать', db='расширение', scope=['основная'])
+    # префикс совпал с хранящимся отпечатком — база области используется
+    ok = _call(server, 'method_dependencies', expect={'основная': 'abcd1234'},
+               **common)['content'][0]['text']
+    assert 'в этой базе НЕТ — есть в базе «основная»' in ok
+    assert 'ИСКЛЮЧЕНА из области' not in ok
+    # не совпал — база исключена, зависимость не «восстанавливается»
+    bad = _call(server, 'method_dependencies', expect={'основная': 'ffff9999'},
+                **common)['content'][0]['text']
+    assert 'база «основная» ИСКЛЮЧЕНА из области' in bad
+    assert 'снимок не соответствует ожидаемому' in bad
+    assert 'в этой базе НЕТ — есть в базе' not in bad
+    # снимок запрошенной базы не совпал — ошибка, а не ответ про другой релиз
+    err = _call(server, 'method_dependencies', path=CM, code_name='obj',
+                name='Экспортная', db='основная',
+                expect={'основная': 'ffff9999'})
+    assert err.get('isError')
+    assert 'снимок не соответствует ожидаемому' in err['content'][0]['text']
+    # expect для неоткрытой базы — ошибка запроса
+    err2 = _call(server, 'method_dependencies', path=CM, code_name='obj',
+                 name='Экспортная', db='основная',
+                 expect={'неттакой': 'abcd'})
+    assert err2.get('isError') and 'неоткрытой базы' in err2['content'][0]['text']
+
+
 def test_error_categories(tmp_path_factory):
     server = _server(tmp_path_factory)
     denied = _call(server, 'sql', query='DELETE FROM meta_object')
