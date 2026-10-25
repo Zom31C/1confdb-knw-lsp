@@ -440,7 +440,7 @@ DATABASE IDENTIFIER: every tool response includes a header line identifying the 
 
 PAGING SEARCH RESULTS: find_objects, find_field, find_methods, find_skd, find_xdto, refs_of, role_rights and object_rights return ONE PAGE of their hits — limit is the page size (1..200), offset is how many hits of the SAME search to skip. Every answer ends with a paging line: '… всего найдено N; показано a–b; есть ещё K — следующий вызов с offset=b' (total hit count, the range shown, how many are left and the offset to pass for the next page); when the page holds everything it says 'это все результаты' instead. The order of hits is stable, so consecutive pages never overlap or skip — to read further, call the same tool with the printed offset. Do NOT raise limit to 200 and do not narrow the mask just to fit one answer: page. find_xdto counts matching types and properties as one list (types first, then properties) and names both counts; refs_of pages each of its two lists with the same offset; role_rights pages the targets of a role and object_rights pages the roles touching an object.
 
-COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the extension methods and whether one REPLACES a stock method (&Вместо) or inserts code around it (&После/&Перед), the attributes it adds, and its external dependencies. configuration_info says WHICH configuration and release a base holds and WHAT KIND of file it came from — .cf configuration, .cfe extension, .epf external data processor, .erf external report (name, version, compatibility mode, source file, build date); db_list repeats the kind and the version in one line per open base. These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
+COMPARING BASES: compare_object(path, db_left, db_right) diffs ONE object between two open bases in a single call — attributes and their types, tabular sections, register dimensions/resources, forms and commands, modules, methods (signature, directives, body), SKD queries. Use it for standard-vs-customized or release-to-release analysis instead of fetching two passports and diffing them by hand. extension_diff(extension_db, base_db, base_db_new?) answers the task-level question 'what does this extension do': new objects (carrying the extension name prefix), borrowed objects, the attributes it adds, its external dependencies, and the INTERCEPT MATRIX — extension method → directive (&Вместо replaces the target, &После/&Перед insert code around it, &ИзменениеИКонтроль changes it under control) → target method in the main configuration; with base_db_new (another release of the main configuration) every row also names whether the TARGET changed between the two releases, own methods and missing targets separately. configuration_info says WHICH configuration and release a base holds and WHAT KIND of file it came from — .cf configuration, .cfe extension, .epf external data processor, .erf external report (name, version, compatibility mode, source file, build date); db_list repeats the kind and the version in one line per open base. These three take explicit base aliases (db_left/db_right, extension_db/base_db), not the db parameter, and db='*' does not apply to them.
 
 REGISTERS: object_card of a РегистрСведений/РегистрНакопления lists Измерения (dimensions — they form the record key), Ресурсы (resources — the stored values) and Реквизиты (attributes) as SEPARATE groups, plus Периодичность and Режим записи (независимый / подчинение регистратору). Before writing СрезПоследних or joining a register, check whether the field you rely on is a dimension: only dimensions guarantee one row per key. A periodicity code that could not be decoded is shown as the raw code, never as a guessed name.
 
@@ -1386,10 +1386,17 @@ class McpServer:
         return '\n'.join(head + compare.format_method_compare(
             res, left_alias, right_alias))
 
-    def extension_diff(self, extension_db, base_db, limit=30):
-        """Что делает расширение относительно основной конфигурации."""
+    def extension_diff(self, extension_db, base_db, base_db_new=None,
+                       limit=30):
+        """Что делает расширение относительно основной конфигурации.
+
+        base_db_new — новый релиз основной конфигурации: с ним матрица
+        перехватов показывает, как каждая цель изменилась между двумя
+        релизами (feedback п.3).
+        """
         ext_alias = self._alias(extension_db)
         base_alias = self._alias(base_db)
+        new_alias = self._alias(base_db_new) if base_db_new else None
         ext = self.cfg_props(ext_alias)
         base = self.cfg_props(base_alias)
         out = []
@@ -1407,6 +1414,14 @@ class McpServer:
         base_ver = f' {base["version"]}' if base.get('version') else ''
         out.append(f'Основная конфигурация: {base_name}{base_ver}')
         out.append(f'  база {base_alias}: {self.dbs[base_alias]["path"]}')
+        if new_alias:
+            new_props = self.cfg_props(new_alias)
+            new_name = new_props.get('name') or new_alias
+            new_ver = (f' {new_props["version"]}'
+                       if new_props.get('version') else '')
+            out.append(f'Новый релиз основной конфигурации: '
+                       f'{new_name}{new_ver}')
+            out.append(f'  база {new_alias}: {self.dbs[new_alias]["path"]}')
         if ext.get('root_type') != 'ConfigurationExtension':
             out.append(f'Внимание: корень базы {ext_alias} — '
                        f'{ext.get("root_type_ru") or ext.get("root_type")}, '
@@ -1414,8 +1429,9 @@ class McpServer:
                        'различия двух баз как есть')
         out.append('')
         out.extend(compare.extension_report(
-            self.conn(ext_alias), self.conn(base_alias), fmt=ru_path,
-            prefix=ext.get('name_prefix'), limit=int(limit),
+            self.conn(ext_alias), self.conn(base_alias),
+            self.conn(new_alias) if new_alias else None,
+            fmt=ru_path, prefix=ext.get('name_prefix'), limit=int(limit),
             fmt_type=ru_type_str))
         return '\n'.join(out)
 
@@ -3758,7 +3774,8 @@ class Tool:
             # ревизия схемы проверяется ДО запроса: база чужой ревизии не
             # читается вовсе, и ответ велит пересобрать её вместо того чтобы
             # упасть ошибкой схемы на отсутствующей таблице или колонке
-            for key in ('db', 'db_left', 'db_right', 'extension_db', 'base_db'):
+            for key in ('db', 'db_left', 'db_right', 'extension_db',
+                        'base_db', 'base_db_new'):
                 if key not in props:
                     continue
                 alias = server._alias(args.get(key))
@@ -4073,12 +4090,18 @@ TOOLS = [
     Tool('extension_diff',
          'What an EXTENSION does relative to the main configuration, in one '
          'call: new objects (marked with the extension name prefix), borrowed '
-         'objects, the extension methods inside them with their directives '
-         '(&Вместо replaces a stock method, &После/&Перед insert code around '
-         'it), attributes the extension adds, and external dependencies '
-         '(references to objects living outside the extension). Both arguments '
-         'are aliases from db_list.',
-         _schema({'extension_db': _STR, 'base_db': _STR, 'limit': _INT},
+         'objects, the attributes the extension adds, and external '
+         'dependencies (references to objects living outside the extension). '
+         'Extension methods come as an INTERCEPT MATRIX: method → directive '
+         '(&Вместо replaces the target, &После/&Перед insert code around it, '
+         '&ИзменениеИКонтроль changes it under control) → target method in '
+         'the main configuration; own methods and missing targets are '
+         'reported separately. Pass base_db_new (a second release of the '
+         'main configuration) and every row also says whether its TARGET '
+         'changed between the two releases — unchanged handlers stay '
+         'visibly unchanged. All arguments are aliases from db_list.',
+         _schema({'extension_db': _STR, 'base_db': _STR,
+                  'base_db_new': _STR, 'limit': _INT},
                  ('extension_db', 'base_db')),
          McpServer.extension_diff),
     Tool('configuration_info',

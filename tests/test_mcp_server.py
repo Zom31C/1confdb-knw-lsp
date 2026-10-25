@@ -22,6 +22,7 @@ from confdb.mcp_server import (McpServer, collect_groups,  # noqa: E402
 
 from test_writer import _write, make_chart_dump, make_dump  # noqa: E402
 from test_writer_roles import RIGHT_READ, ROLE_RIGHTS, _role_dir  # noqa: E402
+from test_compare import _add_method  # noqa: E402
 
 
 def _server(tmp_path_factory):
@@ -1169,6 +1170,46 @@ def test_extension_diff(tmp_path_factory):
     assert 'Справочник.Справочник1' in out
     # корень тестовой базы — конфигурация, а не расширение: честное предупреждение
     assert 'не расширение конфигурации' in out
+
+
+def test_extension_diff_intercept_matrix(tmp_path_factory):
+    """Feedback п.3: матрица перехват→цель→изменение между двумя релизами."""
+    ext_db = _make_db(tmp_path_factory, 'расш.sqlite')
+    old_db = _make_db(tmp_path_factory, 'старая.sqlite')
+    new_db = _make_db(tmp_path_factory, 'новая.sqlite')
+    for db in (old_db, new_db):
+        conn = sqlite3.connect(db)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'ОбработатьРезервы1',
+                    'Процедура ОбработатьРезервы1()\n    А = 1;\n'
+                    'КонецПроцедуры', 10)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'Прочее',
+                    'Процедура Прочее()\n    В = 3;\nКонецПроцедуры', 11)
+        conn.close()
+    # новый релиз: изменился только соседний метод модуля
+    conn = sqlite3.connect(new_db)
+    conn.execute("UPDATE method SET body='Процедура Прочее()\n    В = 300;\n"
+                 "КонецПроцедуры' WHERE name='Прочее'")
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(ext_db)
+    _add_method(conn, 'Catalog/Справочник1', 'obj', 'ОбработатьРезервы1',
+                'Процедура ОбработатьРезервы1()\n    // вставка\n'
+                'КонецПроцедуры', 20, dirs='&После("ОбработатьРезервы1")')
+    conn.close()
+    server = McpServer([ext_db, old_db, new_db])
+    out = _call(server, 'extension_diff', extension_db='расш',
+                base_db='старая',
+                base_db_new='новая')['content'][0]['text']
+    assert 'Новый релиз основной конфигурации' in out
+    assert '&После("ОбработатьРезервы1")' in out
+    assert 'вставляет код после целевого метода' in out
+    # приёмка: цель не изменилась между релизами, хотя соседний метод изменился
+    assert 'цель между релизами: без изменений' in out
+    # без base_db_new матрица остаётся, но колонки релизов нет
+    out_old = _call(server, 'extension_diff', extension_db='расш',
+                    base_db='старая')['content'][0]['text']
+    assert '&После("ОбработатьРезервы1")' in out_old
+    assert 'цель между релизами' not in out_old
 
 
 def test_db_management_tools(tmp_path_factory):

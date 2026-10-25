@@ -286,3 +286,125 @@ def test_method_compare_identical():
     assert res['identical']
     assert compare.format_method_compare(res) == \
         ['Различий нет: методы идентичны']
+
+
+# -- матрица перехватов расширения (feedback п.3) -----------------------------
+
+def _add_method(conn, path, code_name, name, body, ord_, dirs=None,
+                kind='процедура', sig='', exp=0, start=1):
+    """Добавить метод в модуль объекта (модуль создаётся при отсутствии)."""
+    row = conn.execute(
+        'SELECT id FROM module WHERE object_id=(SELECT id FROM meta_object'
+        ' WHERE path=?) AND code_name=?', (path, code_name)).fetchone()
+    if row:
+        mid = row[0]
+    else:
+        mid = conn.execute(
+            'INSERT INTO module (object_id, code_name, context, body)'
+            " VALUES ((SELECT id FROM meta_object WHERE path=?), ?, '', '')",
+            (path, code_name)).lastrowid
+    conn.execute(
+        'INSERT INTO method (module_id, ord, kind, name, signature,'
+        ' is_export, directives, description, line_start, line_end, body)'
+        ' VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        (mid, ord_, kind, name, sig, exp, dirs, '', start,
+         start + body.count('\n'), body))
+    conn.commit()
+
+
+def test_parse_intercepts():
+    assert compare.parse_intercepts('&После("ОбработкаПроведения")') == \
+        [('После', 'ОбработкаПроведения')]
+    assert compare.parse_intercepts('&НаСервере\n&Вместо("А")') == \
+        [('Вместо', 'А')]
+    assert compare.parse_intercepts('&ИзменениеИКонтроль("Б")') == \
+        [('ИзменениеИКонтроль', 'Б')]
+    assert compare.parse_intercepts('&НаКлиенте') == []
+    assert compare.parse_intercepts(None) == []
+
+
+def test_intercept_matrix_unchanged_targets(tmp_path_factory):
+    """Приёмка feedback п.3: два неизменившихся обработчика показаны как
+    неизменившиеся цели, независимо от изменений остальных методов модуля."""
+    old_db = _db(tmp_path_factory, 'old.sqlite')
+    new_db = _db(tmp_path_factory, 'new.sqlite')
+    ext_db = _db(tmp_path_factory, 'ext.sqlite')
+    for db in (old_db, new_db):
+        conn = sqlite3.connect(db)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'ОбработатьРезервы1',
+                    'Процедура ОбработатьРезервы1()\n    А = 1;\n'
+                    'КонецПроцедуры', 10)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'ОбработатьРезервы2',
+                    'Процедура ОбработатьРезервы2()\n    Б = 2;\n'
+                    'КонецПроцедуры', 11)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'Прочее',
+                    'Процедура Прочее()\n    В = 3;\nКонецПроцедуры', 12)
+        conn.close()
+    # новый релиз: изменился только третий метод модуля
+    conn = sqlite3.connect(new_db)
+    conn.execute("UPDATE method SET body='Процедура Прочее()\n    В = 300;\n"
+                 "КонецПроцедуры' WHERE name='Прочее'")
+    conn.commit()
+    conn.close()
+    # расширение перехватывает оба обработчика
+    conn = sqlite3.connect(ext_db)
+    _add_method(conn, 'Catalog/Справочник1', 'obj', 'ОбработатьРезервы1',
+                'Процедура ОбработатьРезервы1()\n    // вставка\n'
+                'КонецПроцедуры', 20, dirs='&После("ОбработатьРезервы1")')
+    _add_method(conn, 'Catalog/Справочник1', 'obj', 'ОбработатьРезервы2',
+                'Процедура ОбработатьРезервы2()\n    // вставка\n'
+                'КонецПроцедуры', 21, dirs='&После("ОбработатьРезервы2")')
+    conn.close()
+
+    rows, own, missing = compare.intercept_matrix(
+        sqlite3.connect(ext_db), sqlite3.connect(old_db),
+        sqlite3.connect(new_db))
+    assert len(rows) == 2 and not missing
+    assert {r['target'] for r in rows} == {'ОбработатьРезервы1',
+                                           'ОбработатьРезервы2'}
+    assert all(r['releases'] == 'без изменений' for r in rows)
+    # штатный метод без директив — собственный метод расширения
+    assert ('Catalog/Справочник1', 'obj', 'Тест', True) in own
+
+
+def test_intercept_matrix_changed_missing_and_control(tmp_path_factory):
+    old_db = _db(tmp_path_factory, 'o.sqlite')
+    new_db = _db(tmp_path_factory, 'n.sqlite')
+    ext_db = _db(tmp_path_factory, 'e.sqlite')
+    for db in (old_db, new_db):
+        conn = sqlite3.connect(db)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'Цель',
+                    'Процедура Цель()\n    А = 1;\nКонецПроцедуры', 10)
+        _add_method(conn, 'Catalog/Справочник1', 'obj', 'ЦельКонтроль',
+                    'Процедура ЦельКонтроль()\n    Х = 1;\n    У = 2;\n'
+                    'КонецПроцедуры', 11)
+        conn.close()
+    conn = sqlite3.connect(new_db)
+    conn.execute("UPDATE method SET body='Процедура Цель()\n    А = 100;\n"
+                 "КонецПроцедуры' WHERE name='Цель'")
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(ext_db)
+    _add_method(conn, 'Catalog/Справочник1', 'obj', 'Цель',
+                'Процедура Цель()\n    А = 1;\nКонецПроцедуры', 20,
+                dirs='&Вместо("Цель")')
+    _add_method(conn, 'Catalog/Справочник1', 'obj', 'ЧегоНет',
+                'Процедура ЧегоНет()\nКонецПроцедуры', 21,
+                dirs='&Перед("НетТакого")')
+    _add_method(conn, 'Catalog/Справочник1', 'obj', 'ЦельКонтроль',
+                'Процедура ЦельКонтроль()\n    Х = 1;\n    У = 200;\n'
+                '    З = 3;\nКонецПроцедуры', 22,
+                dirs='&ИзменениеИКонтроль("ЦельКонтроль")')
+    conn.close()
+
+    rows, _own, missing = compare.intercept_matrix(
+        sqlite3.connect(ext_db), sqlite3.connect(old_db),
+        sqlite3.connect(new_db))
+    by_target = {r['target']: r for r in rows}
+    assert by_target['Цель']['releases'] == 'изменилось: исполняемый текст'
+    ctrl = by_target['ЦельКонтроль']
+    assert ctrl['releases'] == 'без изменений'
+    # вставки/удаления относительно контрольного текста цели
+    assert ctrl['control'] == 'тело +2/-1 строк'
+    assert [m['target'] for m in missing] == ['НетТакого']
+    assert missing[0]['directive'] == 'Перед'

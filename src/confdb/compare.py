@@ -34,6 +34,20 @@ REGISTER_TYPES = frozenset({
 # (так выглядит ссылка на объект основной конфигурации из расширения)
 RE_REF = re.compile(r'Ссылка:\s*([^|()]+)')
 
+# директивы перехвата расширения: &Вместо("Х"), &После("Х"), &Перед("Х"),
+# &ИзменениеИКонтроль("Х"); контекстные директивы (&НаСервере…) перехватами
+# не являются
+RE_INTERCEPT = re.compile(
+    r'&\s*(Вместо|После|Перед|ИзменениеИКонтроль)\s*\(\s*"([^"]+)"',
+    re.IGNORECASE)
+
+INTERCEPT_VERBS = {
+    'вместо': 'замещает целевой метод',
+    'после': 'вставляет код после целевого метода',
+    'перед': 'вставляет код перед целевым методом',
+    'изменениеиконтроль': 'изменяет целевой метод (вариант с контролем)',
+}
+
 
 def sha1(text):
     return hashlib.sha1((text or '').encode('utf-8')).hexdigest()
@@ -791,10 +805,153 @@ def split_extension(conn_ext, conn_base):
     return new, borrowed
 
 
-def extension_report(conn_ext, conn_base, fmt=str, prefix=None,
-                     limit=MAX_ITEMS, fmt_type=None):
+def parse_intercepts(directives):
+    """[(директива, имя целевого метода)] из текста директив метода.
+
+    Директивы перехвата расширения: &Вместо("Х"), &После("Х"), &Перед("Х"),
+    &ИзменениеИКонтроль("Х"). Контекстные директивы (&НаСервере и т.п.)
+    перехватами не являются.
+    """
+    return [(kind, name)
+            for kind, name in RE_INTERCEPT.findall(directives or '')]
+
+
+def _method_rows_by_path(conn, path):
+    """{(code_name, имя в нижнем регистре): строка метода в формате _method_row}."""
+    rows = {}
+    for code, kind, name, sig, dirs, desc, body, exp, ctx, start \
+            in conn.execute(
+                'SELECT m.code_name, mt.kind, mt.name, mt.signature,'
+                ' mt.directives, mt.description, mt.body, mt.is_export,'
+                ' m.context, mt.line_start'
+                ' FROM meta_object o'
+                ' JOIN module m ON m.object_id = o.id'
+                ' JOIN method mt ON mt.module_id = m.id'
+                ' WHERE o.path = ?', (path,)):
+        rows[(code, name.lower())] = (kind, name, sig, dirs, desc, body,
+                                      exp, ctx, start)
+    return rows
+
+
+def _find_target(rows, code, target):
+    """Строка целевого метода: сначала в том же модуле, затем в любом модуле объекта."""
+    key = target.lower()
+    row = rows.get((code, key))
+    if row is None:
+        row = next((r for (c, n), r in rows.items() if n == key), None)
+    return row
+
+
+def _release_verdict(cmp_res):
+    """Короткий вердикт по method_compare: чем цель изменилась между релизами."""
+    bits = []
+    if cmp_res['body_diff']:
+        bits.append('исполняемый текст')
+    p = cmp_res['params']
+    if p['added'] or p['removed'] or p['defaults'] or p['order_changed']:
+        bits.append('параметры')
+    if cmp_res['export']:
+        bits.append('Экспорт')
+    if cmp_res['directives']:
+        bits.append('директивы')
+    if cmp_res['kind']:
+        bits.append('вид метода')
+    if cmp_res['comments_changed']:
+        bits.append('комментарии')
+    if bits:
+        return 'изменилось: ' + ', '.join(bits)
+    if cmp_res['formatting_only']:
+        return 'изменилось только форматирование'
+    return 'без изменений'
+
+
+def intercept_matrix(conn_ext, conn_base, conn_base_new=None):
+    """Матрица перехватов: метод расширения → директива → цель → её изменение.
+
+    Feedback п.3: цели разрешаются в основной конфигурации (conn_base — старый
+    релиз); если задан conn_base_new (новый релиз), каждая цель дополнительно
+    сравнивается method_compare — неизменившиеся обработчики остаются
+    неизменившимися независимо от изменений других методов модуля. Для
+    &ИзменениеИКонтроль видно вставки/удаления метода расширения относительно
+    текста цели (контрольного экземпляра).
+
+    Возвращает (rows, own, missing):
+      rows — перехваты: {path, code, method, kind, directive, target,
+             releases?, control?, source_note?};
+      own — собственные методы без директив перехвата: (path, code, name,
+             name_in_base);
+      missing — директивы, цели которых в основной конфигурации не найдены.
+    """
+    _new, borrowed = split_extension(conn_ext, conn_base)
+    ext_by_path = {}
+    for path, code, name, kind, dirs, _exp in extension_methods(conn_ext):
+        if path in borrowed:
+            ext_by_path.setdefault(path, []).append((code, name, kind, dirs))
+    rows, own, missing = [], [], []
+    for path in sorted(ext_by_path):
+        ext_rows = base_old = base_new = base_keys = None
+        for code, name, kind, dirs in ext_by_path[path]:
+            intercepts = parse_intercepts(dirs)
+            if not intercepts:
+                if base_keys is None:
+                    base_keys = method_keys(conn_base, path)
+                own.append((path, code, name,
+                            (code, name.lower()) in base_keys))
+                continue
+            if base_old is None:
+                base_old = _method_rows_by_path(conn_base, path)
+            if ext_rows is None:
+                ext_rows = _method_rows_by_path(conn_ext, path)
+            if conn_base_new is not None and base_new is None:
+                base_new = _method_rows_by_path(conn_base_new, path)
+            for directive, target in intercepts:
+                item = {'path': path, 'code': code, 'method': name,
+                        'kind': kind, 'directive': directive,
+                        'target': target}
+                trow = _find_target(base_old, code, target)
+                if trow is None:
+                    missing.append(item)
+                    continue
+                if not trow[5]:
+                    item['source_note'] = ('исходник целевого метода пуст '
+                                           '(не извлечён)')
+                if base_new is not None:
+                    nrow = _find_target(base_new, code, target)
+                    item['releases'] = ('в новом релизе отсутствует'
+                                        if nrow is None
+                                        else _release_verdict(
+                                            method_compare(trow, nrow)))
+                if directive.lower() == 'изменениеиконтроль':
+                    erow = ext_rows.get((code, name.lower()))
+                    if erow is not None and trow[5]:
+                        ctrl = method_compare(trow, erow)
+                        parts = []
+                        if ctrl['body_diff']:
+                            plus = sum(1 for ln in ctrl['body_diff']
+                                       if ln.startswith('+'))
+                            minus = sum(1 for ln in ctrl['body_diff']
+                                        if ln.startswith('-'))
+                            parts.append(f'тело +{plus}/-{minus} строк')
+                        p = ctrl['params']
+                        if (p['added'] or p['removed'] or p['defaults']
+                                or p['order_changed']):
+                            parts.append('параметры')
+                        if ctrl['export']:
+                            parts.append('Экспорт')
+                        if ctrl['comments_changed']:
+                            parts.append('комментарии')
+                        item['control'] = ('; '.join(parts) if parts
+                                           else 'совпадает с текстом цели')
+                rows.append(item)
+    return rows, own, missing
+
+
+def extension_report(conn_ext, conn_base, conn_base_new=None, fmt=str,
+                     prefix=None, limit=MAX_ITEMS, fmt_type=None):
     """Разделы отчёта «что делает расширение»: объекты, методы, реквизиты.
 
+    :param conn_base_new: новый релиз основной конфигурации — с ним матрица
+        перехватов показывает изменение каждой цели между двумя релизами
     :param fmt: функция показа пути (сервер передаёт ru_path)
     :param prefix: префикс имён расширения из его заголовка ('Расш1_')
     :param fmt_type: функция показа типа реквизита (сервер передаёт ru_type_str)
@@ -830,37 +987,56 @@ def extension_report(conn_ext, conn_base, fmt=str, prefix=None,
     if len(borrowed) > limit:
         out.append(f'  … и ещё {len(borrowed) - limit}')
 
-    out.append('\nМетоды расширения (что замещается и куда вставляются вставки):')
-    # один проход по методам расширения вместо запроса на каждый объект
-    ext_methods = {}
-    for row in extension_methods(conn_ext):
-        ext_methods.setdefault(row[0], []).append(row)
-    changed_objects = 0
-    for path in sorted(borrowed):
-        rows = ext_methods.get(path) or []
-        if not rows:
-            continue
-        changed_objects += 1
-        if changed_objects > limit:
+    out.append('\nМетоды расширения (перехваты, цели и их состояние):')
+    matrix, own_methods, missing_targets = intercept_matrix(
+        conn_ext, conn_base, conn_base_new)
+    by_path = {}
+    for item in matrix:
+        by_path.setdefault(item['path'], []).append(item)
+    shown_objects = 0
+    for path in sorted(by_path):
+        shown_objects += 1
+        if shown_objects > limit:
             # потолок по числу объектов: без него отчёт о расширении с тысячами
             # заимствований уходит в контекст модели десятками тысяч строк
             continue
-        base_keys = method_keys(conn_base, path)
         out.append(f'  {fmt(path)}:')
-        for _, code, name, kind, dirs, exp in rows[:limit]:
-            key = (code, name.lower())
-            verdict = 'замещает штатный метод' if key in base_keys \
-                else 'новый метод (в основной базе такого нет)'
-            tail = f' [{dirs}]' if dirs else ''
-            out.append(f'    {code}::{kind} {name}(){tail} — {verdict}'
-                       + (' Экспорт' if exp else ''))
-        if len(rows) > limit:
-            out.append(f'    … и ещё {len(rows) - limit}')
-    if not changed_objects:
-        out.append('  в заимствованных объектах методов нет')
-    elif changed_objects > limit:
-        out.append(f'  … и ещё {changed_objects - limit} объектов с методами '
+        items = by_path[path]
+        for it in items[:limit]:
+            verb = INTERCEPT_VERBS.get(it['directive'].lower(),
+                                       'перехватывает целевой метод')
+            out.append(f'    {it["code"]}::{it["kind"]} {it["method"]}() '
+                       f'[&{it["directive"]}("{it["target"]}")] — {verb}')
+            if it.get('source_note'):
+                out.append(f'      ! {it["source_note"]}')
+            if it.get('releases'):
+                out.append(f'      цель между релизами: {it["releases"]}')
+            if it.get('control'):
+                out.append(f'      вставки/удаления относительно '
+                           f'контрольного текста: {it["control"]}')
+        if len(items) > limit:
+            out.append(f'    … и ещё {len(items) - limit} перехватов')
+    if not matrix:
+        out.append('  перехватов директивами нет')
+    elif shown_objects > limit:
+        out.append(f'  … и ещё {shown_objects - limit} объектов с перехватами '
                    '(увеличьте limit)')
+    if own_methods:
+        out.append('\nСобственные методы расширения (не перехватывают цель):')
+        for path, code, name, name_in_base in own_methods[:limit]:
+            note = (' — имя совпадает со штатным методом, но директивы '
+                    'перехвата нет' if name_in_base else '')
+            out.append(f'  {fmt(path)}: {code}::{name}{note}')
+        if len(own_methods) > limit:
+            out.append(f'  … и ещё {len(own_methods) - limit}')
+    if missing_targets:
+        out.append('\nОтсутствующие цели (директива есть, метода в основной '
+                   'конфигурации нет):')
+        for it in missing_targets[:limit]:
+            out.append(f'  {fmt(it["path"])}: {it["code"]}::{it["method"]}() '
+                       f'[&{it["directive"]}("{it["target"]}")]')
+        if len(missing_targets) > limit:
+            out.append(f'  … и ещё {len(missing_targets) - limit}')
 
     out.append('\nРеквизиты и поля, добавленные расширением:')
     added_total = 0
