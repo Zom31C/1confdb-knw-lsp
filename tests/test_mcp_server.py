@@ -903,6 +903,86 @@ def test_method_dependencies_expect_pins_snapshot(tmp_path_factory):
     assert err2.get('isError') and 'неоткрытой базы' in err2['content'][0]['text']
 
 
+def test_method_dependencies_callers_graph(tmp_path_factory):
+    """Feedback п.5: входящий граф — строки, условия, способ разрешения, глубина."""
+    main_db, ext_db = _two_dbs(tmp_path_factory)
+    conn = sqlite3.connect(main_db)
+    _add_method(conn, CM, 'obj', 'Уровень2',
+                'Процедура Уровень2()\n    #Если Сервер Тогда\n'
+                '    ОбщийМодуль1.Экспортная();\n    #КонецЕсли\nКонецПроцедуры',
+                30)
+    _add_method(conn, CM, 'obj', 'Уровень3',
+                'Процедура Уровень3()\n    Уровень2();\nКонецПроцедуры', 31)
+    _add_method(conn, CM, 'obj', 'Динамический',
+                'Процедура Динамический()\n    Вычислить("Экспортная");\n'
+                'КонецПроцедуры', 32)
+    conn.commit()
+    conn.close()
+    server = McpServer([main_db, ext_db])
+    out = _call(server, 'method_dependencies', path=CM, code_name='obj',
+                name='Экспортная', callers=True, depth=2)['content'][0]['text']
+    assert 'Вызывающие методы' in out
+    # глубина 1: прямой вызов — строка модуля, условие препроцессора, разрешение
+    assert 'глубина 1:' in out and 'Уровень2' in out
+    assert 'прямой вызов общего модуля ОбщийМодуль1' in out
+    assert '#Если Сервер' in out
+    # глубина 2: вызывающий вызывающего — путь читается
+    assert 'глубина 2:' in out and 'Уровень3' in out
+    assert 'голый вызов: метод того же модуля или глобальный контекст' in out
+    # строковая диспетчеризация остаётся неподтверждённой
+    assert 'Динамический' in out
+    assert 'диспетчеризация строкой, цель не подтверждена' in out
+
+
+def test_method_dependencies_depth_path_to_write(tmp_path_factory):
+    """Приёмка feedback п.5: путь к записи табличных частей прослеживается."""
+    db = _make_db(tmp_path_factory, 'граф.sqlite')
+    conn = sqlite3.connect(db)
+    _add_method(conn, CM, 'obj', 'Входной',
+                'Процедура Входной()\n    Средний();\nКонецПроцедуры', 40)
+    _add_method(conn, CM, 'obj', 'Средний',
+                'Процедура Средний()\n    ЗаписьВТЧ(Объект);\nКонецПроцедуры', 41)
+    _add_method(conn, CM, 'obj', 'ЗаписьВТЧ',
+                'Процедура ЗаписьВТЧ(Объект)\n'
+                '    Строка = Объект.Товары.Добавить();\n'
+                '    Строка.Номенклатура = '
+                'Справочники.Справочник1.НайтиПоКоду("1");\n'
+                'КонецПроцедуры', 42, sig='Объект')
+    conn.commit()
+    conn.close()
+    server = McpServer([db])
+    out = _call(server, 'method_dependencies', path=CM, code_name='obj',
+                name='Входной', depth=3)['content'][0]['text']
+    assert 'Граф вызовов вниз' in out
+    assert 'глубина 2:' in out and 'Средний' in out
+    assert 'глубина 3:' in out and 'ЗаписьВТЧ' in out
+    # конечная точка пути видна: целевой метод работает с метаданными
+    assert 'в цели: метаданных 1' in out
+
+
+def test_method_dependencies_diff_db_marks_nodes(tmp_path_factory):
+    """Узлы графа связаны с различиями: отметка об изменении против другой базы."""
+    left_db = _make_db(tmp_path_factory, 'левая.sqlite')
+    right_db = _make_db(tmp_path_factory, 'правая.sqlite')
+    conn = sqlite3.connect(left_db)
+    _add_method(conn, CM, 'obj', 'Вызывающий',
+                'Процедура Вызывающий()\n    ОбщийМодуль1.Экспортная();\n'
+                'КонецПроцедуры', 30)
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(right_db)
+    _add_method(conn, CM, 'obj', 'Вызывающий',
+                'Процедура Вызывающий()\n    ОбщийМодуль1.Экспортная();\n'
+                '    // комментарий\nКонецПроцедуры', 30)
+    conn.commit()
+    conn.close()
+    server = McpServer([left_db, right_db])
+    out = _call(server, 'method_dependencies', path=CM, code_name='obj',
+                name='Экспортная', db='левая', callers=True,
+                diff_db='правая')['content'][0]['text']
+    assert 'к базе «правая»: изменилось: комментарии' in out
+
+
 def test_error_categories(tmp_path_factory):
     server = _server(tmp_path_factory)
     denied = _call(server, 'sql', query='DELETE FROM meta_object')

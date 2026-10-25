@@ -465,7 +465,7 @@ DATABASE SCHEMA (for the sql tool; path columns store the legacy slash form 'Cat
 
 1C QUERY LANGUAGE: Russian keywords, dotted paths, table names 'Справочник.Имя', 'Документ.Имя', 'РегистрСведений.Имя', 'РегистрНакопления.Имя.Обороты' (virtual tables: Остатки, Обороты, СрезПоследних…). Grouping clause is 'СГРУППИРОВАТЬ ПО' — the form 'СГРУППИРОВАНО' does NOT exist in the 1C query language. Example: ВЫБРАТЬ Т.Запасы.Номенклатура.Наименование ИЗ Документ.ЗаказПокупателя КАК Т ГДЕ Т.Сумма > 0.
 
-RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects); when several releases or extensions are open at once, pass scope=[aliases] — the exact combination of bases where missing dependencies may be resolved — and expect={alias: sha256-prefix from configuration_info} to pin snapshots: a dependency found only OUTSIDE the scope is reported as such, never silently borrowed from another release; compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns; 8) role_rights / object_rights for access analysis — what a role is given and which roles carry explicit rights on an object (its fields and tabular sections included); effective_rights(roles=[…]) to combine several roles and see which role carries each right; role_diff(roles_a, roles_b) to see what one set has that another lacks; role_impact(role) or role_impact(roles_before, roles_after) to assess what methods, SKD queries, and programmatic checks lose a right when a role is narrowed — shows layers (static rights, RLS, programmatic checks as heuristic, UI visibility out of scope) and names the boundary of static analysis (privileged mode, dynamic calls). This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
+RECOMMENDED WORKFLOW to write a query or 1C code: 1) configuration_info to know which configuration and release you are in, find_objects to locate objects; 2) object_card for its fields, sections, references and the event subscriptions fired on it (the platform calls those handlers, so there is no call site to find in code); 3) skd_of / find_skd to see how THIS configuration queries the same tables (best examples); 4) find_methods — by mask for a name/signature/description, or by text to search INSIDE method bodies: that is how you find EVERY place touching something (all writes to a register, all calls of a common module, all uses of a field) without falling back to a full-text sql query, and every hit carries its module line number; find_methods(text='"Имя"') finds all places where a string literal is mentioned (useful for dynamic calls); then find_method_context for a window around the call you need (it also gives stable insertion markers) and get_method for the full body — reuse existing code instead of inventing; 5) check_query to validate your query before use; 6) method_dependencies before porting code to another configuration (it lists everything the code needs there — including dynamic calls via Вычислить/Выполнить with string literals, resolved against the configuration's modules and objects); when several releases or extensions are open at once, pass scope=[aliases] — the exact combination of bases where missing dependencies may be resolved — and expect={alias: sha256-prefix from configuration_info} to pin snapshots: a dependency found only OUTSIDE the scope is reported as such, never silently borrowed from another release; callers=True adds the INBOUND call graph (who calls this method — each edge names the module line, its enclosing conditions and how it was resolved; event subscriptions and extension interceptions appear as PLATFORM links: registration is not an execution fact, string dispatch stays unconfirmed), depth=2..3 expands the graph transitively, diff_db=<alias> marks every graph node with whether the method changed vs another base; compare_object / extension_diff to see how two configurations differ; 7) method_result_schema when a stock function returns a temporary table and you need its columns; 8) role_rights / object_rights for access analysis — what a role is given and which roles carry explicit rights on an object (its fields and tabular sections included); effective_rights(roles=[…]) to combine several roles and see which role carries each right; role_diff(roles_a, roles_b) to see what one set has that another lacks; role_impact(role) or role_impact(roles_before, roles_after) to assess what methods, SKD queries, and programmatic checks lose a right when a role is narrowed — shows layers (static rights, RLS, programmatic checks as heuristic, UI visibility out of scope) and names the boundary of static analysis (privileged mode, dynamic calls). This server does NOT check 1C code syntax — for that use the 1confdb-knw-lsp variant (BSL Language Server).
 
 All tools are read-only. Prefer the dedicated tools over raw sql; use sql only for what is not covered. ANTI-LOOP: never issue more than two sql calls in a row — if sql did not answer the question, switch to the dedicated tools (find_objects, object_card, find_field, skd_of, refs_of). The schema is EXACTLY as documented above — never waste calls on PRAGMA / sqlite_master / schema guessing.
 
@@ -2903,6 +2903,260 @@ class McpServer:
                          f'общий модуль в базе «{alias}»: {method} — {state}'))
         return hits
 
+    def _methods_containing(self, needle, db, limit=400):
+        """Строки (path, code_name, name, body, line_start) методов с needle в теле.
+
+        Обратный индекс для графа вызовов: FTS по телам, если он есть (игла
+        оборачивается в кавычки — спецсимволы запрос не ломают), иначе
+        body_has (полный скан). Кандидаты потом точно фильтрует
+        bsl_analyzer.call_sites — упоминания в комментариях рёбрами не станут.
+        """
+        conn = self.conn(db)
+        info = self.dbs[self._alias(db)]
+        fts = self._fts_filter(info, conn, needle) if len(needle) >= 3 else None
+        if fts:
+            cond, params = fts[0][len(' AND '):], list(fts[1])
+        else:
+            cond, params = 'body_has(mt.body, ?)', [needle.lower()]
+        return conn.execute(
+            'SELECT o.path, m.code_name, mt.name, mt.body, mt.line_start'
+            ' FROM method mt'
+            ' JOIN module m ON m.id=mt.module_id'
+            ' JOIN meta_object o ON o.id=m.object_id'
+            f' WHERE {cond} ORDER BY mt.id LIMIT ?', params + [limit]).fetchall()
+
+    def _module_method_row(self, path, name, db):
+        """Строка метода (9 колонок _method_row) из любого модуля объекта."""
+        return self.conn(db).execute(
+            'SELECT mt.kind, mt.name, mt.signature, mt.directives, '
+            'mt.description, mt.body, mt.is_export, m.context, mt.line_start '
+            'FROM method mt JOIN module m ON m.id=mt.module_id '
+            'JOIN meta_object o ON o.id=m.object_id '
+            'WHERE o.path=? AND LOWER(mt.name)=LOWER(?) LIMIT 1',
+            (path, name)).fetchone()
+
+    def _module_method_names(self, path, db):
+        """{имя в нижнем регистре: исходное имя} методов всех модулей объекта."""
+        return {n.lower(): n for n, in self.conn(db).execute(
+            'SELECT mt.name FROM method mt '
+            'JOIN module m ON m.id=mt.module_id '
+            'JOIN meta_object o ON o.id=m.object_id WHERE o.path=?', (path,))}
+
+    def _rows_mark(self, row, diff_row, diff_alias):
+        """Связь узла графа с различиями: вердикт method_compare против другой базы."""
+        if not diff_alias:
+            return ''
+        if row is None or diff_row is None:
+            return f'  [к базе «{diff_alias}»: метод не найден в одной из баз]'
+        verdict = compare.release_verdict(
+            compare.method_compare(row, diff_row))
+        return f'  [к базе «{diff_alias}»: {verdict}]'
+
+    def _diff_mark(self, path, code_name, name, db, diff_alias):
+        if not diff_alias:
+            return ''
+        return self._rows_mark(
+            self._method_row(path, code_name, name, db),
+            self._method_row(path, code_name, name, diff_alias), diff_alias)
+
+    def _callers_of(self, path, code_name, name, db, diff_alias=None):
+        """Входящие рёбра графа: вызовы из кода, платформенные связи, строковая диспетчеризация.
+
+        Вызовы проверяются лексически (bsl_analyzer.call_sites). Подписки на
+        события и перехваты расширения — регистрация, а не факт исполнения,
+        поэтому помечены «платформа». Строковая диспетчеризация
+        (Вычислить/Выполнить) остаётся «не подтверждено»: неизвестная цель
+        известной не становится (feedback п.5).
+        """
+        from .bsl_analyzer import call_sites
+        edges = []
+        ctx = self.bsl_ctx(db)
+        for cpath, ccode, cname, cbody, cstart in \
+                self._methods_containing(name, db):
+            for line, form, left, conds in call_sites(cbody or '', name):
+                edge = {'kind': 'code', 'path': cpath, 'code': ccode,
+                        'name': cname, 'line': (cstart or 1) + line - 1,
+                        'conditions': conds}
+                if form == 'string':
+                    edge['kind'] = 'string'
+                    edge['resolution'] = (f'{left}("{name}") — диспетчеризация '
+                                          'строкой, цель не подтверждена')
+                elif form == 'dotted':
+                    module = ctx.common_module(left)
+                    if module is not None:
+                        if module['path'] != path:
+                            continue  # одноимённый метод другого модуля
+                        edge['resolution'] = f'прямой вызов общего модуля {left}'
+                    else:
+                        edge['resolution'] = (f'вызов через «{left}.» — '
+                                              'объект/переменная, цель '
+                                              'статически не подтверждена')
+                else:
+                    edge['resolution'] = ('голый вызов: метод того же модуля '
+                                          'или глобальный контекст')
+                edge['mark'] = self._diff_mark(cpath, ccode, cname, db,
+                                               diff_alias)
+                edges.append(edge)
+        # платформа: подписки на события (вызова в коде нет)
+        for entry in self.event_index(db)['by_handler'].get(
+                (path, name.lower()), []):
+            edges.append({
+                'kind': 'platform',
+                'text': f'подписка на событие {ru_path(entry["path"])}'
+                        + (f' (событие {entry["event"]})'
+                           if entry.get('event') else '')
+                        + ': обработчик вызывает платформа; регистрация — '
+                          'не факт исполнения',
+                'resolution': 'платформа: подписка на событие'})
+        # платформа: перехваты расширения директивами в этой же базе
+        for cpath, ccode, cname, dirs in self.conn(db).execute(
+                'SELECT o.path, m.code_name, mt.name, mt.directives '
+                'FROM method mt JOIN module m ON m.id=mt.module_id '
+                'JOIN meta_object o ON o.id=m.object_id '
+                'WHERE LOWER(mt.directives) LIKE ?',
+                (f'%("{name.lower()}")%',)):
+            for directive, target in compare.parse_intercepts(dirs):
+                if target.lower() == name.lower():
+                    edges.append({
+                        'kind': 'platform',
+                        'text': f'перехват &{directive}("{target}"): '
+                                f'{ru_path(cpath)} ({ccode})::{cname} — '
+                                'применяет платформа, не вызов из кода',
+                        'resolution': f'платформа: перехват &{directive}'})
+        return edges
+
+    def _format_edge(self, edge, depth):
+        if edge['kind'] == 'platform':
+            return (f'  глубина {depth}: {edge["text"]} '
+                    f'(разрешение: {edge["resolution"]})')
+        line = (f'  глубина {depth}: {ru_path(edge["path"])} ({edge["code"]})::'
+                f'{edge["name"]} — строка {edge["line"]}')
+        if edge.get('conditions'):
+            line += f'; условия: {", ".join(edge["conditions"])}'
+        line += f' (разрешение: {edge["resolution"]})'
+        return line + edge.get('mark', '')
+
+    def _call_graph(self, path, code_name, name, row, report, db,
+                    callers, depth, diff_db):
+        """Секции графа вызовов: входящие (callers) и нисходящие при depth > 1.
+
+        У каждого перехода — строка исходника, условия (статическое приближение)
+        и способ разрешения; с diff_db узлы связаны с различиями (вердикт
+        method_compare). Обход ограничен: глубина ≤ 3, не больше 60 переходов
+        на раздел.
+        """
+        from .bsl_analyzer import (analyze, call_sites, caller_context,
+                                   conditions_at, split_params)
+        diff_alias = self._alias(diff_db) if diff_db else None
+        cap = 60
+        out = []
+        if callers:
+            out.append(f'\nВызывающие методы (обход вглубь до {depth}; у каждого '
+                       'перехода строка, условия и способ разрешения):')
+            level = [(path, code_name, name)]
+            seen = {(path.lower(), name.lower())}
+            shown = 0
+            for d in range(1, depth + 1):
+                nxt, hidden = [], 0
+                for p, code, mname in level:
+                    for edge in self._callers_of(p, code, mname, db,
+                                                 diff_alias):
+                        if shown < cap:
+                            out.append(self._format_edge(edge, d))
+                            shown += 1
+                        else:
+                            hidden += 1
+                        if edge['kind'] == 'code':
+                            key = (edge['path'].lower(), edge['name'].lower())
+                            if key not in seen:
+                                seen.add(key)
+                                nxt.append((edge['path'], edge['code'],
+                                            edge['name']))
+                if hidden:
+                    out.append(f'  … и ещё {hidden} переходов на этой глубине '
+                               f'(потолок {cap})')
+                level = nxt
+                if not level:
+                    break
+            if not shown:
+                out.append('  вызывающих не найдено: метод не вызывается из '
+                           'кода, и на него не указывают подписки и перехваты')
+        if depth > 1:
+            out.append(f'\nГраф вызовов вниз (глубина до {depth}; прямые вызовы '
+                       'перечислены в разделах выше):')
+            ctx = self.bsl_ctx(db)
+            seen = {(path.lower(), name.lower())}
+            level = [(path, name, row, report)]
+            shown = 0
+            for d in range(2, depth + 1):
+                nxt, hidden = [], 0
+                for p, mname, mrow, mreport in level:
+                    body = mrow[5] or ''
+                    edges = []
+                    for mod, meth, line, _state in mreport['modules']:
+                        module = ctx.common_module(mod)
+                        if module is None:
+                            continue
+                        nrow = self._module_method_row(module['path'], meth, db)
+                        if nrow is not None:
+                            edges.append((module['path'], meth, nrow, line,
+                                          f'прямой вызов общего модуля {mod}'))
+                    own_names = self._module_method_names(p, db)
+                    for pname in mreport['plain_calls']:
+                        target = own_names.get(pname.lower())
+                        if target is None or target.lower() == mname.lower():
+                            continue
+                        nrow = self._module_method_row(p, target, db)
+                        if nrow is None:
+                            continue
+                        for line, form, _left, _c in call_sites(body, pname):
+                            if form == 'plain':
+                                edges.append((p, target, nrow, line,
+                                              'голый вызов: метод того же модуля'))
+                                break
+                    for npath, nmeth, nrow, line, resolution in edges:
+                        key = (npath.lower(), nmeth.lower())
+                        fresh = key not in seen
+                        nrep = None
+                        if fresh:
+                            seen.add(key)
+                            nrep = analyze(nrow[5] or '', ctx,
+                                           params=split_params(nrow[2] or ''),
+                                           caller_context=caller_context(
+                                               nrow[3], nrow[7]),
+                                           self_name=nrow[1])
+                        if shown < cap:
+                            conds = conditions_at(body, line)
+                            mark = ''
+                            if diff_alias:
+                                drow = self._module_method_row(npath, nmeth,
+                                                               diff_alias)
+                                mark = self._rows_mark(nrow, drow, diff_alias)
+                            summary = (f'; в цели: метаданных '
+                                       f'{len(nrep["metadata"])}, запросов '
+                                       f'{len(nrep["queries"])}'
+                                       if nrep is not None else '')
+                            out.append(
+                                f'  глубина {d}: {ru_path(p)}.{mname} -> '
+                                f'{ru_path(npath)}.{nmeth} — строка '
+                                f'{(mrow[8] or 1) + line - 1}'
+                                + (f'; условия: {", ".join(conds)}'
+                                   if conds else '')
+                                + f' (разрешение: {resolution}{summary})'
+                                + mark)
+                            shown += 1
+                        else:
+                            hidden += 1
+                        if nrep is not None:
+                            nxt.append((npath, nmeth, nrow, nrep))
+                if hidden:
+                    out.append(f'  … и ещё {hidden} переходов на этой глубине '
+                               f'(потолок {cap})')
+                level = nxt
+                if not level:
+                    break
+        return out
+
     def get_method(self, path, code_name, name, db=None):
         row = self._method_row(path, code_name, name, db)
         if not row:
@@ -2974,7 +3228,8 @@ class McpServer:
         return '\n'.join(out)
 
     def method_dependencies(self, path, code_name, name, db=None,
-                            scope=None, expect=None):
+                            scope=None, expect=None,
+                            callers=False, depth=1, diff_db=None):
         """Что использует метод: общие модули, метаданные, запросы, параметры.
 
         scope — область разрешения недостающих зависимостей (список алиасов:
@@ -2982,6 +3237,10 @@ class McpServer:
         отпечатки исходников {алиас: sha256 или префикс} (feedback п.4):
         зависимость из старого релиза не «восстанавливается», если база вне
         области или её снимок не совпал.
+
+        callers — входящие рёбра графа вызовов (кто вызывает метод), depth
+        (1..3) — глубина обхода, diff_db — база, против которой узлы графа
+        помечаются изменениями (feedback п.5).
         """
         from .bsl_analyzer import analyze, caller_context, split_params
         row = self._method_row(path, code_name, name, db)
@@ -3127,6 +3386,10 @@ class McpServer:
             for line, func, literal, resolution in report['dynamic_calls']:
                 out.append(f'  строка {start + line - 1}: '
                            f'{func}("{literal}") — {resolution}')
+        depth = max(1, min(int(depth or 1), 3))
+        if callers or depth > 1:
+            out.extend(self._call_graph(path, code_name, name, row, report,
+                                        db, bool(callers), depth, diff_db))
         return '\n'.join(out)
 
     def method_result_schema(self, path, code_name, name, db=None):
@@ -3909,7 +4172,7 @@ class Tool:
             # читается вовсе, и ответ велит пересобрать её вместо того чтобы
             # упасть ошибкой схемы на отсутствующей таблице или колонке
             for key in ('db', 'db_left', 'db_right', 'extension_db',
-                        'base_db', 'base_db_new'):
+                        'base_db', 'base_db_new', 'diff_db'):
                 if key not in props:
                     continue
                 alias = server._alias(args.get(key))
@@ -4119,11 +4382,22 @@ TOOLS = [
          'Pass expect={alias: file_sha256 or prefix} (ids from '
          'configuration_info) to pin exact snapshots: a base whose stored '
          'fingerprint differs is refused (queried base) or excluded from the '
-         'area (scope base). Use it before porting a customization to '
+         'area (scope base). CALL GRAPH: callers=True adds the inbound graph '
+         '(who calls this method) and depth=2..3 expands the traversal; every '
+         'edge carries the module line, the enclosing conditions '
+         '(#Если/block, static approximation) and HOW it was resolved — '
+         'direct common-module call, plain same-module call, unconfirmed '
+         'object call, string dispatch via Вычислить/Выполнить (kept '
+         'UNCONFIRMED — an unknown dynamic target stays unknown), or a '
+         'PLATFORM link (event subscription, extension interception — '
+         'registration is not an execution fact). diff_db=<alias> marks every '
+         'graph node with whether that method changed vs the other base. '
+         'Use it before porting a customization to '
          'another configuration — it lists everything the code needs there.',
          _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
                   'scope': {'type': 'array', 'items': _STR},
                   'expect': {'type': 'object'},
+                  'callers': _BOOL, 'depth': _INT, 'diff_db': _STR,
                   'db': _DB, 'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.method_dependencies),

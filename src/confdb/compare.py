@@ -842,8 +842,8 @@ def _find_target(rows, code, target):
     return row
 
 
-def _release_verdict(cmp_res):
-    """Короткий вердикт по method_compare: чем цель изменилась между релизами."""
+def release_verdict(cmp_res):
+    """Короткий вердикт по method_compare: чем метод изменился между релизами."""
     bits = []
     if cmp_res['body_diff']:
         bits.append('исполняемый текст')
@@ -919,7 +919,7 @@ def intercept_matrix(conn_ext, conn_base, conn_base_new=None):
                     nrow = _find_target(base_new, code, target)
                     item['releases'] = ('в новом релизе отсутствует'
                                         if nrow is None
-                                        else _release_verdict(
+                                        else release_verdict(
                                             method_compare(trow, nrow)))
                 if directive.lower() == 'изменениеиконтроль':
                     erow = ext_rows.get((code, name.lower()))

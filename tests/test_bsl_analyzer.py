@@ -12,7 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from confdb.bsl_analyzer import analyze, extract_queries, split_params  # noqa: E402
+from confdb.bsl_analyzer import (analyze, call_sites,  # noqa: E402
+                                 extract_queries, split_params)
 from confdb.header_props import IR_PERIODICITY, IR_WRITE_MODE, register_props  # noqa: E402
 
 
@@ -148,3 +149,39 @@ def test_register_props_accumulation_register_is_recorder_only():
     lines = register_props('AccumulationRegister',
                            _ir_header('3', '0'))
     assert lines == ['Режим записи: подчинение регистратору']
+
+
+# -- call_sites: обратный индекс графа вызовов (feedback п.5) ----------------
+
+def test_call_sites_forms_and_conditions():
+    text = '\n'.join([
+        'Процедура Внешняя()',            # 1
+        '    #Если Сервер Тогда',          # 2
+        '    Если А > 0 Тогда',            # 3
+        '        Модуль.Цель();',          # 4
+        '    КонецЕсли;',                  # 5
+        '    #КонецЕсли',                  # 6
+        '    Цель();',                     # 7
+        '    Вычислить("Цель");',          # 8
+        '    // Цель(); — комментарий, а не вызов',    # 9
+        '    С = "Цель()";',               # 10
+        'КонецПроцедуры',                  # 11
+    ])
+    sites = call_sites(text, 'Цель')
+    by_line = {line: (form, left) for line, form, left, _c in sites}
+    assert by_line[4] == ('dotted', 'Модуль')
+    assert by_line[7] == ('plain', None)
+    assert by_line[8] == ('string', 'Вычислить')
+    # комментарии и литералы мест вызова не дают
+    assert 9 not in by_line and 10 not in by_line
+    # условия: препроцессор и блок, окружающие строку 4
+    conds = {line: c for line, _f, _l, c in sites}
+    assert any(x.startswith('#Если Сервер') for x in conds[4])
+    assert any(x.startswith('блок Если') for x in conds[4])
+    assert conds[7] == []
+
+
+def test_call_sites_skips_declaration():
+    text = 'Процедура Цель()\n    Цель();\nКонецПроцедуры'
+    sites = call_sites(text, 'Цель')
+    assert [(line, form) for line, form, _l, _c in sites] == [(2, 'plain')]

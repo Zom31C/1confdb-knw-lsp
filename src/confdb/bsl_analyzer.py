@@ -195,6 +195,131 @@ def local_names(masked, params=()):
     return names
 
 
+# условия строки: препроцессор (#Если/#ИначеЕсли/#Иначе/#КонецЕсли) и блоки
+# (Если…Тогда/Цикл/Попытка). Считаются по маскированному тексту — литералы
+# и комментарии ключевыми словами не считаются.
+RE_PREPROC = re.compile(
+    r'^\s*#\s*(Если|If|ИначеЕсли|ElsIf|ElseIf|Иначе|Else|КонецЕсли|EndIf)\b'
+    r'\s*(.*)', re.IGNORECASE)
+RE_OPEN_THEN = re.compile(r'\b(?:Тогда|Then)\b', re.IGNORECASE)
+RE_OPEN_CYCLE = re.compile(r'\b(?:Цикл|Do)\b', re.IGNORECASE)
+RE_OPEN_TRY = re.compile(r'\b(?:Попытка|Try)\b', re.IGNORECASE)
+RE_CLOSE_IF = re.compile(r'\b(?:КонецЕсли|EndIf)\b', re.IGNORECASE)
+RE_CLOSE_CYCLE = re.compile(r'\b(?:КонецЦикла|EndDo)\b', re.IGNORECASE)
+RE_CLOSE_TRY = re.compile(r'\b(?:КонецПопытки|EndTry)\b', re.IGNORECASE)
+
+
+def _pop_block(blocks, prefix):
+    for i in range(len(blocks) - 1, -1, -1):
+        if blocks[i].startswith(prefix):
+            del blocks[i]
+            return
+
+
+def _conditions_by_line(masked):
+    """Для каждой строки (1..N): состояние условий ПЕРЕД ней.
+
+    Статическое приближение: препроцессор отслеживается точно (стек
+    #Если/#ИначеЕсли/#Иначе/#КонецЕсли), рантайм-блоки — по открывающим и
+    закрывающим ключевым словам в строке, поэтому однострочное
+    «Если … Тогда …; КонецЕсли;» условием не считается.
+    """
+    preproc, blocks = [], []
+    states = []
+    for idx, line in enumerate(masked.split('\n'), 1):
+        states.append((list(preproc), list(blocks)))
+        m = RE_PREPROC.match(line)
+        if m:
+            kw = m.group(1).lower()
+            tail = m.group(2).strip()
+            if kw in ('если', 'if'):
+                preproc.append(f'#Если {tail} (строка {idx})')
+            elif kw in ('иначеесли', 'elsif', 'elseif'):
+                if preproc:
+                    preproc.pop()
+                preproc.append(f'#ИначеЕсли {tail} (строка {idx})')
+            elif kw in ('иначе', 'else'):
+                if preproc:
+                    preproc.pop()
+                preproc.append(f'#Иначе (строка {idx})')
+            elif preproc:
+                preproc.pop()
+            continue
+        for _ in range(len(RE_OPEN_THEN.findall(line))):
+            blocks.append(f'блок Если (строка {idx})')
+        for _ in range(len(RE_OPEN_CYCLE.findall(line))):
+            blocks.append(f'блок Цикл (строка {idx})')
+        for _ in range(len(RE_OPEN_TRY.findall(line))):
+            blocks.append(f'блок Попытка (строка {idx})')
+        for _ in range(len(RE_CLOSE_IF.findall(line))):
+            _pop_block(blocks, 'блок Если')
+        for _ in range(len(RE_CLOSE_CYCLE.findall(line))):
+            _pop_block(blocks, 'блок Цикл')
+        for _ in range(len(RE_CLOSE_TRY.findall(line))):
+            _pop_block(blocks, 'блок Попытка')
+    states.append((list(preproc), list(blocks)))
+    return states
+
+
+def conditions_at(text, line):
+    """Условия, окружающие строку line (от 1) текста: препроцессор + блоки."""
+    masked, _ = scan(text or '')
+    states = _conditions_by_line(masked)
+    if 1 <= line <= len(states):
+        preproc, blocks = states[line - 1]
+        return preproc + blocks
+    return []
+
+
+def call_sites(text, name):
+    """Места вызова метода name: [(строка, форма, левая часть, условия)].
+
+    Форма: 'dotted' — Left.Name( (левая часть возвращена: общий модуль,
+    объект или переменная — различает вызывающий), 'plain' — голый вызов
+    (метод того же модуля или глобальный контекст), 'string' — диспетчеризация
+    строкой (Вычислить/Выполнить с литералом name). Объявление метода
+    (Процедура/Функция name) вызовом не считается; комментарии и литералы
+    невидимы (маскированный scan). Условия — статическое приближение
+    conditions_at для строки вызова.
+    """
+    text = text or ''
+    masked, literals = scan(text)
+    lines = LineIndex(text)
+    states = _conditions_by_line(masked)
+
+    def conds(pos):
+        line = lines(pos)
+        if 1 <= line <= len(states):
+            preproc, blocks = states[line - 1]
+            return preproc + blocks
+        return []
+
+    out = []
+    esc = re.escape(name)
+    decl = re.compile(r'(?:Процедура|Функция)\s+$', re.IGNORECASE)
+    for m in re.finditer(rf'({ID})\s*\.\s*({esc})\s*\(', masked,
+                         re.IGNORECASE):
+        out.append((lines(m.start(2)), 'dotted', m.group(1),
+                    conds(m.start(2))))
+    for m in re.finditer(rf'(?<![\w.])({esc})\s*\(', masked, re.IGNORECASE):
+        if decl.search(masked[:m.start(1)]):
+            continue  # объявление метода, а не вызов
+        out.append((lines(m.start(1)), 'plain', None, conds(m.start(1))))
+    for m in RE_DYNAMIC_CALL.finditer(masked):
+        for start, _end, value in literals:
+            if start < m.end():
+                continue
+            if masked[m.end():start].strip():
+                break  # первый аргумент — не литерал
+            low = value.strip().lower()
+            if low == name.lower() or low.endswith('.' + name.lower()):
+                out.append((lines(m.start()), 'string', m.group(1),
+                            conds(m.start())))
+            break
+    out.sort(key=lambda item: item[0])
+    return out
+
+
 def split_params(signature):
     """Имена параметров метода из сигнатуры ('Знач А, Б = Неопределено')."""
     params = []
