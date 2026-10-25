@@ -312,6 +312,15 @@ MAX_PAGE_LIMIT = 200    # потолок страницы поисковых и�
 COUNT_CACHE_MAX = 128   # сколько итогов COUNT(*) помнить на одну базу
 
 
+class UserError(ValueError):
+    """Ошибка запроса пользователя: неверный алиас, пустая группа, не-SELECT.
+
+    Отдельный класс, а не голый ValueError: внутренняя ошибка (например,
+    распаковка строки результата) не должна обозначаться как неверный запрос
+    пользователя — голый ValueError диагностика считает INTERNAL.
+    """
+
+
 def page_limit(limit):
     """Размер страницы поиска: целое в границах 1..MAX_PAGE_LIMIT.
 
@@ -473,7 +482,7 @@ def _group_items(groups):
         name, paths = (item if isinstance(item, (tuple, list)) and len(item) == 2
                        else (None, None))
         if not name or not str(name).strip():
-            raise ValueError(f'имя группы не может быть пустым: {item!r}')
+            raise UserError(f'имя группы не может быть пустым: {item!r}')
         if isinstance(paths, str):
             paths = [paths]
         result.append((str(name).strip(), list(paths or ())))
@@ -636,13 +645,13 @@ class McpServer:
                 self.active = known
             return known
         if not os.path.isfile(path):
-            raise ValueError(f'файл базы не найден: {path}')
+            raise UserError(f'файл базы не найден: {path}')
         if alias is not None:
             if not str(alias).strip():
-                raise ValueError('алиас не может быть пустым')
+                raise UserError('алиас не может быть пустым')
             alias = str(alias).strip()
             if alias.lower() in (a.lower() for a in self.dbs):
-                raise ValueError(f'алиас уже занят: {alias}')
+                raise UserError(f'алиас уже занят: {alias}')
         conn = sqlite3.connect(
             f'file:{path}?mode=ro', uri=True,
             check_same_thread=False)  # HTTP-транспорт: потоки под блокировкой
@@ -665,7 +674,7 @@ class McpServer:
             conn.execute('SELECT COUNT(*) FROM meta_object').fetchone()
         except sqlite3.Error:
             conn.close()
-            raise ValueError(
+            raise UserError(
                 f'это не база знаний confdb (нет таблицы meta_object): {path}')
         # FTS5-индекс по телам методов. Неполный не считается: сборку могли
         # прервать (или база собрана с --no-fts), и тогда поиск по телам должен
@@ -721,12 +730,12 @@ class McpServer:
         """Разрешает алиас (None = активная база); ValueError, если не найден."""
         if not alias:
             if self.active is None:
-                raise ValueError('нет открытых баз — укажите путь в db_open')
+                raise UserError('нет открытых баз — укажите путь в db_open')
             return self.active
         for key in self.dbs:
             if key.lower() == str(alias).strip().lower():
                 return key
-        raise ValueError(
+        raise UserError(
             f'база не открыта: {alias}' +
             ('; открыты: ' + ', '.join(self.dbs) if self.dbs
              else ' — откройте через db_open'))
@@ -750,10 +759,10 @@ class McpServer:
     def create_group(self, name):
         """Создаёт пустую группу баз. Имя группы уникально (регистр не важен)."""
         if not name or not str(name).strip():
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         name = str(name).strip()
         if name.lower() in (g.lower() for g in self.groups):
-            raise ValueError(f'группа уже существует: {name}')
+            raise UserError(f'группа уже существует: {name}')
         self.groups[name] = []
         if self.active_group is None:
             self.active_group = name
@@ -771,7 +780,7 @@ class McpServer:
         """
         name = str(name).strip() if name else ''
         if not name:
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         group = next((g for g in self.groups if g.lower() == name.lower()), None)
         if group is None:
             group = self.create_group(name)
@@ -801,10 +810,10 @@ class McpServer:
         """
         group_name = str(group_name).strip() if group_name else ''
         if not group_name:
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
         if group is None:
-            raise ValueError(f'группа не найдена: {group_name}')
+            raise UserError(f'группа не найдена: {group_name}')
         aliases = list(self.groups[group])
         self.close_group(group)
         closed = []
@@ -823,12 +832,12 @@ class McpServer:
     def add_db_to_group(self, group_name, db_alias):
         """Добавляет базу в группу. База должна быть открыта."""
         if not group_name or not str(group_name).strip():
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         group_name = str(group_name).strip()
         # Поиск группы без учёта регистра
         actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
         if actual_group is None:
-            raise ValueError(f'группа не найдена: {group_name}')
+            raise UserError(f'группа не найдена: {group_name}')
         alias = self._alias(db_alias)  # Проверит, что база открыта
         if alias not in self.groups[actual_group]:
             self.groups[actual_group].append(alias)
@@ -837,11 +846,11 @@ class McpServer:
     def remove_db_from_group(self, group_name, db_alias):
         """Убирает базу из группы. База не закрывается."""
         if not group_name or not str(group_name).strip():
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         group_name = str(group_name).strip()
         actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
         if actual_group is None:
-            raise ValueError(f'группа не найдена: {group_name}')
+            raise UserError(f'группа не найдена: {group_name}')
         alias = self._alias(db_alias)
         if alias in self.groups[actual_group]:
             self.groups[actual_group].remove(alias)
@@ -873,11 +882,11 @@ class McpServer:
         умолчанию» после group_use продолжали бы ходить в прежнюю конфигурацию.
         """
         if not group_name or not str(group_name).strip():
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         group_name = str(group_name).strip()
         actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
         if actual_group is None:
-            raise ValueError(f'группа не найдена: {group_name}')
+            raise UserError(f'группа не найдена: {group_name}')
         self.active_group = actual_group
         opened = [a for a in self.groups[actual_group] if a in self.dbs]
         if opened:
@@ -887,11 +896,11 @@ class McpServer:
     def close_group(self, group_name):
         """Удаляет группу. Базы не закрываются."""
         if not group_name or not str(group_name).strip():
-            raise ValueError('имя группы не может быть пустым')
+            raise UserError('имя группы не может быть пустым')
         group_name = str(group_name).strip()
         actual_group = next((g for g in self.groups if g.lower() == group_name.lower()), None)
         if actual_group is None:
-            raise ValueError(f'группа не найдена: {group_name}')
+            raise UserError(f'группа не найдена: {group_name}')
         del self.groups[actual_group]
         if self.active_group == actual_group:
             self.active_group = next(iter(self.groups), None)
@@ -901,11 +910,11 @@ class McpServer:
         """Возвращает список алиасов баз в группе. None = активная группа."""
         if group_name is None:
             if self.active_group is None:
-                raise ValueError('нет активной группы — укажите имя группы')
+                raise UserError('нет активной группы — укажите имя группы')
             group_name = self.active_group
         actual_group = next((g for g in self.groups if g.lower() == str(group_name).lower()), None)
         if actual_group is None:
-            raise ValueError(f'группа не найдена: {group_name}')
+            raise UserError(f'группа не найдена: {group_name}')
         return self.groups[actual_group]
 
     # -- инфраструктура ----------------------------------------------------
@@ -1268,8 +1277,14 @@ class McpServer:
 
     # -- сравнение двух баз --------------------------------------------------
     def compare_object(self, path, db_left, db_right, path_right=None,
-                       limit=100, offset=0):
-        """Различия одного объекта в двух базах знаний."""
+                       limit=100, offset=0, format='text'):
+        """Различия одного объекта в двух базах знаний.
+
+        Различия — структурированные элементы DiffItem со стабильными id
+        (секция:ключ); текстовая выдача листается limit/offset, а футер
+        сообщает итог и offset продолжения. format='json' возвращает те же
+        элементы в едином конверте со счётчиками полноты.
+        """
         left_alias = self._alias(db_left)
         right_alias = self._alias(db_right)
         left_path = self.resolve_path(path, left_alias)
@@ -1277,7 +1292,45 @@ class McpServer:
                       if path_right else left_path)
         left = compare.object_snapshot(self.conn(left_alias), left_path)
         right = compare.object_snapshot(self.conn(right_alias), right_path)
+        limit, offset = page_limit(limit), page_offset(offset)
         title = ru_path(left_path if left else right_path) or path
+        items = (compare.compute_diff(left, right, left_alias, right_alias,
+                                      fmt_type=ru_type_str)
+                 if left is not None and right is not None else [])
+        total = len(items)
+        end = min(offset + limit, total)
+        page = items[offset:end]
+
+        if format == 'json':
+            meta_l = _db_meta(self, left_alias)
+            meta_r = _db_meta(self, right_alias)
+            data = {
+                'object': {'title': title,
+                           'path_left': left_path, 'path_right': right_path},
+                'db_right': {k: meta_r[k] for k in
+                             ('alias', 'path', 'group', 'schema_revision',
+                              'extractor_version', 'source')},
+                'items': [{'id': it.id, 'section': it.section,
+                           'kind': it.kind, 'description': it.description}
+                          for it in page],
+            }
+            status = 'ok'
+            completeness = {'total': total, 'shown': len(page),
+                            'offset': offset,
+                            'next_offset': end if end < total else None}
+            if left is None and right is None:
+                status = 'error'
+                data['error'] = (f'объект не найден ни в базе «{left_alias}», '
+                                 f'ни в базе «{right_alias}»')
+                completeness = {}
+            elif left is None:
+                data['only_in'] = right_alias
+            elif right is None:
+                data['only_in'] = left_alias
+            env = _json_envelope('compare_object', meta_l, data,
+                                 status=status, completeness=completeness)
+            return json.dumps(env, ensure_ascii=False, indent=2)
+
         head = [f'Сравнение объекта: {title}',
                 f'  {left_alias}: {self.dbs[left_alias]["path"]} '
                 f'(путь {left_path})',
@@ -1301,20 +1354,20 @@ class McpServer:
             f'{len(left["methods"])} / {len(right["methods"])}, модулей '
             f'{len(left["modules"])} / {len(right["modules"])}, запросов СКД '
             f'{len(left["skd"])} / {len(right["skd"])}')
-        lines = compare.diff_snapshots(left, right, left_alias, right_alias,
-                                       fmt_type=ru_type_str,
-                                       limit=int(limit), offset=int(offset))
         head.append('Различий нет: метаданные и код объекта совпадают'
-                    if not lines else 'Различия:')
-        return '\n'.join(head + lines)
+                    if not items else f'Различия (всего {total}):')
+        return '\n'.join(head + compare.format_diff(items, limit, offset))
 
     def method_diff(self, path, code_name, name, db_left, db_right, context=3):
-        """Построчное сравнение одного метода в двух базах (игнорирует комментарии и пробелы)."""
+        """Точное сравнение одного метода в двух базах.
+
+        Объявление (параметры и значения по умолчанию, Экспорт, директивы),
+        исполняемый текст (unified diff) и комментарии — отдельные разделы.
+        """
         left_alias = self._alias(db_left)
         right_alias = self._alias(db_right)
         left_path = self.resolve_path(path, left_alias)
         right_path = self.resolve_path(path, right_alias)
-        # получить тело метода из левой базы
         left_row = self._method_row(left_path, code_name, name, left_alias)
         right_row = self._method_row(right_path, code_name, name, right_alias)
         head = [f'Сравнение метода: {name}',
@@ -1329,14 +1382,9 @@ class McpServer:
         if not right_row:
             head.append(f'метод есть только в {left_alias}')
             return '\n'.join(head)
-        left_body = left_row[5] or ''
-        right_body = right_row[5] or ''
-        if left_body == right_body:
-            head.append('Тела методов идентичны (с точностью до комментариев и пробелов)')
-            return '\n'.join(head)
-        lines = compare.method_diff(left_body, right_body, context=int(context))
-        head.append(f'Различия (контекст {context} строк):')
-        return '\n'.join(head + lines)
+        res = compare.method_compare(left_row, right_row, context=int(context))
+        return '\n'.join(head + compare.format_method_compare(
+            res, left_alias, right_alias))
 
     def extension_diff(self, extension_db, base_db, limit=30):
         """Что делает расширение относительно основной конфигурации."""
@@ -2778,7 +2826,7 @@ class McpServer:
         return '\n'.join(parts)
 
     def find_method_context(self, path, code_name, name, match='', before=20,
-                            after=20, db=None):
+                            after=20, limit=3, offset=0, db=None):
         """Фрагмент тела метода вокруг вхождения match + маркеры точки вставки."""
         row = self._method_row(path, code_name, name, db)
         if not row:
@@ -2803,7 +2851,13 @@ class McpServer:
             out.append('match не задан — показано начало тела; передайте match '
                        '(строку или вызов), чтобы получить точку вставки')
             hits = [0]
-        for i in hits[:3]:
+        # вхождения листаются limit/offset: каждое можно дочитать,
+        # а не «уточнять match», пока совпадения не кончатся
+        limit = max(1, min(int(limit), MAX_PAGE_LIMIT))
+        offset = page_offset(offset)
+        total = len(hits)
+        end = min(offset + limit, total)
+        for i in hits[offset:end]:
             low, high = max(0, i - before), min(len(lines), i + after + 1)
             out.append(f'--- вхождение: строка {start + i} '
                        f'(показано {start + low}..{start + high - 1}) ---')
@@ -2816,8 +2870,9 @@ class McpServer:
             out.append(f'Маркеры вставки у строки {start + i}:')
             out.append(f'  предыдущий оператор: {prev_op or "(начало метода)"}')
             out.append(f'  следующий оператор:  {next_op or "(конец метода)"}')
-        if len(hits) > 3:
-            out.append(f'… и ещё {len(hits) - 3} вхождений (уточните match)')
+        if offset or end < total:
+            out.append(page_note(total, offset, end - offset,
+                                 detail=' вхождений'))
         return '\n'.join(out)
 
     def method_dependencies(self, path, code_name, name, db=None):
@@ -3269,7 +3324,7 @@ class McpServer:
         stripped = _sql_rewrite(query).strip().rstrip(';')
         head = stripped.upper()
         if not (head.startswith('SELECT') or head.startswith('WITH')):
-            raise ValueError('разрешены только SELECT/WITH (read-only)')
+            raise UserError('разрешены только SELECT/WITH (read-only)')
         if ' LIMIT ' not in head:
             stripped += ' LIMIT 200'
         cur = self.conn(db).execute(stripped)
@@ -3446,8 +3501,12 @@ def error_text(err):
         code = 'DB_ERROR'
     elif isinstance(err, TypeError):
         code = 'BAD_ARGS'
-    elif isinstance(err, ValueError):
+    elif isinstance(err, UserError):
         code = 'BAD_REQUEST'
+    elif isinstance(err, ValueError):
+        # голый ValueError — внутренняя ошибка (распаковка, разбор), а не
+        # неверный запрос пользователя
+        code = 'INTERNAL'
     elif isinstance(err, OSError):
         code = 'IO_ERROR'
     else:
@@ -3620,6 +3679,17 @@ class Tool:
                 'inputSchema': self.schema}
 
     def run(self, server, **args):
+        # приведение аргументов по схеме: неверный ввод ловится на границе
+        # как BAD_ARGS, а не голым ValueError внутри инструмента (тот теперь
+        # трактуется как INTERNAL)
+        for key, prop in self.schema.get('properties', {}).items():
+            if key in args and prop.get('type') == 'integer':
+                try:
+                    args[key] = int(args[key])
+                except (TypeError, ValueError):
+                    raise TypeError(
+                        f'аргумент {key} должен быть целым числом, '
+                        f'получено {args[key]!r}')
         # Поддержка групп: приоритет group > db > active_group > active
         group = args.get('group')
         db = args.get('db')
@@ -3634,7 +3704,7 @@ class Tool:
         # group='*' — fan-out по всем группам
         if group == '*' and 'group' in self.schema.get('properties', {}) and not is_group_management:
             if not server.groups:
-                raise ValueError('нет созданных групп — создайте через group_create')
+                raise UserError('нет созданных групп — создайте через group_create')
             parts = []
             state = {}
             for group_name, db_aliases in server.groups.items():
@@ -3649,14 +3719,14 @@ class Tool:
                 if group_parts:
                     parts.append(f'=== группа {group_name} ===\n' + '\n\n'.join(group_parts))
             if not parts:
-                raise ValueError('группы не содержат открытых баз')
+                raise UserError('группы не содержат открытых баз')
             return _fanout_answer(parts, state)
 
         # Конкретная группа — fan-out по её базам
         if group and 'group' in self.schema.get('properties', {}) and not is_group_management:
             db_aliases = server.get_group_dbs(group)
             if not db_aliases:
-                raise ValueError(f'группа {group} пуста — добавьте базы через group_add_db')
+                raise UserError(f'группа {group} пуста — добавьте базы через group_add_db')
             parts = []
             state = {}
             for alias in db_aliases:
@@ -3667,7 +3737,7 @@ class Tool:
                     parts.append(_fanout_call(server, self.fn, alias, call_args,
                                               [group], state))
             if not parts:
-                raise ValueError(f'группа {group} не содержит открытых баз')
+                raise UserError(f'группа {group} не содержит открытых баз')
             return _fanout_answer(parts, state)
 
         # db='*' — выполнить инструмент по всем открытым базам сразу
@@ -3678,7 +3748,7 @@ class Tool:
                 parts.append(_fanout_call(server, self.fn, alias,
                                           dict(args, db=alias), None, state))
             if not parts:
-                raise ValueError('нет открытых баз — укажите путь в db_open')
+                raise UserError('нет открытых баз — укажите путь в db_open')
             return _fanout_answer(parts, state)
 
         # Обычный запрос к одной базе
@@ -3873,9 +3943,14 @@ TOOLS = [
          'each occurrence of match, with the module line numbers, plus stable '
          'insertion markers (the previous and the next statement). Cheaper '
          'than get_method on a big method and the right way to pick a place '
-         'to insert code. before/after = how many lines to show (default 20).',
+         'to insert code. before/after = how many lines to show (default 20). '
+         'Occurrences are PAGED (limit, default 3): the answer ends with the '
+         'total count and the offset of the next page, so every occurrence '
+         'stays readable without refining match.',
          _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
-                  'match': _STR, 'before': _INT, 'after': _INT, 'db': _DB, 'group': _GROUP},
+                  'match': _STR, 'before': _INT, 'after': _INT,
+                  'limit': _LIMIT, 'offset': _OFFSET, 'db': _DB,
+                  'group': _GROUP},
                  ('path', 'code_name', 'name')),
          McpServer.find_method_context),
     Tool('method_dependencies',
@@ -3964,15 +4039,25 @@ TOOLS = [
          'a customized configuration, or for the same object in two releases. '
          'db_left/db_right are aliases from db_list (NOT the db parameter); '
          'path_right is needed only when the object is named differently in '
-         'the right base.',
+         'the right base. Differences are STRUCTURED items with stable ids '
+         '(section:key), paged by limit/offset: the footer names the total, '
+         'the shown range and the next offset, so the full list is always '
+         'readable. format="json" returns the same items with completeness '
+         'counters in the standard envelope.',
          _schema({'path': _STR, 'db_left': _STR, 'db_right': _STR,
-                  'path_right': _STR, 'limit': _INT, 'offset': _INT},
+                  'path_right': _STR, 'limit': _LIMIT, 'offset': _OFFSET,
+                  'format': _FORMAT},
                  ('path', 'db_left', 'db_right')),
          McpServer.compare_object),
     Tool('method_diff',
-         'Построчное сравнение ОДНОГО МЕТОДА в двух базах. Игнорирует комментарии '
-         'и пробелы (как git -w). Показывает изменённые строки с контекстом и номерами. '
-         'Используйте после compare_object для детального анализа изменённого метода.',
+         'Точное сравнение ОДНОГО МЕТОДА в двух базах: объявление (параметры и '
+         'значения по умолчанию, Экспорт, директивы), исполняемый текст '
+         '(unified diff с номерами строк модуля и контекстом обеих сторон), '
+         'комментарии и форматирование — ОТДЕЛЬНЫЕ разделы. Комментарии и '
+         'пробелы вне строковых литералов изменением не считаются; литералы и '
+         'препроцессор сохраняются. Добавление только Экспорт не считается '
+         'изменением исполняемого тела. Используйте после compare_object для '
+         'детального анализа изменённого метода.',
          _schema({'path': _STR, 'code_name': _STR, 'name': _STR,
                   'db_left': _STR, 'db_right': _STR, 'context': _INT},
                  ('path', 'code_name', 'name', 'db_left', 'db_right')),
@@ -4252,16 +4337,16 @@ def parse_group_spec(spec):
     """
     text = str(spec)
     if '=' not in text:
-        raise ValueError(
+        raise UserError(
             f'нужен вид ИМЯ=ПУТЬ (несколько путей — через ;): {spec}')
     name, _, rest = text.partition('=')
     name = name.strip()
     if not name:
-        raise ValueError(f'пустое имя группы: {spec}')
+        raise UserError(f'пустое имя группы: {spec}')
     paths = [p.strip().strip('"') for p in rest.split(';')]
     paths = [p for p in paths if p]
     if not paths:
-        raise ValueError(f'в группе «{name}» нет ни одного пути к базе')
+        raise UserError(f'в группе «{name}» нет ни одного пути к базе')
     return name, paths
 
 

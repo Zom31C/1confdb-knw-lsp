@@ -139,8 +139,12 @@ def test_pick_path_empty_input_reprompts(tui, monkeypatch):
 
 
 def test_pick_path_commands_still_work(tui, monkeypatch):
-    _feed(monkeypatch, ['p', 'D:\\cf\\ЧерезP.cf'])
-    assert tui._pick_path('Файл', [], []) == 'D:\\cf\\ЧерезP.cf'
+    # после перехода на авто-распознавание команды только '0' (отмена) и
+    # 'e' (пусто): буква 'p' больше не команда, а путь, набранный вручную
+    _feed(monkeypatch, ['0'])
+    assert tui._pick_path('Файл', ['D:\\a.cf'], []) is None
+    _feed(monkeypatch, ['p'])
+    assert tui._pick_path('Файл', [], []) == 'p'
 
 
 def test_pick_path_empty_option(tui, monkeypatch):
